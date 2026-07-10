@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "research_agent": {
+    "allowed_repository_paths": [
+      "train.py"
+    ],
+    "protected_repository_paths": [
+      "prepare.py",
+      "pyproject.toml",
+      "uv.lock",
+      "autodidact/data/**"
+    ]
+  },
+  "dataset": {
+    "name": "TinyStories",
+    "public_splits": [
+      "train",
+      "dev"
+    ],
+    "evaluator_only_splits": [
+      "promotion",
+      "sealed_final"
+    ],
+    "fixed_contract": {
+      "vocab_size": 1792,
+      "context_length": 256,
+      "attention": "dense-causal",
+      "position_encoding": "rope"
+    }
+  }
+}

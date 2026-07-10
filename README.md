@@ -37,7 +37,7 @@ The research agent proposes changes, while the protected experiment runner and P
 
 The initial implementation keeps the same useful boundary as autoresearch:
 
-- **`prepare.py`** — fixed data preparation, tokenizer, dataloader, experiment budgets, and evaluation. The agent cannot modify it.
+- **`prepare.py`** — fixed data preparation and integrity verification. The agent cannot modify it.
 - **`train.py`** — the transformer, optimizer, and training loop. This is the only file the agent may modify.
 - **`program.md`** — instructions and research context supplied to the agent.
 - **`autodidact/`** — the protected PatchRCT harness, downstream-reward estimator, experiment ledger, and promotion rules.
@@ -48,16 +48,17 @@ The baseline is a decoder-only, GPT-style transformer trained from scratch on [T
 
 | Component | Baseline |
 | --- | ---: |
-| Vocabulary | 1,536-token BPE |
+| Vocabulary | 1,792-token BPE |
 | Context length | 256 tokens |
 | Transformer layers | 4 |
 | Model width | 128 |
 | Attention heads | 4 |
+| Attention pattern | Dense causal |
 | Head dimension | 32 |
 | MLP width | 512 |
 | Normalization | Pre-LayerNorm |
 | Activation | GELU |
-| Position representation | Learned embeddings |
+| Position representation | RoPE |
 | Input/output embeddings | Tied |
 | Linear biases | Disabled |
 | Initial dropout | 0 |
@@ -65,6 +66,63 @@ The baseline is a decoder-only, GPT-style transformer trained from scratch on [T
 | Autoresearch limit | **1,050,000** |
 
 The starting training recipe uses AdamW, a cosine learning-rate schedule, gradient clipping, and a 16,384-token batch. Cheap, intermediate, and full experiments train for 2M, 6M, and 20M tokens respectively. These are baseline choices, not protected truths: the research agent may change the architecture, optimizer, batching, and training logic while remaining inside the parameter and evaluation constraints.
+
+## Data preparation
+
+The data pipeline downloads the original TinyStories train and validation files from a pinned Hugging Face revision. Their sizes and SHA-256 LFS object hashes are fixed in code, so an upstream or cached-file change fails before tokenization. The source download is about 1.95 GB.
+
+Install the locked environment and build the complete dataset:
+
+```bash
+uv sync --all-groups
+uv run prepare.py prepare
+```
+
+Defaults can be changed without changing the data contract:
+
+```bash
+AUTODIDACT_RAW_DATA=/path/to/raw \
+AUTODIDACT_DATA_ROOT=/path/to/tinystories-v1 \
+uv run prepare.py prepare
+```
+
+Preparation trains the 1,792-token byte-level BPE on training stories only. It then writes document-preserving, little-endian `uint16` token shards and NumPy document indexes:
+
+```text
+tinystories-v1/
+├── public/
+│   ├── tokenizer.json
+│   ├── data_policy.json
+│   ├── train/
+│   ├── dev/
+│   └── manifest.json
+└── protected/
+    ├── promotion/
+    ├── sealed_final/
+    └── manifest.json
+```
+
+The validation source is assigned by normalized-story SHA-256 into 50% public development, 25% evaluator-only promotion, and 25% sealed-final data. Duplicate stories always enter the same split. The public manifest commits to protected split counts and content hashes without exposing protected shard paths.
+
+The build happens in a staging directory and is atomically renamed only after complete verification. Prepared files are made read-only, every source/tokenizer/shard/index has a recorded SHA-256, and existing output roots are verified rather than overwritten.
+
+Verify public artifacts or the complete evaluator-visible tree at any time:
+
+```bash
+uv run prepare.py verify --scope public
+uv run prepare.py verify --scope all
+```
+
+The checked-in policy permits research-plane changes only to `train.py`. A future experiment runner can enforce that policy directly:
+
+```bash
+uv run prepare.py check-paths train.py
+uv run prepare.py check-paths prepare.py  # rejected
+```
+
+The training process receives only the public directory. Promotion and final data stay outside its mounted workspace and are opened through an explicit evaluator-only reader. Read-only permissions are defense in depth; manifest verification and the path allowlist are the authoritative integrity checks.
+
+TinyStories is distributed under CDLA-Sharing-1.0. The pipeline downloads source data but does not commit or redistribute it.
 
 ## What is BPB?
 
@@ -268,9 +326,10 @@ Fixed-token results provide the cleanest comparison across hardware. Fixed-time 
 ## Planned repository structure
 
 ```text
-prepare.py              fixed data and evaluation code
+prepare.py              fixed data preparation and integrity verification
 train.py                model and training code; agent-editable
 program.md              research instructions
+autodidact/data/         protected data pipeline, readers, policy, and verification
 autodidact/              PatchRCT, orchestration, reward model, and ledger
 experiments/             manifests and machine-readable results
 assets/                  final figures
@@ -278,6 +337,7 @@ assets/                  final figures
 
 ## Roadmap
 
+- [x] Implement the immutable TinyStories tokenizer, shards, splits, manifests, and verifier.
 - [ ] Train and verify the 1,016,960-parameter TinyStories baseline.
 - [ ] Measure seed noise and execution noise locally.
 - [ ] Implement protected paired parent-versus-patch experiments.

@@ -1,0 +1,43 @@
+[project]
+name = "autodidact-autoresearch"
+version = "0.1.0"
+description = "Local-first autonomous language-model research with protected evaluation"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "numpy>=1.26,<3",
+    "tokenizers>=0.20,<1",
+]
+
+[project.scripts]
+autodidact-data = "autodidact.data.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["autodidact"]
+
+[tool.hatch.build]
+include = [
+    "autodidact/**/*.py",
+    "autodidact/data/policy.json",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<10",
+    "ruff>=0.9,<1",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
