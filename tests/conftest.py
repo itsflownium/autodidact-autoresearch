@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import random
 import shutil
+import string
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
@@ -71,6 +73,36 @@ def prepared_dataset(
 ) -> Iterator[Path]:
     root = tmp_path / "prepared"
     build_dataset(*source_files, root, config=test_config)
+    try:
+        yield root
+    finally:
+        make_tree_writable(root)
+        shutil.rmtree(root, ignore_errors=True)
+
+
+@pytest.fixture
+def baseline_dataset(
+    tmp_path: Path,
+    source_files: tuple[Path, Path],
+) -> Iterator[Path]:
+    root = tmp_path / "baseline-prepared"
+    train_path = tmp_path / "baseline-train.txt"
+    random_source = random.Random(2_026)
+    alphabet = string.ascii_lowercase
+    stories = [
+        " ".join(
+            "".join(random_source.choices(alphabet, k=random_source.randint(4, 12)))
+            for _word in range(32)
+        )
+        for _story in range(2_000)
+    ]
+    write_stories(train_path, stories)
+    config = replace(
+        DEFAULT_CONFIG,
+        min_token_frequency=1,
+        shard_token_limit=100_000,
+    )
+    build_dataset(train_path, source_files[1], root, config=config)
     try:
         yield root
     finally:
