@@ -7,6 +7,7 @@ import json
 import sys
 from pathlib import Path
 
+from autodidact.data.archive import PreparedArchiveError, fetch_prepared_dataset
 from autodidact.data.config import default_output_root, default_raw_dir
 from autodidact.data.download import (
     SourceIntegrityError,
@@ -61,6 +62,17 @@ def build_parser() -> argparse.ArgumentParser:
     prepare = commands.add_parser("prepare", help="download, build, seal, and verify")
     _add_raw_dir(prepare)
     _add_output_root(prepare)
+
+    fetch = commands.add_parser(
+        "fetch-prepared",
+        help="download, verify, safely extract, and seal the pinned prepared archive",
+    )
+    _add_output_root(fetch)
+    fetch.add_argument(
+        "--archive",
+        type=_path,
+        help="use an existing archive instead of downloading from the private Hub dataset",
+    )
 
     verify = commands.add_parser("verify", help="verify manifests, hashes, and permissions")
     _add_output_root(verify)
@@ -127,6 +139,13 @@ def main(argv: list[str] | None = None) -> int:
                 manifest = build_pinned_dataset(args.raw_dir, args.output_root)
             _print_summary(manifest)
             return 0
+        if args.command == "fetch-prepared":
+            manifest = fetch_prepared_dataset(
+                args.output_root,
+                archive_path=args.archive,
+            )
+            _print_summary(manifest)
+            return 0
         if args.command == "verify":
             manifest = verify_dataset(args.output_root, scope=args.scope)
             print(f"verified {args.scope} data under {args.output_root}")
@@ -144,6 +163,7 @@ def main(argv: list[str] | None = None) -> int:
         DatasetBuildError,
         DatasetIntegrityError,
         FileExistsError,
+        PreparedArchiveError,
         ProtectedPathError,
         SourceIntegrityError,
     ) as error:

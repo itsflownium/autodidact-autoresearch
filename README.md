@@ -75,16 +75,35 @@ The exact parameter count uses weight-only LayerNorm and bias-free linear layers
 
 ## Data preparation
 
-The data pipeline downloads the original TinyStories train and validation files from a pinned Hugging Face revision. Their sizes and SHA-256 LFS object hashes are fixed in code, so an upstream or cached-file change fails before tokenization. The source download is about 1.95 GB.
+The data pipeline can either fetch the prebuilt private artifact or reproduce it from the original TinyStories sources. Both paths are pinned by revision, size, SHA-256, tokenizer, and manifest commitments.
 
-Install the locked environment and build the complete dataset:
+Install the locked environment, authenticate with Hugging Face, and fetch the prepared dataset:
 
 ```bash
 uv sync --all-groups
+hf auth login
+uv run prepare.py fetch-prepared
+```
+
+The pinned archive is hosted at the private
+[`Flownium/autodidact-dataset`](https://huggingface.co/datasets/Flownium/autodidact-dataset)
+repository. It is 454,752,409 bytes (433.7 MiB), compared with 1.10 GiB extracted,
+and has SHA-256
+`49fa417804c3e905cf986392d2397ec58e55317925e31021c7cb128417e153ac`.
+The fetch command downloads into temporary storage, verifies the compressed
+artifact, safely extracts it, verifies every prepared file, seals the tree
+read-only, and removes the compressed copy.
+
+The repository must remain private because the full artifact contains promotion
+and sealed-final data. Training and research processes receive only `public/`.
+
+To reproduce the artifact from the 1.95 GB pinned source download instead:
+
+```bash
 uv run prepare.py prepare
 ```
 
-Defaults can be changed without changing the data contract:
+Defaults can be changed without changing either data contract:
 
 ```bash
 AUTODIDACT_RAW_DATA=/path/to/raw \
@@ -128,7 +147,7 @@ uv run prepare.py check-paths prepare.py  # rejected
 
 The training process receives only the public directory. Promotion and final data stay outside its mounted workspace and are opened through an explicit evaluator-only reader. Read-only permissions are defense in depth; manifest verification and the path allowlist are the authoritative integrity checks.
 
-TinyStories is distributed under CDLA-Sharing-1.0. The pipeline downloads source data but does not commit or redistribute it.
+TinyStories and the private prepared redistribution use CDLA-Sharing-1.0. Raw and prepared dataset bytes remain outside GitHub source history.
 
 ## Training the baseline
 

@@ -5,9 +5,11 @@ description = "Local-first autonomous language-model research with protected eva
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 dependencies = [
+    "huggingface-hub>=0.34,<2",
     "numpy>=1.26,<3",
     "tokenizers>=0.20,<1",
     "torch>=2.4,<3",
+    "zstandard>=0.23,<1",
 ]
 
 [project.scripts]

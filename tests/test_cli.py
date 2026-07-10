@@ -34,3 +34,34 @@ def test_prepare_verifies_existing_output_without_downloading(
 
     assert main(["prepare", "--output-root", str(output_root)]) == 0
     assert "already exists" in capsys.readouterr().err
+
+
+def test_fetch_prepared_command_routes_archive_and_output(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    archive = tmp_path / "prepared.tar.zst"
+    output_root = tmp_path / "prepared"
+    manifest = {"dataset": {}, "pipeline": {}, "splits": {}, "tokenizer": {}}
+    calls = []
+
+    def fake_fetch(output, *, archive_path):
+        calls.append((output, archive_path))
+        return manifest
+
+    monkeypatch.setattr(cli, "fetch_prepared_dataset", fake_fetch)
+    assert (
+        main(
+            [
+                "fetch-prepared",
+                "--archive",
+                str(archive),
+                "--output-root",
+                str(output_root),
+            ]
+        )
+        == 0
+    )
+    assert calls == [(output_root, archive)]
+    assert '"splits": {}' in capsys.readouterr().out
