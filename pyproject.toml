@@ -7,10 +7,12 @@ requires-python = ">=3.11,<3.14"
 dependencies = [
     "numpy>=1.26,<3",
     "tokenizers>=0.20,<1",
+    "torch>=2.4,<3",
 ]
 
 [project.scripts]
 autodidact-data = "autodidact.data.cli:main"
+autodidact-train = "train:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -19,10 +21,16 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["autodidact"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"prepare.py" = "prepare.py"
+"train.py" = "train.py"
+
 [tool.hatch.build]
 include = [
     "autodidact/**/*.py",
     "autodidact/data/policy.json",
+    "prepare.py",
+    "train.py",
 ]
 
 [dependency-groups]

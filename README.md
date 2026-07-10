@@ -8,7 +8,7 @@ Autodidact starts with a **1,016,960-parameter transformer** that can run locall
 
 Autodidact builds on the compact workflow introduced by [Karpathy's autoresearch](https://github.com/karpathy/autoresearch), then adds **PatchRCT**, paired experiments, hidden evaluation, and Bayesian downstream-reward estimation.
 
-> **Status:** design and baseline implementation are in progress. No model-quality result is claimed yet.
+> **Status:** the immutable data system and baseline trainer are implemented. No full-budget model-quality result is claimed yet.
 
 ## How it works
 
@@ -67,6 +67,12 @@ The baseline is a decoder-only, GPT-style transformer trained from scratch on [T
 
 The starting training recipe uses AdamW, a cosine learning-rate schedule, gradient clipping, and a 16,384-token batch. Cheap, intermediate, and full experiments train for 2M, 6M, and 20M tokens respectively. These are baseline choices, not protected truths: the research agent may change the architecture, optimizer, batching, and training logic while remaining inside the parameter and evaluation constraints.
 
+The exact parameter count uses weight-only LayerNorm and bias-free linear layers. The token embedding contains 229,376 parameters; each transformer block contains 196,864; and the final normalization contains 128:
+
+```text
+229,376 + (4 x 196,864) + 128 = 1,016,960
+```
+
 ## Data preparation
 
 The data pipeline downloads the original TinyStories train and validation files from a pinned Hugging Face revision. Their sizes and SHA-256 LFS object hashes are fixed in code, so an upstream or cached-file change fails before tokenization. The source download is about 1.95 GB.
@@ -123,6 +129,50 @@ uv run prepare.py check-paths prepare.py  # rejected
 The training process receives only the public directory. Promotion and final data stay outside its mounted workspace and are opened through an explicit evaluator-only reader. Read-only permissions are defense in depth; manifest verification and the path allowlist are the authoritative integrity checks.
 
 TinyStories is distributed under CDLA-Sharing-1.0. The pipeline downloads source data but does not commit or redistribute it.
+
+## Training the baseline
+
+Inspect the fixed model contract without loading data:
+
+```bash
+uv run train.py inspect
+```
+
+Train one of the predeclared modes after preparing TinyStories:
+
+```bash
+uv run train.py --mode cheap --device auto
+uv run train.py --mode intermediate --device auto
+uv run train.py --mode full --device auto
+```
+
+| Mode | Training tokens | Default public-dev evaluation |
+| --- | ---: | ---: |
+| Cheap | 2,000,000 | 250,000 tokens |
+| Intermediate | 6,000,000 | 1,000,000 tokens |
+| Full | 20,000,000 | Complete dev split |
+
+`auto` selects CUDA first, then MPS, then CPU. A device can be selected explicitly with `--device cuda`, `--device cuda:0`, `--device mps`, or `--device cpu`.
+
+Every run writes newline-delimited JSON to stdout and to `artifacts/metrics/baseline-<mode>.jsonl`. Events cover the resolved contract, training loss, bits per token, learning rate, gradient norm, throughput, checkpoints, public-dev BPB, generated text, and the final summary. The final checkpoint is written to `artifacts/checkpoints/baseline-<mode>.pt`.
+
+Checkpoints contain model and AdamW state, exact token progress, global random-number-generator state, sampler state, and cumulative metrics. Resume an interrupted run with the same mode, seed, and token budget:
+
+```bash
+uv run train.py --mode cheap \
+  --resume artifacts/checkpoints/baseline-cheap.pt
+```
+
+Generate text independently from a checkpoint:
+
+```bash
+uv run train.py generate \
+  --checkpoint artifacts/checkpoints/baseline-cheap.pt \
+  --prompt "Once upon a time" \
+  --generate-tokens 128
+```
+
+`--token-budget` and `--eval-tokens` provide explicit diagnostic overrides for smoke tests. Omitting them preserves the named mode's declared budget.
 
 ## What is BPB?
 
@@ -338,6 +388,7 @@ assets/                  final figures
 ## Roadmap
 
 - [x] Implement the immutable TinyStories tokenizer, shards, splits, manifests, and verifier.
+- [x] Implement the exact 1,016,960-parameter baseline trainer and runtime controls.
 - [ ] Train and verify the 1,016,960-parameter TinyStories baseline.
 - [ ] Measure seed noise and execution noise locally.
 - [ ] Implement protected paired parent-versus-patch experiments.
