@@ -48,6 +48,32 @@ SOURCE_FILES = (
 
 
 @dataclass(frozen=True)
+class PreparedDatasetArchive:
+    """A content-addressed prepared dataset published outside Git history."""
+
+    repo_id: str
+    revision: str
+    filename: str
+    root_name: str
+    size: int
+    sha256: str
+    expanded_file_bytes: int
+    regular_file_count: int
+
+
+PREPARED_DATASET_ARCHIVE = PreparedDatasetArchive(
+    repo_id="Flownium/autodidact-dataset",
+    revision="1123f36219fdeb261212a73df750be6278a697bb",
+    filename="data/autodidact-tinystories-v1.tar.zst",
+    root_name="tinystories-v1",
+    size=454_752_409,
+    sha256="49fa417804c3e905cf986392d2397ec58e55317925e31021c7cb128417e153ac",
+    expanded_file_bytes=1_183_154_998,
+    regular_file_count=120,
+)
+
+
+@dataclass(frozen=True)
 class PipelineConfig:
     """All values that affect tokenizer, split, or shard contents."""
 

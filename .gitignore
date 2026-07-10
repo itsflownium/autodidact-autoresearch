@@ -13,3 +13,4 @@ artifacts/
 *.bin
 *.idx.npy
 *.part
+*.tar.zst
