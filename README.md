@@ -8,7 +8,7 @@ Autodidact starts with a **1,016,960-parameter transformer** that can run locall
 
 Autodidact builds on the compact workflow introduced by [Karpathy's autoresearch](https://github.com/karpathy/autoresearch), then adds **PatchRCT**, paired experiments, hidden evaluation, and Bayesian downstream-reward estimation.
 
-> **Status:** the immutable data system, baseline trainer, and local seed-noise calibration are implemented. PatchRCT promotion is not implemented yet, and no candidate-patch improvement is claimed.
+> **Status:** the immutable data system, baseline trainer, local seed-noise calibration, research-agent contract, CI checks, and resumable full-baseline runner are implemented. PatchRCT promotion is not implemented yet, and no candidate-patch improvement is claimed.
 
 ## How it works
 
@@ -217,6 +217,57 @@ The completed Apple M4 calibration is recorded in [`docs/calibration/m4-cheap.md
 - Maximum all-pairs same-seed model-state difference: `2.38e-7`; optimizer-state difference: `5.12e-9`; behavioral checkpoint metadata was exact.
 
 These measurements establish the noise floor for experiment design. They do not show that one training-code patch is better than another. PatchRCT will use paired parent/candidate runs so initialization and data-order effects cancel within each seed.
+
+## Running the retained full baseline
+
+The full-baseline harness runs three independent 20M-token seeds sequentially, evaluates each checkpoint on the complete public-development split, generates a deterministic sample, and retains the checkpoint plus raw JSONL metrics. It verifies the exact parent parameter count, trainer and runner hashes, data and tokenizer commitments, seed-specific data orders, deterministic mode, complete token budgets, finite outcomes, device consistency, and checkpoint hashes before labeling a report complete.
+
+Start a new local run with:
+
+```bash
+uv run autodidact-baseline --device mps
+```
+
+The default output root is `artifacts/baseline/full-v1/`. If execution stops after an intermediate checkpoint, resume the exact recorded contract rather than starting completed seeds again:
+
+```bash
+uv run autodidact-baseline --device mps --resume
+```
+
+Use `--overwrite` only to intentionally replace a marked baseline directory. The runner refuses to delete an unmarked directory, and resume refuses changes to seeds, budgets, data root, device request, batching, generation settings, or trainer hash.
+
+For a short integration check that cannot be mistaken for full evidence:
+
+```bash
+uv run autodidact-baseline \
+  --device mps \
+  --seeds 11 23 \
+  --token-budget 8192 \
+  --eval-tokens 2048 \
+  --output-root artifacts/baseline/smoke-v1
+```
+
+Any token-budget or evaluation override sets `diagnostic_override` and forces `complete_full_baseline` to `false`, even when every integrity check passes. Baseline checkpoints and raw run artifacts remain outside Git history; only compact reviewed reports should be committed.
+
+## Research-agent instructions
+
+[`program.md`](program.md) is the executable research contract supplied to the proposal agent. It permits edits only to `train.py`, preserves the training and generation CLI, enforces the 1.05M parameter cap and protected-data boundary, requires one falsifiable causal claim per patch, and defines the proposal and completion records.
+
+Seeds come from the protected scheduler. The agent may reason about a code change, but it may not select, search, retry, discard, or report seeds according to favorable outcomes. It submits a patch for protected measurement; it does not grade or promote itself.
+
+## Continuous integration
+
+GitHub Actions runs the locked Python 3.11 environment with read-only repository permissions. Pull requests and pushes to `main` must pass linting, formatting, all tests, bytecode compilation, the 1,016,960-parameter inspection contract, and package construction. Local equivalents are:
+
+```bash
+uv sync --locked --all-groups
+uv run ruff check .
+uv run ruff format --check .
+uv run pytest -q
+uv run python -m compileall -q train.py prepare.py autodidact tests
+uv run train.py inspect
+uv build
+```
 
 ## What is BPB?
 
@@ -433,8 +484,9 @@ assets/                  final figures
 
 - [x] Implement the immutable TinyStories tokenizer, shards, splits, manifests, and verifier.
 - [x] Implement the exact 1,016,960-parameter baseline trainer and runtime controls.
+- [x] Add locked CI, protected research instructions, and a resumable full-baseline harness.
 - [ ] Train and verify the 1,016,960-parameter TinyStories baseline.
-- [ ] Measure seed noise and execution noise locally.
+- [x] Measure seed noise and execution noise locally.
 - [ ] Implement protected paired parent-versus-patch experiments.
 - [ ] Implement PatchRCT promotion, rejection, and escalation gates.
 - [ ] Collect 40 full-budget patch labels and calibrate downstream prediction.
