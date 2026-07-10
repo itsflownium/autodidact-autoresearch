@@ -13,6 +13,7 @@ dependencies = [
 ]
 
 [project.scripts]
+autodidact-baseline = "autodidact.baseline:main"
 autodidact-calibrate = "autodidact.calibration:main"
 autodidact-data = "autodidact.data.cli:main"
 autodidact-train = "train:main"
