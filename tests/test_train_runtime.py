@@ -11,10 +11,13 @@ import train
 from autodidact.data.reader import open_public_split
 from train import (
     JsonlMetrics,
+    PeakMemoryTracker,
     TokenBatcher,
     TransformerLM,
     build_optimizer,
+    checkpoint_state_sha256,
     evaluate_bpb,
+    load_checkpoint_payload,
     resolve_device,
     restore_training_checkpoint,
     save_checkpoint,
@@ -39,6 +42,11 @@ def test_token_batcher_is_seeded_and_restorable(prepared_dataset: Path) -> None:
     )
     torch.testing.assert_close(first_inputs, second_inputs, rtol=0, atol=0)
     torch.testing.assert_close(first_targets, second_targets, rtol=0, atol=0)
+    assert first.data_order_sha256 == second.data_order_sha256
+
+    different = TokenBatcher(split, seed=45)
+    different.next_batch(4, 32, device=torch.device("cpu"))
+    assert different.data_order_sha256 != first.data_order_sha256
 
     saved_state = first.state_dict()
     expected_inputs, expected_targets = first.next_batch(
@@ -55,6 +63,7 @@ def test_token_batcher_is_seeded_and_restorable(prepared_dataset: Path) -> None:
     )
     torch.testing.assert_close(actual_inputs, expected_inputs, rtol=0, atol=0)
     torch.testing.assert_close(actual_targets, expected_targets, rtol=0, atol=0)
+    assert restored.data_order_sha256 == first.data_order_sha256
 
 
 def test_checkpoint_restores_model_optimizer_rng_and_sampler(
@@ -76,7 +85,7 @@ def test_checkpoint_restores_model_optimizer_rng_and_sampler(
 
     checkpoint = tmp_path / "checkpoint.pt"
     cumulative_loss = float(loss.item()) * inputs.numel()
-    save_checkpoint(
+    fingerprints = save_checkpoint(
         checkpoint,
         model=model,
         optimizer=optimizer,
@@ -90,6 +99,10 @@ def test_checkpoint_restores_model_optimizer_rng_and_sampler(
         cumulative_loss=cumulative_loss,
         cumulative_loss_tokens=inputs.numel(),
     )
+    payload = load_checkpoint_payload(checkpoint, device)
+    assert fingerprints["checkpoint_state_sha256"] == checkpoint_state_sha256(payload)
+    assert len(fingerprints["checkpoint_sha256"]) == 64
+    assert len(fingerprints["checkpoint_state_sha256"]) == 64
     expected_random = torch.rand(5)
     expected_inputs, expected_targets = batcher.next_batch(2, 16, device=device)
 
@@ -136,6 +149,23 @@ def test_public_dev_evaluation_produces_finite_bpb(prepared_dataset: Path) -> No
     assert 0 < metrics["predicted_tokens"] <= 400
     assert metrics["stories"] > 0
     assert metrics["utf8_bytes"] > 0
+    repeated = evaluate_bpb(
+        model,
+        dev,
+        device=torch.device("cpu"),
+        maximum_tokens=400,
+        batch_size=4,
+    )
+    assert repeated == metrics
+
+
+def test_peak_memory_tracker_reports_process_high_water_mark() -> None:
+    metrics = PeakMemoryTracker(torch.device("cpu")).snapshot()
+
+    assert metrics["device_memory_peak_kind"] == "process_only"
+    assert metrics["peak_device_allocated_bytes"] is None
+    assert metrics["peak_device_reserved_bytes"] is None
+    assert int(metrics["peak_process_rss_bytes"]) > 0
 
 
 def test_jsonl_metrics_writes_identical_machine_readable_records(tmp_path: Path) -> None:

@@ -81,6 +81,14 @@ def test_train_and_generate_commands_are_reproducible(
     assert records[-1]["tokens_seen"] == records[-1]["target_tokens"] == 128
     assert records[-1]["parameter_count"] == EXPECTED_PARAMETER_COUNT
     assert records[-1]["validation_bpb"] > 0
+    assert records[-1]["training_seconds"] > 0
+    assert records[-1]["training_tokens_per_second"] > 0
+    assert records[-1]["training_tokens_this_process"] == 128
+    assert records[-1]["evaluation_seconds"] > 0
+    assert records[-1]["evaluation_tokens_per_second"] > 0
+    assert records[-1]["peak_process_rss_bytes"] > 0
+    assert len(records[-1]["data_order_sha256"]) == 64
+    assert len(records[-1]["checkpoint_state_sha256"]) == 64
     assert first_checkpoint.is_file()
     assert _json_lines(first_metrics.read_text(encoding="utf-8")) == records
 
@@ -117,10 +125,24 @@ def test_train_and_generate_commands_are_reproducible(
     repeated_arguments[repeated_arguments.index(str(first_checkpoint))] = str(second_checkpoint)
     repeated_arguments[repeated_arguments.index(str(first_metrics))] = str(second_metrics)
     assert main(repeated_arguments) == 0
-    capsys.readouterr()
+    repeated_records = _json_lines(capsys.readouterr().out)
 
     first_state = torch.load(first_checkpoint, map_location="cpu", weights_only=False)
     second_state = torch.load(second_checkpoint, map_location="cpu", weights_only=False)
     assert first_state["training"] == second_state["training"]
     for name, tensor in first_state["model_state"].items():
         torch.testing.assert_close(tensor, second_state["model_state"][name], rtol=0, atol=0)
+    assert records[-1]["data_order_sha256"] == repeated_records[-1]["data_order_sha256"]
+    assert records[-1]["checkpoint_state_sha256"] == repeated_records[-1]["checkpoint_state_sha256"]
+    assert records[-1]["validation_bpb"] == repeated_records[-1]["validation_bpb"]
+
+    resume_metrics = tmp_path / "resume.jsonl"
+    resume_arguments = list(arguments)
+    resume_arguments[resume_arguments.index(str(first_metrics))] = str(resume_metrics)
+    resume_arguments.extend(["--resume", str(first_checkpoint)])
+    assert main(resume_arguments) == 0
+    resumed_records = _json_lines(capsys.readouterr().out)
+    resumed_summary = resumed_records[-1]
+    assert resumed_summary["tokens_seen"] == 128
+    assert resumed_summary["training_tokens_this_process"] == 0
+    assert resumed_summary["training_tokens_per_second"] == 0

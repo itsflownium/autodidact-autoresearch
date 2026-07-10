@@ -8,7 +8,7 @@ Autodidact starts with a **1,016,960-parameter transformer** that can run locall
 
 Autodidact builds on the compact workflow introduced by [Karpathy's autoresearch](https://github.com/karpathy/autoresearch), then adds **PatchRCT**, paired experiments, hidden evaluation, and Bayesian downstream-reward estimation.
 
-> **Status:** the immutable data system and baseline trainer are implemented. No full-budget model-quality result is claimed yet.
+> **Status:** the immutable data system, baseline trainer, and local seed-noise calibration are implemented. PatchRCT promotion is not implemented yet, and no candidate-patch improvement is claimed.
 
 ## How it works
 
@@ -173,7 +173,7 @@ uv run train.py --mode full --device auto
 
 `auto` selects CUDA first, then MPS, then CPU. A device can be selected explicitly with `--device cuda`, `--device cuda:0`, `--device mps`, or `--device cpu`.
 
-Every run writes newline-delimited JSON to stdout and to `artifacts/metrics/baseline-<mode>.jsonl`. Events cover the resolved contract, training loss, bits per token, learning rate, gradient norm, throughput, checkpoints, public-dev BPB, generated text, and the final summary. The final checkpoint is written to `artifacts/checkpoints/baseline-<mode>.pt`.
+Every run writes newline-delimited JSON to stdout and to `artifacts/metrics/baseline-<mode>.jsonl`. Events cover the resolved contract, training loss, bits per token, learning rate, gradient norm, aggregate and interval throughput, process and accelerator peak memory, data-order fingerprints, checkpoint fingerprints, public-dev BPB, generated text, and the final summary. The final checkpoint is written to `artifacts/checkpoints/baseline-<mode>.pt`.
 
 Checkpoints contain model and AdamW state, exact token progress, global random-number-generator state, sampler state, and cumulative metrics. Resume an interrupted run with the same mode, seed, and token budget:
 
@@ -192,6 +192,31 @@ uv run train.py generate \
 ```
 
 `--token-budget` and `--eval-tokens` provide explicit diagnostic overrides for smoke tests. Omitting them preserves the named mode's declared budget.
+
+## Calibrating seed noise
+
+Run the protected local calibration after preparing the dataset:
+
+```bash
+uv run autodidact-calibrate --device mps
+```
+
+The default matrix launches each experiment in a fresh process and randomizes execution order. It runs seed `1337` three times to measure execution noise, then combines one of those replicates with seven additional seeds to estimate between-seed variance. Every run uses the complete cheap budget: 2M training tokens and 250K public-dev evaluation tokens.
+
+The harness requires exact token budgets, finite outcomes, matched data/device/model contracts, repeatable data order, numerically reproducible checkpoints, and repeatable BPB. It records exact checkpoint hashes as a diagnostic, then compares every pair of repeated model and optimizer tensors using an absolute tolerance of `1e-6`. BPB and accumulated training loss use `1e-7`, calibrated above the maximum observed same-seed MPS drift of `1.26e-8` BPB and `1.95e-8` mean training loss. This distinction matters on MPS, where parallel floating-point reductions can produce tiny state differences even when data order and evaluation results reproduce.
+
+Checkpoints are retained only long enough to compare the same-seed runs. By default they are then removed, leaving compact JSONL logs and JSON/Markdown reports under `artifacts/calibration/`. Pass `--keep-checkpoints` only when debugging a failed comparison.
+
+The completed Apple M4 calibration is recorded in [`docs/calibration/m4-cheap.md`](docs/calibration/m4-cheap.md), with machine-readable evidence in [`m4-cheap.json`](docs/calibration/m4-cheap.json). All ten runs completed:
+
+- Same-seed dev BPB range: `1.26e-8`; sample standard deviation: `7.25e-9`.
+- Eight-unique-seed dev BPB sample standard deviation: `0.004654`.
+- Estimated seed BPB variance after subtracting execution variance: `2.1663e-5`.
+- Distinct-seed training throughput: approximately `20,129-37,155 tokens/second`, with a mean of `26,805`.
+- Mean peak process RSS: approximately `771 MiB`; sampled MPS peak allocation: approximately `132 MiB`.
+- Maximum all-pairs same-seed model-state difference: `2.38e-7`; optimizer-state difference: `5.12e-9`; behavioral checkpoint metadata was exact.
+
+These measurements establish the noise floor for experiment design. They do not show that one training-code patch is better than another. PatchRCT will use paired parent/candidate runs so initialization and data-order effects cancel within each seed.
 
 ## What is BPB?
 
