@@ -28,6 +28,7 @@ def test_ci_runs_locked_repository_checks_with_read_only_permissions() -> None:
     assert "permissions:\n  contents: read" in workflow
     assert "persist-credentials: false" in workflow
     assert "uv sync --locked --all-groups" in workflow
+    assert "UV_FROZEN" not in workflow
     for command in (
         "uv run ruff check .",
         "uv run ruff format --check .",
