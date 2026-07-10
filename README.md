@@ -115,6 +115,95 @@ PatchRCT validates candidates in stages:
 
 A patch is promoted only when the probability of exceeding the predeclared minimum useful effect is high enough and the runtime, memory, parameter, and stability constraints all pass. The resulting claim is intentionally narrow: the patch improved this parent, on this task, under these tested conditions.
 
+## PatchRCT architecture
+
+PatchRCT separates patch generation from experiment control and promotion. Only the research plane proposes code. Every measurement and decision comes from protected components outside the agent-editable workspace.
+
+```mermaid
+flowchart TB
+    subgraph research["1. Research plane"]
+        agent["Research agent"] --> proposal["Patch proposal<br/>diff + claim + expected effect + risks"]
+    end
+
+    subgraph control["2. Control plane"]
+        proposal --> contract["Patch-contract validator"]
+        contract --> lineage["Lineage and workspace manager"]
+        lineage --> integrity["Integrity gate<br/>file scope + CLI + hashes + parameter cap"]
+        integrity --> scheduler["Sequential experiment scheduler<br/>seed + data + budget + run order"]
+    end
+
+    subgraph experiment["3. Experiment plane"]
+        scheduler --> parent["Parent runner<br/>control"]
+        scheduler --> treatment["Patch runner<br/>treatment"]
+        parent --> metrics["Protected metric collector<br/>BPB + throughput + memory + stability"]
+        treatment --> metrics
+    end
+
+    subgraph decision["4. Evidence and decision plane"]
+        metrics --> effect["Paired treatment-effect estimator"]
+        metrics --> reward["Bayesian downstream-reward estimator"]
+        effect --> promotion["Sequential promotion controller"]
+        reward --> promotion
+        promotion -->|Reject| rejected["Rejected archive"]
+        promotion -->|Escalate| scheduler
+        promotion -->|Promote| accepted["Accepted commit<br/>new parent"]
+        accepted --> interactions["Patch-interaction auditor"]
+    end
+
+    subgraph persistence["5. Persistence and final evaluation"]
+        ledger["Evidence ledger and artifact store"]
+        hidden["Sealed final evaluator"]
+    end
+
+    accepted -->|Lineage complete| hidden
+    interactions -->|Pass| agent
+    interactions -->|Conflict| lineage
+    scheduler -.-> ledger
+    metrics -.-> ledger
+    effect -.-> ledger
+    reward -.-> ledger
+    promotion -.-> ledger
+    interactions -.-> ledger
+    hidden -.-> ledger
+```
+
+### Components
+
+| Component | Responsibility | Produces |
+| --- | --- | --- |
+| Research agent | Proposes one focused change and a falsifiable reason it should help. | Patch diff and patch contract |
+| Patch-contract validator | Checks that the proposal identifies its parent, metric, direction, minimum effect, and risks. | Validated proposal or rejection reason |
+| Lineage and workspace manager | Creates immutable parent and treatment workspaces and tracks their Git ancestry. | Isolated runnable candidates |
+| Integrity gate | Enforces file scope, the training interface, protected-file hashes, dependency policy, and the 1.05M parameter cap. | Eligible candidate or integrity failure |
+| Sequential scheduler | Chooses the next seed, data block, token budget, and randomized execution order. | Matched trial specification |
+| Paired runners | Train the parent and treatment under the same trial specification. | Checkpoints and raw run artifacts |
+| Metric collector | Computes trusted BPB, throughput, memory, and stability measurements instead of accepting agent-reported scores. | Standardized paired trial results |
+| Treatment-effect estimator | Calculates per-seed gains and the uncertainty around the patch's observed effect. | Effect estimate and probability of useful gain |
+| Downstream-reward estimator | Predicts the patch's full-budget held-out gain from its early learning curves and resource signals. | Predictive distribution and calibrated interval |
+| Promotion controller | Applies the predeclared evidence threshold and resource constraints. | Reject, escalate, or promote decision |
+| Patch-interaction auditor | Tests whether promoted changes remain helpful in the accepted stack and through leave-one-out ablations. | Interaction and stack-validity records |
+| Evidence ledger | Stores claims, commits, trial specifications, artifacts, estimates, decisions, and compute usage. | Reproducible experiment history |
+| Sealed final evaluator | Evaluates a completed lineage once on untouched data, seeds, and longer budgets. | Final transfer result |
+
+### Shared records
+
+Every component communicates through versioned, machine-readable records:
+
+- **Patch proposal:** patch ID, parent commit, diff hash, claim, mechanism, primary metric, expected direction, minimum useful effect, and risk metrics.
+- **Trial specification:** parent and treatment commits, seed, data block, token or time budget, execution order, device, and evaluator version.
+- **Trial result:** BPB checkpoints, throughput, peak memory, stability events, completion status, and artifact hashes.
+- **Effect estimate:** paired gains, mean effect, uncertainty, probability of exceeding the minimum effect, and constraint deltas.
+- **Patch decision:** evidence snapshot, downstream prediction, threshold checks, verdict, reason, and next experiment when escalation is required.
+
+### Trust boundaries
+
+- Only `train.py` and the patch contract are mutable from the research plane.
+- Data preparation, trial scheduling, metrics, promotion rules, and protected hashes live outside the agent-editable workspace.
+- Promotion data and seeds are evaluator-only; the sealed final set is unavailable until a lineage ends.
+- The metric collector computes results from run artifacts. A candidate cannot promote itself by printing a favorable score.
+- Parent results are reused only when commit, seed, data block, budget, backend, and evaluator version all match.
+- Every decision is reconstructable from the evidence ledger without relying on the research agent's narrative.
+
 ## Estimating downstream reward
 
 A patch can look good after 2M tokens and become neutral or harmful after 20M. Autodidact therefore treats the short experiment as evidence about the objective, not the objective itself.
