@@ -4,15 +4,22 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import math
 import os
 import random
+import struct
 import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, TextIO
+
+try:
+    import resource as resource_module
+except ImportError:  # pragma: no cover - unavailable on Windows
+    resource_module = None
 
 import numpy as np
 import torch
@@ -20,15 +27,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tokenizers import Tokenizer
 
+from autodidact.checkpoints import checkpoint_state_sha256, file_sha256
 from autodidact.data.config import END_OF_TEXT_TOKEN, default_output_root
 from autodidact.data.integrity import verify_dataset
 from autodidact.data.reader import PreparedSplit
 
 EXPECTED_PARAMETER_COUNT = 1_016_960
 MAX_PARAMETER_COUNT = 1_050_000
-CHECKPOINT_SCHEMA_VERSION = 1
+CHECKPOINT_SCHEMA_VERSION = 2
 METRICS_SCHEMA_VERSION = 1
 DEFAULT_SEED = 1_337
+DATA_ORDER_DIGEST_DOMAIN = b"autodidact-data-order-v1"
 
 
 class TrainingError(RuntimeError):
@@ -333,7 +342,7 @@ def seed_everything(seed: int, *, deterministic: bool = True) -> None:
         torch.cuda.manual_seed_all(seed)
     if _mps_available() and hasattr(torch.mps, "manual_seed"):
         torch.mps.manual_seed(seed)
-    torch.use_deterministic_algorithms(deterministic, warn_only=True)
+    torch.use_deterministic_algorithms(deterministic, warn_only=False)
     if hasattr(torch.backends, "cudnn"):
         torch.backends.cudnn.benchmark = not deterministic
         torch.backends.cudnn.deterministic = deterministic
@@ -348,6 +357,9 @@ class TokenBatcher:
         self.shards = [split.token_shard(index) for index in range(len(split.manifest["shards"]))]
         self.token_counts = np.asarray([len(shard) for shard in self.shards], dtype=np.int64)
         self._window_cache: dict[int, tuple[np.ndarray, int]] = {}
+        self._order_digest = hashlib.sha256(DATA_ORDER_DIGEST_DOMAIN).digest()
+        self._order_batches = 0
+        self._order_tokens = 0
 
     def _windows(self, sequence_length: int) -> tuple[np.ndarray, int]:
         if sequence_length <= 0:
@@ -378,6 +390,13 @@ class TokenBatcher:
         cumulative, total = self._windows(sequence_length)
         draws = self.rng.integers(0, total, size=batch_size, dtype=np.int64)
         shard_indexes = np.searchsorted(cumulative, draws, side="right")
+        order_record = (
+            struct.pack(">QQ", batch_size, sequence_length)
+            + draws.astype("<u8", copy=False).tobytes()
+        )
+        self._order_digest = hashlib.sha256(self._order_digest + order_record).digest()
+        self._order_batches += 1
+        self._order_tokens += batch_size * sequence_length
         inputs = np.empty((batch_size, sequence_length), dtype=np.int64)
         targets = np.empty((batch_size, sequence_length), dtype=np.int64)
         for row, (draw, shard_index) in enumerate(
@@ -393,11 +412,28 @@ class TokenBatcher:
             torch.from_numpy(targets).to(device=device),
         )
 
+    @property
+    def data_order_sha256(self) -> str:
+        return self._order_digest.hex()
+
     def state_dict(self) -> dict[str, Any]:
-        return {"numpy_bit_generator": copy.deepcopy(self.rng.bit_generator.state)}
+        return {
+            "data_order": {
+                "batches": self._order_batches,
+                "sha256": self.data_order_sha256,
+                "tokens": self._order_tokens,
+            },
+            "numpy_bit_generator": copy.deepcopy(self.rng.bit_generator.state),
+        }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
         self.rng.bit_generator.state = copy.deepcopy(state["numpy_bit_generator"])
+        order = state.get("data_order")
+        if order is None:
+            raise TrainingError("checkpoint does not contain a data-order fingerprint")
+        self._order_digest = bytes.fromhex(order["sha256"])
+        self._order_batches = int(order["batches"])
+        self._order_tokens = int(order["tokens"])
 
 
 def batch_shape_for_remaining(
@@ -500,6 +536,60 @@ class JsonlMetrics:
             self._file.close()
 
 
+def _process_peak_rss_bytes() -> int | None:
+    if resource_module is None:
+        return None
+    peak = int(resource_module.getrusage(resource_module.RUSAGE_SELF).ru_maxrss)
+    return peak if sys.platform == "darwin" else peak * 1024
+
+
+class PeakMemoryTracker:
+    """Collect an OS high-water mark and accelerator allocator peaks."""
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        self._mps_peak_allocated = 0
+        self._mps_peak_driver = 0
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+        self.sample()
+
+    def sample(self) -> None:
+        if self.device.type != "mps":
+            return
+        if hasattr(torch.mps, "current_allocated_memory"):
+            self._mps_peak_allocated = max(
+                self._mps_peak_allocated,
+                int(torch.mps.current_allocated_memory()),
+            )
+        if hasattr(torch.mps, "driver_allocated_memory"):
+            self._mps_peak_driver = max(
+                self._mps_peak_driver,
+                int(torch.mps.driver_allocated_memory()),
+            )
+
+    def snapshot(self) -> dict[str, int | str | None]:
+        self.sample()
+        if self.device.type == "cuda":
+            allocated = int(torch.cuda.max_memory_allocated(self.device))
+            reserved = int(torch.cuda.max_memory_reserved(self.device))
+            measurement = "allocator_exact"
+        elif self.device.type == "mps":
+            allocated = self._mps_peak_allocated
+            reserved = self._mps_peak_driver
+            measurement = "allocator_sampled"
+        else:
+            allocated = None
+            reserved = None
+            measurement = "process_only"
+        return {
+            "device_memory_peak_kind": measurement,
+            "peak_device_allocated_bytes": allocated,
+            "peak_device_reserved_bytes": reserved,
+            "peak_process_rss_bytes": _process_peak_rss_bytes(),
+        }
+
+
 def _capture_rng_state(device: torch.device) -> dict[str, Any]:
     state: dict[str, Any] = {
         "python": random.getstate(),
@@ -537,7 +627,7 @@ def save_checkpoint(
     target_tokens: int,
     cumulative_loss: float,
     cumulative_loss_tokens: int,
-) -> None:
+) -> dict[str, str]:
     payload = {
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "model_config": asdict(model.config),
@@ -560,6 +650,10 @@ def save_checkpoint(
     temporary = path.with_name(path.name + ".tmp")
     torch.save(payload, temporary)
     os.replace(temporary, path)
+    return {
+        "checkpoint_sha256": file_sha256(path),
+        "checkpoint_state_sha256": checkpoint_state_sha256(payload),
+    }
 
 
 def load_checkpoint_payload(path: Path, device: torch.device) -> dict[str, Any]:
@@ -853,15 +947,20 @@ def run_training(args: argparse.Namespace) -> int:
         if tokens_seen > target_tokens:
             raise TrainingError("checkpoint has already exceeded the target token budget")
 
+    process_start_tokens = tokens_seen
     next_log = (tokens_seen // log_every + 1) * log_every
     next_checkpoint = (tokens_seen // checkpoint_every + 1) * checkpoint_every
+    memory = PeakMemoryTracker(device)
     started = time.perf_counter()
+    training_seconds = 0.0
     interval_loss = 0.0
     interval_tokens = 0
     interval_seconds = 0.0
     final_grad_norm = 0.0
     final_learning_rate = args.maximum_learning_rate
     evaluation: dict[str, float | int] | None = None
+    evaluation_seconds: float | None = None
+    evaluation_tokens_per_second: float | None = None
     generated_text: str | None = None
 
     with JsonlMetrics(metrics_path, append=args.resume is not None) as metrics:
@@ -921,6 +1020,7 @@ def run_training(args: argparse.Namespace) -> int:
             optimizer.step()
             synchronize_device(device)
             step_seconds = time.perf_counter() - step_started
+            memory.sample()
 
             loss_value = float(loss.item())
             step += 1
@@ -930,6 +1030,7 @@ def run_training(args: argparse.Namespace) -> int:
             interval_loss += loss_value * step_tokens
             interval_tokens += step_tokens
             interval_seconds += step_seconds
+            training_seconds += step_seconds
             final_grad_norm = float(grad_norm.item())
             final_learning_rate = learning_rate
 
@@ -938,12 +1039,14 @@ def run_training(args: argparse.Namespace) -> int:
                 metrics.emit(
                     "train",
                     bits_per_token=mean_loss / math.log(2.0),
+                    data_order_sha256=batcher.data_order_sha256,
                     grad_norm=final_grad_norm,
                     learning_rate=learning_rate,
                     loss=mean_loss,
                     step=step,
                     tokens_per_second=interval_tokens / max(interval_seconds, 1e-12),
                     tokens_seen=tokens_seen,
+                    **memory.snapshot(),
                 )
                 interval_loss = 0.0
                 interval_tokens = 0
@@ -952,7 +1055,7 @@ def run_training(args: argparse.Namespace) -> int:
                     next_log += log_every
 
             if tokens_seen >= next_checkpoint and tokens_seen < target_tokens:
-                save_checkpoint(
+                checkpoint_fingerprints = save_checkpoint(
                     checkpoint_path,
                     model=model,
                     optimizer=optimizer,
@@ -968,15 +1071,17 @@ def run_training(args: argparse.Namespace) -> int:
                 )
                 metrics.emit(
                     "checkpoint",
+                    data_order_sha256=batcher.data_order_sha256,
                     final=False,
                     path=str(checkpoint_path),
                     step=step,
                     tokens_seen=tokens_seen,
+                    **checkpoint_fingerprints,
                 )
                 while next_checkpoint <= tokens_seen:
                     next_checkpoint += checkpoint_every
 
-        save_checkpoint(
+        final_checkpoint_fingerprints = save_checkpoint(
             checkpoint_path,
             model=model,
             optimizer=optimizer,
@@ -992,13 +1097,17 @@ def run_training(args: argparse.Namespace) -> int:
         )
         metrics.emit(
             "checkpoint",
+            data_order_sha256=batcher.data_order_sha256,
             final=True,
             path=str(checkpoint_path),
             step=step,
             tokens_seen=tokens_seen,
+            **final_checkpoint_fingerprints,
         )
 
         if eval_tokens != 0:
+            synchronize_device(device)
+            evaluation_started = time.perf_counter()
             evaluation = evaluate_bpb(
                 model,
                 dev_split,
@@ -1006,7 +1115,20 @@ def run_training(args: argparse.Namespace) -> int:
                 maximum_tokens=eval_tokens,
                 batch_size=args.eval_batch_size,
             )
-            metrics.emit("evaluation", split="dev", **evaluation)
+            synchronize_device(device)
+            evaluation_seconds = time.perf_counter() - evaluation_started
+            evaluation_tokens_per_second = int(evaluation["predicted_tokens"]) / max(
+                evaluation_seconds, 1e-12
+            )
+            memory.sample()
+            metrics.emit(
+                "evaluation",
+                evaluation_seconds=evaluation_seconds,
+                evaluation_tokens_per_second=evaluation_tokens_per_second,
+                split="dev",
+                **evaluation,
+                **memory.snapshot(),
+            )
 
         if not args.no_generate:
             prompt_ids = tokenizer.encode(args.prompt, add_special_tokens=False).ids
@@ -1022,6 +1144,7 @@ def run_training(args: argparse.Namespace) -> int:
                 end_of_text_id=end_of_text_id,
             )
             generated_text = tokenizer.decode(generated_ids, skip_special_tokens=False)
+            memory.sample()
             metrics.emit(
                 "generation",
                 prompt=args.prompt,
@@ -1032,7 +1155,10 @@ def run_training(args: argparse.Namespace) -> int:
         metrics.emit(
             "summary",
             checkpoint_path=str(checkpoint_path),
+            data_order_sha256=batcher.data_order_sha256,
             elapsed_seconds=time.perf_counter() - started,
+            evaluation_seconds=evaluation_seconds,
+            evaluation_tokens_per_second=evaluation_tokens_per_second,
             final_grad_norm=final_grad_norm,
             final_learning_rate=final_learning_rate,
             generated_text=generated_text,
@@ -1045,7 +1171,13 @@ def run_training(args: argparse.Namespace) -> int:
             steps=step,
             target_tokens=target_tokens,
             tokens_seen=tokens_seen,
+            training_seconds=training_seconds,
+            training_tokens_per_second=(tokens_seen - process_start_tokens)
+            / max(training_seconds, 1e-12),
+            training_tokens_this_process=tokens_seen - process_start_tokens,
             validation_bpb=evaluation["bpb"] if evaluation is not None else None,
+            **final_checkpoint_fingerprints,
+            **memory.snapshot(),
         )
     return 0
 
