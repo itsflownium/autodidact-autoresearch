@@ -13,11 +13,11 @@ dependencies = [
 ]
 
 [project.scripts]
+autodidact-reward = "autodidact.reward:main"
 autodidact-baseline = "autodidact.baseline:main"
 autodidact-calibrate = "autodidact.calibration:main"
 autodidact-data = "autodidact.data.cli:main"
 autodidact-ledger = "autodidact.ledger:main"
-autodidact-reward = "autodidact.reward:main"
 autodidact-train = "train:main"
 
 [build-system]
