@@ -16,6 +16,7 @@ dependencies = [
 autodidact-reward = "autodidact.reward:main"
 autodidact-baseline = "autodidact.baseline:main"
 autodidact-calibrate = "autodidact.calibration:main"
+autodidact-controller = "autodidact.controller:main"
 autodidact-data = "autodidact.data.cli:main"
 autodidact-ledger = "autodidact.ledger:main"
 autodidact-train = "train:main"
