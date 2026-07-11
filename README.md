@@ -8,7 +8,7 @@ Autodidact starts with a **1,016,960-parameter transformer** that can run locall
 
 Autodidact builds on the compact workflow introduced by [Karpathy's autoresearch](https://github.com/karpathy/autoresearch), then adds **PatchRCT**, paired experiments, hidden evaluation, and Bayesian downstream-reward estimation.
 
-> **Status:** the immutable data system, baseline trainer, local seed-noise calibration, research-agent contract, CI checks, and resumable full-baseline runner are implemented. PatchRCT promotion is not implemented yet, and no candidate-patch improvement is claimed.
+> **Status:** the immutable data system, baseline trainer, local seed-noise calibration, research-agent contract, CI checks, and resumable full-baseline runner are implemented. The three-seed, 20M-token parent baseline is complete. PatchRCT promotion is not implemented yet, and no candidate-patch improvement is claimed.
 
 ## How it works
 
@@ -249,6 +249,20 @@ uv run autodidact-baseline \
 
 Any token-budget or evaluation override sets `diagnostic_override` and forces `complete_full_baseline` to `false`, even when every integrity check passes. Baseline checkpoints and raw run artifacts remain outside Git history; only compact reviewed reports should be committed.
 
+### Completed parent baseline
+
+The full parent baseline completed locally on an Apple M4 MacBook Air with 16 GB unified memory. It used the unmodified parent at commit `64530217d85ac39e7c901eb2ad92cf6e7934bb6d`, the default three seeds, 20M training tokens per seed, and the complete public-dev split. No run was resumed, retried, selected, or discarded according to its result.
+
+| Seed | Dev BPB | Train tok/s | Peak process RSS |
+| ---: | ---: | ---: | ---: |
+| 1337 | 1.030082235 | 41,255.0 | 638.7 MiB |
+| 2027 | 1.033565403 | 36,067.7 | 827.4 MiB |
+| 4099 | 1.031866454 | 28,279.1 | 744.8 MiB |
+
+Mean dev BPB is `1.031838031`; the three-seed sample standard deviation is `0.001741758`. Each model was evaluated on the same 10,998 stories, covering 2,680,300 predicted tokens and 9,549,555 UTF-8 bytes. All thirteen full-baseline verification checks passed, including exact token budgets, expected parameter counts, distinct seeded data orders, matched data and evaluation contracts, finite outcomes, and checkpoint hashes.
+
+The reviewed report is in [`docs/baseline/m4-full.md`](docs/baseline/m4-full.md), with machine-readable evidence in [`m4-full.json`](docs/baseline/m4-full.json). These are parent reference measurements, not evidence that a candidate patch improves the model.
+
 ## Research-agent instructions
 
 [`program.md`](program.md) is the executable research contract supplied to the proposal agent. It permits edits only to `train.py`, preserves the training and generation CLI, enforces the 1.05M parameter cap and protected-data boundary, requires one falsifiable causal claim per patch, and defines the proposal and completion records.
@@ -485,7 +499,7 @@ assets/                  final figures
 - [x] Implement the immutable TinyStories tokenizer, shards, splits, manifests, and verifier.
 - [x] Implement the exact 1,016,960-parameter baseline trainer and runtime controls.
 - [x] Add locked CI, protected research instructions, and a resumable full-baseline harness.
-- [ ] Train and verify the 1,016,960-parameter TinyStories baseline.
+- [x] Train and verify the 1,016,960-parameter TinyStories baseline.
 - [x] Measure seed noise and execution noise locally.
 - [ ] Implement protected paired parent-versus-patch experiments.
 - [ ] Implement PatchRCT promotion, rejection, and escalation gates.
@@ -501,7 +515,7 @@ MIT. See [LICENSE](LICENSE).
 
 ## Results
 
-No result is reported before the sealed evaluation. The final graph will compare hidden BPB, false promotions, and compute per confirmed improvement across the three research systems.
+The completed public-dev parent baseline is a reference measurement, not a candidate-patch or sealed research result. No comparative result is reported before sealed evaluation. The final graph will compare hidden BPB, false promotions, and compute per confirmed improvement across the three research systems.
 
 <!-- Replace this comment after the sealed evaluation:
 ![Autodidact results](assets/results.png)
