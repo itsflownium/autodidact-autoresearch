@@ -8,7 +8,7 @@ Autodidact starts with a **1,016,960-parameter transformer** that can run locall
 
 Autodidact builds on the compact workflow introduced by [Karpathy's autoresearch](https://github.com/karpathy/autoresearch), then adds **PatchRCT**, paired experiments, hidden evaluation, and Bayesian downstream-reward estimation.
 
-> **Status:** the immutable data system, baseline trainer, local seed-noise calibration, research-agent contract, CI checks, and resumable full-baseline runner are implemented. The three-seed, 20M-token parent baseline is complete. PatchRCT promotion is not implemented yet, and no candidate-patch improvement is claimed.
+> **Status:** the immutable data system, baseline trainer, local seed-noise calibration, research-agent contract, versioned experiment records, append-only evidence ledger, CI checks, and resumable full-baseline runner are implemented. The three-seed, 20M-token parent baseline is complete. The paired experiment runner and automatic PatchRCT promotion controller are not integrated yet, and no candidate-patch improvement is claimed.
 
 ## How it works
 
@@ -406,11 +406,55 @@ flowchart TB
 
 Every component communicates through versioned, machine-readable records:
 
-- **Patch proposal:** patch ID, parent commit, diff hash, claim, mechanism, primary metric, expected direction, minimum useful effect, and risk metrics.
-- **Trial specification:** parent and treatment commits, seed, data block, token or time budget, execution order, device, and evaluator version.
-- **Trial result:** BPB checkpoints, throughput, peak memory, stability events, completion status, and artifact hashes.
-- **Effect estimate:** paired gains, mean effect, uncertainty, probability of exceeding the minimum effect, and constraint deltas.
-- **Patch decision:** evidence snapshot, downstream prediction, threshold checks, verdict, reason, and next experiment when escalation is required.
+- **Patch proposal:** parent commit, falsifiable claim, mechanism, expected gain, predeclared minimum useful effect, and risks.
+- **Candidate:** proposal link, parent and candidate commits, diff and protected-file hashes, changed paths, and parameter count.
+- **Trial specification:** commits, stage, seed, token and evaluation budgets, execution order, protected input hashes, device, and resource limits.
+- **Run result:** arm, completion status, BPB, losses, throughput, memory, timing, token counts, and seeded data-order hash.
+- **Artifact manifest:** portable relative paths, content hashes, sizes, kinds, and retention policy for each run artifact.
+- **Paired result:** parent-minus-candidate BPB gain, resource deltas, and protected constraint failures for one matched seed.
+- **Effect estimate:** paired evidence IDs, seeds, mean gain, sample variance, standard error, useful-gain probability, and estimator version.
+- **Downstream prediction:** source trials and stages, target stage, predictive distribution, useful-gain probability, model version, and label count.
+- **Decision:** linked effect and prediction evidence, threshold, constraint status, reject/escalate/promote verdict, and reason.
+- **Lineage:** accepted parent transition, promotion decision, generation, and previous lineage link.
+- **Compute:** run-linked wall and accelerator time, training and evaluation tokens, attempts, and optional estimated cost.
+
+## Evidence ledger
+
+`autodidact.records` defines frozen schema-versioned records. `autodidact.ledger` stores their canonical JSON envelopes in SQLite as an ordered event stream. Each event commits to its payload, writer role, timestamp, sequence, and previous event hash. SQLite triggers reject updates and deletes, while full replay verifies the hash chain and every lifecycle transition.
+
+The ledger also enforces the trust boundary:
+
+- the research agent can submit proposals but cannot write candidates, measurements, decisions, or lineage;
+- a candidate must descend from the current accepted parent and may change only `train.py`;
+- trial seeds, budgets, trainer hashes, evaluator hashes, and execution order are fixed before a run;
+- parent and candidate results must share the trial seed, budget, evaluation budget, and seeded data order;
+- successful paired runs require hashed checkpoint and metrics manifests;
+- paired gains, uncertainty statistics, and resource failures are recomputed from linked evidence;
+- predictions and decisions must use the proposal's predeclared minimum useful effect;
+- only a valid promotion decision can advance the accepted Git lineage;
+- machine-local paths are rejected, and exports support additional value redaction.
+
+Create and inspect a local ledger with:
+
+```bash
+uv run autodidact-ledger \
+  --path artifacts/ledger/experiments.sqlite3 \
+  init --initial-parent "$(git rev-parse HEAD)"
+
+uv run autodidact-ledger --path artifacts/ledger/experiments.sqlite3 verify
+uv run autodidact-ledger --path artifacts/ledger/experiments.sqlite3 summary
+uv run autodidact-ledger --path artifacts/ledger/experiments.sqlite3 show proposal-001
+```
+
+Write a sanitized review artifact without copying the mutable database:
+
+```bash
+uv run autodidact-ledger \
+  --path artifacts/ledger/experiments.sqlite3 \
+  export --output experiments/evidence.json --format snapshot
+```
+
+Ledger databases, WAL files, and shared-memory files remain local and ignored by Git. The compact JSON or JSONL export is the portable review surface. Schema migration is explicit through `autodidact-ledger migrate` and must preserve the event head. The ledger is tamper-evident under the repository's file-access boundary; it is not a cryptographically signed remote transparency log.
 
 ### Trust boundaries
 
@@ -501,6 +545,7 @@ assets/                  final figures
 - [x] Add locked CI, protected research instructions, and a resumable full-baseline harness.
 - [x] Train and verify the 1,016,960-parameter TinyStories baseline.
 - [x] Measure seed noise and execution noise locally.
+- [x] Implement versioned experiment records and the append-only evidence ledger.
 - [ ] Implement protected paired parent-versus-patch experiments.
 - [ ] Implement PatchRCT promotion, rejection, and escalation gates.
 - [ ] Collect 40 full-budget patch labels and calibrate downstream prediction.
