@@ -8,7 +8,7 @@ Autodidact starts with a **1,016,960-parameter transformer** that can run locall
 
 Autodidact builds on the compact workflow introduced by [Karpathy's autoresearch](https://github.com/karpathy/autoresearch), then adds **PatchRCT**, paired experiments, hidden evaluation, and Bayesian downstream-reward estimation.
 
-> **Status:** the immutable data system, baseline trainer, local seed-noise calibration, research-agent contract, versioned experiment records, append-only evidence ledger, CI checks, and resumable full-baseline runner are implemented. The three-seed, 20M-token parent baseline is complete. The paired experiment runner and automatic PatchRCT promotion controller are not integrated yet, and no candidate-patch improvement is claimed.
+> **Status:** the immutable data system, baseline trainer, local seed-noise calibration, research-agent contract, versioned experiment records, append-only evidence ledger, PatchRCT decision controller, CI checks, and resumable full-baseline runner are implemented. The three-seed, 20M-token parent baseline is complete. The protected paired runner and downstream-reward estimator are not integrated on this branch, and no candidate-patch improvement is claimed.
 
 ## How it works
 
@@ -408,6 +408,7 @@ Every component communicates through versioned, machine-readable records:
 
 - **Patch proposal:** parent commit, falsifiable claim, mechanism, expected gain, predeclared minimum useful effect, and risks.
 - **Candidate:** proposal link, parent and candidate commits, diff and protected-file hashes, changed paths, and parameter count.
+- **Trial schedule:** stage, fixed seed prefix, assignment seed, budgets, resource limits, policy hash, source effect, and scheduling reason.
 - **Trial specification:** commits, stage, seed, token and evaluation budgets, execution order, protected input hashes, device, and resource limits.
 - **Run result:** arm, completion status, BPB, losses, throughput, memory, timing, token counts, and seeded data-order hash.
 - **Artifact manifest:** portable relative paths, content hashes, sizes, kinds, and retention policy for each run artifact.
@@ -455,6 +456,42 @@ uv run autodidact-ledger \
 ```
 
 Ledger databases, WAL files, and shared-memory files remain local and ignored by Git. The compact JSON or JSONL export is the portable review surface. Schema migration is explicit through `autodidact-ledger migrate` and must preserve the event head. The ledger is tamper-evident under the repository's file-access boundary; it is not a cryptographically signed remote transparency log.
+
+## PatchRCT decision controller
+
+`autodidact.controller` is the protected sequential state machine above the evidence ledger. It never chooses a seed because that seed performed well. Each stage receives a prefix of the fixed policy seed pool, and uncertainty can request only the next unused seed in that predetermined order.
+
+The default policy schedules:
+
+| Stage | Initial paired seeds | Training budget | Evaluation budget |
+| --- | ---: | ---: | ---: |
+| Cheap | 1 | 2M tokens | 250K tokens |
+| Intermediate | 2 | 6M tokens | 1M tokens |
+| Full | 3 | 20M tokens | Complete development split |
+
+Every schedule is written to the ledger before a trial can match it. The record fixes the seeds, deterministic assignment seed, budget, batch sizes, resource limits, scheduler version, source effect estimate, and complete policy hash. Once all scheduled trials are terminal, the controller recomputes the paired mean, sample variance, standard error, and a useful-gain probability.
+
+The initial probability model is a protected normal-normal posterior. Its observation variance is the larger of the locally calibrated `0.004654` BPB seed-noise standard deviation and the observed paired sample variance, preventing a single run from claiming zero uncertainty. The default decisions are:
+
+- reject at or below 10% probability of exceeding the proposal's predeclared minimum useful gain;
+- escalate cheap to intermediate and intermediate to full at or above 80%;
+- promote only after the required full-stage pairs reach at least 95%;
+- otherwise schedule the next fixed seed until the pool is exhausted, then reject as inconclusive.
+
+Initialize a validated candidate and inspect the persisted schedule:
+
+```bash
+uv run autodidact-controller initialize --candidate-id candidate-001
+uv run autodidact-controller status --candidate-id candidate-001
+```
+
+After the scheduled trial records and outcomes are present, advance the state machine:
+
+```bash
+uv run autodidact-controller advance --candidate-id candidate-001
+```
+
+An escalation decision and its next-stage schedule are appended in one transaction. A promotion decision and lineage transition are also atomic; after the ledger parent advances, the controller synchronizes `refs/autodidact/accepted` to the accepted candidate commit. Crashes, timeouts, OOMs, non-finite outcomes, and incomplete pairs cannot be converted into a favorable effect and are rejected or left waiting with explicit reasons.
 
 ### Trust boundaries
 
@@ -547,7 +584,7 @@ assets/                  final figures
 - [x] Measure seed noise and execution noise locally.
 - [x] Implement versioned experiment records and the append-only evidence ledger.
 - [ ] Implement protected paired parent-versus-patch experiments.
-- [ ] Implement PatchRCT promotion, rejection, and escalation gates.
+- [x] Implement PatchRCT promotion, rejection, and escalation gates.
 - [ ] Collect 40 full-budget patch labels and calibrate downstream prediction.
 - [ ] Run the three-arm, 50-proposal local pilot.
 - [ ] Expand to repeated 100-proposal studies.

@@ -365,6 +365,51 @@ class TrialSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class TrialSchedule:
+    RECORD_TYPE: ClassVar[str] = "trial_schedule"
+
+    schedule_id: str
+    candidate_id: str
+    parent_commit: str
+    stage: ExperimentStage
+    seeds: tuple[int, ...]
+    assignment_seed: int
+    token_budget: int
+    eval_tokens: int | None
+    batch_size: int
+    eval_batch_size: int
+    limits: ResourceLimits
+    policy_sha256: str
+    source_effect_estimate_id: str | None
+    scheduler_version: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        _validate_id("schedule_id", self.schedule_id)
+        _validate_id("candidate_id", self.candidate_id)
+        _validate_git_commit("parent_commit", self.parent_commit)
+        _validate_enum("stage", self.stage, ExperimentStage)
+        if not self.seeds:
+            raise RecordValidationError("scheduled seeds cannot be empty")
+        _validate_unique("scheduled seeds", self.seeds)
+        for seed in self.seeds:
+            _validate_seed(seed)
+        _validate_seed(self.assignment_seed)
+        _validate_integer("token_budget", self.token_budget, minimum=1)
+        if self.eval_tokens is not None:
+            _validate_integer("eval_tokens", self.eval_tokens, minimum=1)
+        _validate_integer("batch_size", self.batch_size, minimum=1)
+        _validate_integer("eval_batch_size", self.eval_batch_size, minimum=1)
+        if not isinstance(self.limits, ResourceLimits):
+            raise RecordValidationError("limits must be a ResourceLimits value")
+        _validate_sha256("policy_sha256", self.policy_sha256)
+        if self.source_effect_estimate_id is not None:
+            _validate_id("source_effect_estimate_id", self.source_effect_estimate_id)
+        _validate_text("scheduler_version", self.scheduler_version, maximum=120)
+        _validate_text("reason", self.reason)
+
+
+@dataclass(frozen=True, slots=True)
 class RunResult:
     RECORD_TYPE: ClassVar[str] = "run_result"
 
@@ -636,7 +681,7 @@ class DecisionRecord:
     candidate_id: str
     stage: ExperimentStage
     verdict: DecisionVerdict
-    effect_estimate_id: str
+    effect_estimate_id: str | None
     downstream_prediction_id: str | None
     minimum_useful_gain_bpb: float
     probability_threshold: float
@@ -646,8 +691,10 @@ class DecisionRecord:
     resulting_parent_commit: str | None = None
 
     def __post_init__(self) -> None:
-        for name in ("decision_id", "candidate_id", "effect_estimate_id"):
+        for name in ("decision_id", "candidate_id"):
             _validate_id(name, getattr(self, name))
+        if self.effect_estimate_id is not None:
+            _validate_id("effect_estimate_id", self.effect_estimate_id)
         _validate_enum("stage", self.stage, ExperimentStage)
         _validate_enum("verdict", self.verdict, DecisionVerdict)
         if self.downstream_prediction_id is not None:
@@ -665,9 +712,13 @@ class DecisionRecord:
         if self.next_stage is not None:
             _validate_enum("next_stage", self.next_stage, ExperimentStage)
         if self.verdict is DecisionVerdict.ESCALATE:
+            if self.effect_estimate_id is None:
+                raise RecordValidationError("escalation requires an effect estimate")
             if self.next_stage is None or self.resulting_parent_commit is not None:
                 raise RecordValidationError("escalation requires next_stage and no new parent")
         elif self.verdict is DecisionVerdict.PROMOTE:
+            if self.effect_estimate_id is None:
+                raise RecordValidationError("promotion requires an effect estimate")
             if self.next_stage is not None or self.resulting_parent_commit is None:
                 raise RecordValidationError("promotion requires resulting_parent_commit")
             _validate_git_commit("resulting_parent_commit", self.resulting_parent_commit)
@@ -733,6 +784,7 @@ ExperimentRecord: TypeAlias = (
     PatchProposal
     | CandidateRecord
     | TrialSpec
+    | TrialSchedule
     | RunResult
     | ArtifactManifest
     | PairedResult
@@ -749,6 +801,7 @@ _RECORD_CLASSES: dict[str, type[ExperimentRecord]] = {
         PatchProposal,
         CandidateRecord,
         TrialSpec,
+        TrialSchedule,
         RunResult,
         ArtifactManifest,
         PairedResult,
@@ -764,6 +817,7 @@ _RECORD_ID_FIELDS: dict[type[ExperimentRecord], str] = {
     PatchProposal: "proposal_id",
     CandidateRecord: "candidate_id",
     TrialSpec: "trial_id",
+    TrialSchedule: "schedule_id",
     RunResult: "run_id",
     ArtifactManifest: "manifest_id",
     PairedResult: "paired_result_id",
@@ -824,6 +878,7 @@ def _parse_record(record_type: str, payload: dict[str, Any]) -> ExperimentRecord
     tuple_fields: dict[str, tuple[str, ...]] = {
         CandidateRecord.RECORD_TYPE: ("changed_paths",),
         TrialSpec.RECORD_TYPE: ("execution_order",),
+        TrialSchedule.RECORD_TYPE: ("seeds",),
         ArtifactManifest.RECORD_TYPE: ("artifacts",),
         PairedResult.RECORD_TYPE: ("constraint_failures",),
         EffectEstimate.RECORD_TYPE: ("paired_result_ids", "seeds"),
@@ -842,6 +897,11 @@ def _parse_record(record_type: str, payload: dict[str, Any]) -> ExperimentRecord
         if record_type == TrialSpec.RECORD_TYPE:
             values["stage"] = ExperimentStage(values["stage"])
             values["execution_order"] = tuple(RunArm(item) for item in values["execution_order"])
+            if not isinstance(values["limits"], dict):
+                raise RecordValidationError("limits must be an object")
+            values["limits"] = ResourceLimits(**_strict_payload(ResourceLimits, values["limits"]))
+        elif record_type == TrialSchedule.RECORD_TYPE:
+            values["stage"] = ExperimentStage(values["stage"])
             if not isinstance(values["limits"], dict):
                 raise RecordValidationError("limits must be an object")
             values["limits"] = ResourceLimits(**_strict_payload(ResourceLimits, values["limits"]))

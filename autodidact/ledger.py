@@ -39,6 +39,7 @@ from autodidact.records import (
     RunArm,
     RunResult,
     RunStatus,
+    TrialSchedule,
     TrialSpec,
     build_effect_estimate,
     build_paired_result,
@@ -164,6 +165,7 @@ class WriterRole(StrEnum):
 _ALLOWED_WRITERS: dict[str, frozenset[WriterRole]] = {
     PatchProposal.RECORD_TYPE: frozenset({WriterRole.RESEARCH_AGENT, WriterRole.CONTROLLER}),
     CandidateRecord.RECORD_TYPE: frozenset({WriterRole.CONTROLLER}),
+    TrialSchedule.RECORD_TYPE: frozenset({WriterRole.CONTROLLER}),
     TrialSpec.RECORD_TYPE: frozenset({WriterRole.CONTROLLER}),
     RunResult.RECORD_TYPE: frozenset({WriterRole.CONTROLLER, WriterRole.EVALUATOR}),
     ArtifactManifest.RECORD_TYPE: frozenset({WriterRole.CONTROLLER, WriterRole.EVALUATOR}),
@@ -796,6 +798,86 @@ class ExperimentLedger:
                 raise LedgerStateError("a proposal can produce only one immutable candidate")
             return
 
+        if isinstance(record, TrialSchedule):
+            candidate = cls._require_record(connection, record.candidate_id, CandidateRecord)
+            if (
+                record.parent_commit != candidate.parent_commit
+                or record.parent_commit != current_parent
+            ):
+                raise LedgerStateError("trial schedule is based on a stale candidate parent")
+            decisions = [
+                item
+                for item in cls._records_of_type(connection, DecisionRecord)
+                if item.candidate_id == record.candidate_id
+            ]
+            if any(
+                item.verdict in {DecisionVerdict.REJECT, DecisionVerdict.PROMOTE}
+                for item in decisions
+            ):
+                raise LedgerStateError("terminal candidates cannot receive new schedules")
+            if any(item.stage is record.stage for item in decisions):
+                raise LedgerStateError("a decided stage cannot receive another schedule")
+            schedules = [
+                item
+                for item in cls._records_of_type(connection, TrialSchedule)
+                if item.candidate_id == record.candidate_id
+            ]
+            used_seeds = {
+                seed for item in schedules if item.stage is record.stage for seed in item.seeds
+            }
+            used_seeds.update(
+                item.seed
+                for item in cls._records_of_type(connection, TrialSpec)
+                if item.candidate_id == record.candidate_id and item.stage is record.stage
+            )
+            if used_seeds.intersection(record.seeds):
+                raise LedgerStateError("trial schedule repeats an assigned stage seed")
+            source_effect = None
+            if record.source_effect_estimate_id is not None:
+                source_effect = cls._require_record(
+                    connection,
+                    record.source_effect_estimate_id,
+                    EffectEstimate,
+                )
+                if source_effect.candidate_id != record.candidate_id:
+                    raise LedgerStateError(
+                        "trial schedule source effect belongs to another candidate"
+                    )
+                if _STAGE_ORDER[source_effect.stage] > _STAGE_ORDER[record.stage]:
+                    raise LedgerStateError("trial schedule source effect is from a later stage")
+            if not schedules:
+                if record.stage is not ExperimentStage.CHEAP:
+                    raise LedgerStateError("a candidate's first schedule must be cheap")
+                if source_effect is not None:
+                    raise LedgerStateError("the initial cheap schedule cannot cite an effect")
+                return
+            latest_stage = max(schedules, key=lambda item: _STAGE_ORDER[item.stage]).stage
+            if record.stage is latest_stage:
+                if source_effect is None or source_effect.stage is not record.stage:
+                    raise LedgerStateError(
+                        "an additional same-stage schedule requires its latest effect"
+                    )
+                return
+            expected_order = _STAGE_ORDER[latest_stage] + 1
+            if _STAGE_ORDER[record.stage] != expected_order:
+                raise LedgerStateError("trial schedules must advance one stage at a time")
+            escalation = next(
+                (
+                    item
+                    for item in reversed(decisions)
+                    if item.stage is latest_stage
+                    and item.verdict is DecisionVerdict.ESCALATE
+                    and item.next_stage is record.stage
+                ),
+                None,
+            )
+            if (
+                escalation is None
+                or record.source_effect_estimate_id != escalation.effect_estimate_id
+            ):
+                raise LedgerStateError("later-stage schedules require their escalation decision")
+            return
+
         if isinstance(record, TrialSpec):
             candidate = cls._require_record(connection, record.candidate_id, CandidateRecord)
             if (
@@ -806,6 +888,21 @@ class ExperimentLedger:
                 raise LedgerStateError("trial does not match its candidate contract")
             if record.parent_commit != current_parent:
                 raise LedgerStateError("cannot schedule a new trial against a stale parent")
+            schedules = [
+                item
+                for item in cls._records_of_type(connection, TrialSchedule)
+                if item.candidate_id == record.candidate_id and item.stage is record.stage
+            ]
+            if schedules and not any(
+                record.seed in schedule.seeds
+                and record.token_budget == schedule.token_budget
+                and record.eval_tokens == schedule.eval_tokens
+                and record.batch_size == schedule.batch_size
+                and record.eval_batch_size == schedule.eval_batch_size
+                and record.limits == schedule.limits
+                for schedule in schedules
+            ):
+                raise LedgerStateError("trial does not match its protected stage schedule")
             duplicates = [
                 item
                 for item in cls._records_of_type(connection, TrialSpec)
@@ -825,8 +922,8 @@ class ExperimentLedger:
             candidate = cls._require_record(connection, trial.candidate_id, CandidateRecord)
             if record.seed != trial.seed or record.target_tokens != trial.token_budget:
                 raise LedgerStateError("run seed or budget does not match its trial")
-            if trial.eval_tokens is not None and record.evaluation_tokens != trial.eval_tokens:
-                raise LedgerStateError("run evaluation budget does not match its trial")
+            if trial.eval_tokens is not None and record.evaluation_tokens > trial.eval_tokens:
+                raise LedgerStateError("run exceeds its trial evaluation budget")
             if record.parameter_count > trial.limits.max_parameter_count:
                 raise LedgerStateError("run exceeds the trial parameter limit")
             if (
@@ -1089,16 +1186,32 @@ class ExperimentLedger:
     ) -> None:
         candidate = cls._require_record(connection, record.candidate_id, CandidateRecord)
         proposal = cls._require_record(connection, candidate.proposal_id, PatchProposal)
-        effect = cls._require_record(connection, record.effect_estimate_id, EffectEstimate)
-        if effect.candidate_id != record.candidate_id or effect.stage is not record.stage:
-            raise LedgerStateError("decision effect estimate differs from candidate or stage")
-        if (
-            record.minimum_useful_gain_bpb != proposal.minimum_useful_gain_bpb
-            or effect.minimum_useful_gain_bpb != proposal.minimum_useful_gain_bpb
-        ):
+        if record.effect_estimate_id is None:
+            effect = None
+            if record.verdict is not DecisionVerdict.REJECT or record.constraints_passed:
+                raise LedgerStateError(
+                    "only a constraint-failure rejection may omit an effect estimate"
+                )
+            stage_trial_ids = {
+                trial.trial_id
+                for trial in cls._records_of_type(connection, TrialSpec)
+                if trial.candidate_id == record.candidate_id and trial.stage is record.stage
+            }
+            if not any(
+                run.trial_id in stage_trial_ids and run.status is not RunStatus.SUCCEEDED
+                for run in cls._records_of_type(connection, RunResult)
+            ):
+                raise LedgerStateError("effect-free rejection requires a recorded failed stage run")
+        else:
+            effect = cls._require_record(connection, record.effect_estimate_id, EffectEstimate)
+            if effect.candidate_id != record.candidate_id or effect.stage is not record.stage:
+                raise LedgerStateError("decision effect estimate differs from candidate or stage")
+            if effect.minimum_useful_gain_bpb != proposal.minimum_useful_gain_bpb:
+                raise LedgerStateError("decision effect differs from proposal contract")
+            if record.constraints_passed != effect.constraints_passed:
+                raise LedgerStateError("decision constraints differ from effect estimate")
+        if record.minimum_useful_gain_bpb != proposal.minimum_useful_gain_bpb:
             raise LedgerStateError("decision minimum effect differs from proposal contract")
-        if record.constraints_passed != effect.constraints_passed:
-            raise LedgerStateError("decision constraints differ from effect estimate")
         if record.downstream_prediction_id is not None:
             prediction = cls._require_record(
                 connection,
@@ -1129,12 +1242,16 @@ class ExperimentLedger:
             raise LedgerStateError("candidate decisions must advance through stages")
 
         if record.verdict is DecisionVerdict.ESCALATE:
+            assert effect is not None
             assert record.next_stage is not None
             if _STAGE_ORDER[record.next_stage] <= _STAGE_ORDER[record.stage]:
                 raise LedgerStateError("escalation must advance to a later stage")
             if candidate.parent_commit != current_parent:
                 raise LedgerStateError("cannot escalate a candidate from a stale parent")
+            if effect.probability_exceeds_minimum < record.probability_threshold:
+                raise LedgerStateError("effect probability does not satisfy escalation threshold")
         elif record.verdict is DecisionVerdict.PROMOTE:
+            assert effect is not None
             if candidate.parent_commit != current_parent:
                 raise LedgerStateError("cannot promote a candidate from a stale parent")
             if record.resulting_parent_commit != candidate.candidate_commit:

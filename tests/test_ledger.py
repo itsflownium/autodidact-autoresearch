@@ -126,8 +126,8 @@ def test_trial_seed_and_evaluation_contracts_cannot_drift(tmp_path: Path) -> Non
     records = evidence_records()
     ledger.append_many(lifecycle_entries()[:3])
 
-    wrong_eval_budget = replace(records["parent_run"], evaluation_tokens=249_999)
-    with pytest.raises(LedgerStateError, match="evaluation budget"):
+    wrong_eval_budget = replace(records["parent_run"], evaluation_tokens=250_001)
+    with pytest.raises(LedgerStateError, match="exceeds its trial evaluation budget"):
         ledger.append(wrong_eval_budget, writer_role=WriterRole.EVALUATOR)
 
     ledger.append(records["parent_run"], writer_role=WriterRole.EVALUATOR)
