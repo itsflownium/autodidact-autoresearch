@@ -8,7 +8,7 @@ Autodidact starts with a **1,016,960-parameter transformer** that can run locall
 
 Autodidact builds on the compact workflow introduced by [Karpathy's autoresearch](https://github.com/karpathy/autoresearch), then adds **PatchRCT**, paired experiments, hidden evaluation, and Bayesian downstream-reward estimation.
 
-> **Status:** the immutable data system, baseline trainer, local seed-noise calibration, research-agent contract, versioned experiment records, append-only evidence ledger, CI checks, and resumable full-baseline runner are implemented. The three-seed, 20M-token parent baseline is complete. The paired experiment runner and automatic PatchRCT promotion controller are not integrated yet, and no candidate-patch improvement is claimed.
+> **Status:** the immutable data system, baseline trainer, local seed-noise calibration, research-agent contract, versioned experiment records, append-only evidence ledger, Bayesian downstream-reward estimator, CI checks, and resumable full-baseline runner are implemented. The three-seed, 20M-token parent baseline is complete. The paired runner and automatic PatchRCT controller are not integrated on this branch, the real full-budget calibration labels have not been collected, and no candidate-patch improvement is claimed.
 
 ## How it works
 
@@ -471,8 +471,8 @@ A patch can look good after 2M tokens and become neutral or harmful after 20M. A
 
 For this project, **downstream reward** is the patch's held-out BPB improvement after the full budget, measured on unseen seeds and data and subject to the resource constraints. The estimator observes early signals such as:
 
-- paired BPB differences at several checkpoints;
-- learning-curve slope and area;
+- paired BPB differences at completed cheap and intermediate stages;
+- training-loss learning-curve slope and area;
 - disagreement across seeds;
 - training-versus-development gap;
 - throughput and peak memory;
@@ -488,6 +488,39 @@ probability gain is useful: 87%
 The uncertainty drives compute allocation. Clearly poor candidates die early, uncertain candidates receive another seed or a longer run, and strong candidates proceed to held-out confirmation. A random sample of rejected patches is still fully evaluated so that missed improvements and estimator bias remain measurable.
 
 The downstream estimator does not replace PatchRCT. It helps PatchRCT decide **which experiment would be most useful next**.
+
+### Estimator implementation
+
+`autodidact.reward` extracts a fixed 15-value early-evidence vector from ledger-linked paired results and verified compact metrics artifacts. It captures stage counts and budget fraction, paired gain level and trend, across-seed disagreement, training-loss endpoint/slope/area deltas, throughput and RSS ratios, candidate failures, resource-constraint pass rate, and parameter ratio. Every metrics file is checked against its artifact size and SHA-256 before use.
+
+Feature snapshots can contain only cheap and intermediate evidence. Their ledger event sequence must precede the matching full-budget label, which prevents full outcomes from leaking into training features. Full labels aggregate the mean and sample variance of completed full-stage paired gains while retaining the resource-constraint outcome.
+
+Calibration uses conjugate Bayesian linear regression with a normal-inverse-gamma prior. The saved model contains feature standardization, posterior coefficients, posterior precision, noise parameters, source feature and label IDs, and leave-one-out RMSE, mean absolute error, and 90% predictive-interval coverage. Predictions are Student-t distributions rather than point estimates.
+
+The default model is considered calibrated only after 40 candidates have both early features and full labels. Before then, predictions remain diagnostic and the allocation is `run_full_for_calibration`. After calibration:
+
+- useful-gain probability at or below 10% returns `stop`;
+- probability at or above 80% returns `run_full`;
+- intermediate probability returns `gather_more_early_evidence`.
+
+Capture evidence and fit the model with:
+
+```bash
+uv run autodidact-reward extract \
+  --candidate-id candidate-001 \
+  --artifact-root artifacts/experiments
+
+uv run autodidact-reward label --candidate-id candidate-001
+uv run autodidact-reward calibrate
+```
+
+Generate a full-budget predictive interval and append its `DownstreamPrediction` record to the ledger:
+
+```bash
+uv run autodidact-reward predict --candidate-id candidate-001
+```
+
+Feature rows, labels, and model files default to `artifacts/reward/` and remain outside Git. Calibration files contain compact numerical evidence, not datasets or checkpoints. Collecting the actual 40 full-budget labels remains an experiment milestone rather than a claimed result of this implementation.
 
 ## How this extends autoresearch
 
@@ -548,6 +581,7 @@ assets/                  final figures
 - [x] Implement versioned experiment records and the append-only evidence ledger.
 - [ ] Implement protected paired parent-versus-patch experiments.
 - [ ] Implement PatchRCT promotion, rejection, and escalation gates.
+- [x] Implement Bayesian downstream-reward features, calibration, and prediction.
 - [ ] Collect 40 full-budget patch labels and calibrate downstream prediction.
 - [ ] Run the three-arm, 50-proposal local pilot.
 - [ ] Expand to repeated 100-proposal studies.
