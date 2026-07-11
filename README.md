@@ -584,7 +584,7 @@ assets/                  final figures
 - [x] Measure seed noise and execution noise locally.
 - [x] Implement versioned experiment records and the append-only evidence ledger.
 - [ ] Implement protected paired parent-versus-patch experiments.
-- [x] Implement PatchRCT promotion, rejection, and escalation gates.
+- [ ] Implement PatchRCT promotion, rejection, and escalation gates.
 - [ ] Collect 40 full-budget patch labels and calibrate downstream prediction.
 - [ ] Run the three-arm, 50-proposal local pilot.
 - [ ] Expand to repeated 100-proposal studies.
