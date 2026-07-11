@@ -576,7 +576,7 @@ assets/                  final figures
 - [x] Train and verify the 1,016,960-parameter TinyStories baseline.
 - [x] Measure seed noise and execution noise locally.
 - [x] Implement versioned experiment records and the append-only evidence ledger.
-- [x] Implement protected paired parent-versus-patch experiments.
+- [ ] Implement protected paired parent-versus-patch experiments.
 - [ ] Implement PatchRCT promotion, rejection, and escalation gates.
 - [ ] Collect 40 full-budget patch labels and calibrate downstream prediction.
 - [ ] Run the three-arm, 50-proposal local pilot.
