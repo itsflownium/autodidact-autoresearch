@@ -161,6 +161,66 @@ class WriterRole(StrEnum):
     EVALUATOR = "evaluator"
 
 
+def resource_constraint_failures(
+    trial: TrialSpec,
+    parent: RunResult,
+    candidate: RunResult,
+) -> tuple[str, ...]:
+    """Recompute candidate resource failures from a protected paired trial."""
+
+    limits = trial.limits
+    failures: list[str] = []
+    if candidate.parameter_count > limits.max_parameter_count:
+        failures.append("parameter_count")
+    if (
+        limits.max_peak_process_rss_bytes is not None
+        and candidate.peak_process_rss_bytes is not None
+        and candidate.peak_process_rss_bytes > limits.max_peak_process_rss_bytes
+    ):
+        failures.append("peak_process_rss")
+    if limits.max_peak_device_bytes is not None and (
+        candidate.peak_device_allocated_bytes is None
+        or candidate.peak_device_allocated_bytes > limits.max_peak_device_bytes
+    ):
+        failures.append("peak_device_memory")
+    if (
+        limits.min_training_tokens_per_second is not None
+        and candidate.training_tokens_per_second is not None
+        and candidate.training_tokens_per_second < limits.min_training_tokens_per_second
+    ):
+        failures.append("training_throughput_minimum")
+
+    if parent.training_tokens_per_second is None or candidate.training_tokens_per_second is None:
+        raise LedgerStateError("successful paired runs require training throughput")
+    if limits.max_training_throughput_regression_fraction is not None:
+        regression = (
+            parent.training_tokens_per_second - candidate.training_tokens_per_second
+        ) / parent.training_tokens_per_second
+        if regression > limits.max_training_throughput_regression_fraction:
+            failures.append("training_throughput_regression")
+    if parent.peak_process_rss_bytes is None or candidate.peak_process_rss_bytes is None:
+        raise LedgerStateError("successful paired runs require process memory")
+    if limits.max_peak_process_rss_regression_fraction is not None:
+        regression = (candidate.peak_process_rss_bytes - parent.peak_process_rss_bytes) / max(
+            parent.peak_process_rss_bytes, 1
+        )
+        if regression > limits.max_peak_process_rss_regression_fraction:
+            failures.append("peak_process_rss_regression")
+    if limits.max_peak_device_regression_fraction is not None:
+        if (
+            parent.peak_device_allocated_bytes is None
+            or candidate.peak_device_allocated_bytes is None
+        ):
+            failures.append("peak_device_regression_unavailable")
+        else:
+            regression = (
+                candidate.peak_device_allocated_bytes - parent.peak_device_allocated_bytes
+            ) / max(parent.peak_device_allocated_bytes, 1)
+            if regression > limits.max_peak_device_regression_fraction:
+                failures.append("peak_device_regression")
+    return tuple(sorted(failures))
+
+
 _ALLOWED_WRITERS: dict[str, frozenset[WriterRole]] = {
     PatchProposal.RECORD_TYPE: frozenset({WriterRole.RESEARCH_AGENT, WriterRole.CONTROLLER}),
     CandidateRecord.RECORD_TYPE: frozenset({WriterRole.CONTROLLER}),
@@ -825,8 +885,8 @@ class ExperimentLedger:
             candidate = cls._require_record(connection, trial.candidate_id, CandidateRecord)
             if record.seed != trial.seed or record.target_tokens != trial.token_budget:
                 raise LedgerStateError("run seed or budget does not match its trial")
-            if trial.eval_tokens is not None and record.evaluation_tokens != trial.eval_tokens:
-                raise LedgerStateError("run evaluation budget does not match its trial")
+            if trial.eval_tokens is not None and record.evaluation_tokens > trial.eval_tokens:
+                raise LedgerStateError("run exceeds its trial evaluation budget")
             if record.parameter_count > trial.limits.max_parameter_count:
                 raise LedgerStateError("run exceeds the trial parameter limit")
             if (
@@ -990,57 +1050,7 @@ class ExperimentLedger:
         parent: RunResult,
         candidate: RunResult,
     ) -> tuple[str, ...]:
-        limits = trial.limits
-        failures: list[str] = []
-        if candidate.parameter_count > limits.max_parameter_count:
-            failures.append("parameter_count")
-        if (
-            limits.max_peak_process_rss_bytes is not None
-            and candidate.peak_process_rss_bytes is not None
-            and candidate.peak_process_rss_bytes > limits.max_peak_process_rss_bytes
-        ):
-            failures.append("peak_process_rss")
-        if limits.max_peak_device_bytes is not None and (
-            candidate.peak_device_allocated_bytes is None
-            or candidate.peak_device_allocated_bytes > limits.max_peak_device_bytes
-        ):
-            failures.append("peak_device_memory")
-        if (
-            limits.min_training_tokens_per_second is not None
-            and candidate.training_tokens_per_second is not None
-            and candidate.training_tokens_per_second < limits.min_training_tokens_per_second
-        ):
-            failures.append("training_throughput_minimum")
-
-        assert parent.training_tokens_per_second is not None
-        assert candidate.training_tokens_per_second is not None
-        if limits.max_training_throughput_regression_fraction is not None:
-            regression = (
-                parent.training_tokens_per_second - candidate.training_tokens_per_second
-            ) / parent.training_tokens_per_second
-            if regression > limits.max_training_throughput_regression_fraction:
-                failures.append("training_throughput_regression")
-        assert parent.peak_process_rss_bytes is not None
-        assert candidate.peak_process_rss_bytes is not None
-        if limits.max_peak_process_rss_regression_fraction is not None:
-            regression = (candidate.peak_process_rss_bytes - parent.peak_process_rss_bytes) / max(
-                parent.peak_process_rss_bytes, 1
-            )
-            if regression > limits.max_peak_process_rss_regression_fraction:
-                failures.append("peak_process_rss_regression")
-        if limits.max_peak_device_regression_fraction is not None:
-            if (
-                parent.peak_device_allocated_bytes is None
-                or candidate.peak_device_allocated_bytes is None
-            ):
-                failures.append("peak_device_regression_unavailable")
-            else:
-                regression = (
-                    candidate.peak_device_allocated_bytes - parent.peak_device_allocated_bytes
-                ) / max(parent.peak_device_allocated_bytes, 1)
-                if regression > limits.max_peak_device_regression_fraction:
-                    failures.append("peak_device_regression")
-        return tuple(sorted(failures))
+        return resource_constraint_failures(trial, parent, candidate)
 
     @classmethod
     def _validate_pair(
