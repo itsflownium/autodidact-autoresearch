@@ -581,7 +581,6 @@ assets/                  final figures
 - [x] Implement versioned experiment records and the append-only evidence ledger.
 - [ ] Implement protected paired parent-versus-patch experiments.
 - [ ] Implement PatchRCT promotion, rejection, and escalation gates.
-- [x] Implement Bayesian downstream-reward features, calibration, and prediction.
 - [ ] Collect 40 full-budget patch labels and calibrate downstream prediction.
 - [ ] Run the three-arm, 50-proposal local pilot.
 - [ ] Expand to repeated 100-proposal studies.
