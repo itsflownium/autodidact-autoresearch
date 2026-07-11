@@ -8,7 +8,7 @@ Autodidact starts with a **1,016,960-parameter transformer** that can run locall
 
 Autodidact builds on the compact workflow introduced by [Karpathy's autoresearch](https://github.com/karpathy/autoresearch), then adds **PatchRCT**, paired experiments, hidden evaluation, and Bayesian downstream-reward estimation.
 
-> **Status:** the immutable data system, baseline trainer, local seed-noise calibration, research-agent contract, versioned experiment records, append-only evidence ledger, PatchRCT decision controller, CI checks, and resumable full-baseline runner are implemented. The three-seed, 20M-token parent baseline is complete. The protected paired runner and downstream-reward estimator are not integrated on this branch, and no candidate-patch improvement is claimed.
+> **Status:** the immutable data system, baseline trainer, local seed-noise calibration, research-agent contract, versioned experiment records, append-only evidence ledger, CI checks, and resumable full-baseline runner are implemented. The three-seed, 20M-token parent baseline is complete. The paired experiment runner and automatic PatchRCT promotion controller are not integrated yet, and no candidate-patch improvement is claimed.
 
 ## How it works
 
