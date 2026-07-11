@@ -332,6 +332,36 @@ PatchRCT validates candidates in stages:
 
 A patch is promoted only when the probability of exceeding the predeclared minimum useful effect is high enough and the runtime, memory, parameter, and stability constraints all pass. The resulting claim is intentionally narrow: the patch improved this parent, on this task, under these tested conditions.
 
+## Protected paired runner
+
+`autodidact.runner` executes a candidate without restricting its intended research surface: the candidate may change model and training behavior inside `train.py`. The runner instead protects the comparison around that code.
+
+Before any training starts, the runner:
+
+- requires the candidate to be one non-merge commit directly on the ledger's current parent;
+- verifies that the commit changes `train.py` and no protected repository path;
+- independently imports both trainers, constructs their models, and counts parameters;
+- verifies the public dataset and creates a public-only hardlinked view with no protected split directory;
+- commits every selected seed, balanced randomized execution order, budget, hash, evaluator, environment, and resource limit to trial records;
+- creates detached parent and candidate Git worktrees that are removed after the experiment.
+
+For each seed, parent and candidate run sequentially in the precommitted order. Training receives no evaluation or generation task. A protected evaluator then loads each checkpoint and computes cross-entropy and BPB itself; candidate-defined evaluation functions and printed scores are not used as outcomes. The controller measures subprocess wall time and process RSS, collects device-memory diagnostics, classifies crashes, timeouts, OOMs, non-finite failures, cancellations, and integrity failures, and hashes every retained artifact.
+
+Run a predeclared cheap experiment after its proposal is in the ledger:
+
+```bash
+uv run autodidact-runner \
+  --proposal-id proposal-001 \
+  --candidate-commit "$(git rev-parse candidate-branch)" \
+  --stage cheap \
+  --seeds 11 23 37 \
+  --assignment-seed 20260711 \
+  --max-throughput-regression 0.10 \
+  --max-process-rss-regression 0.10
+```
+
+The runner writes candidate, trial, run, manifest, compute, and paired-result records transactionally. Rerunning the same contract verifies and reuses immutable evidence rather than selecting a new outcome. Failed candidates are retained as evidence, and the other arm still runs when possible. Cheap, intermediate, full, promotion, and sealed-final stages use the same runner; evaluator-only splits are opened only inside the protected evaluator.
+
 ## PatchRCT architecture
 
 PatchRCT separates patch generation from experiment control and promotion. Only the research plane proposes code. Every measurement and decision comes from protected components outside the agent-editable workspace.
