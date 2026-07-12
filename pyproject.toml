@@ -20,6 +20,7 @@ autodidact-controller = "autodidact.controller:main"
 autodidact-data = "autodidact.data.cli:main"
 autodidact-evaluate = "autodidact.evaluator:main"
 autodidact-ledger = "autodidact.ledger:main"
+autodidact-state = "autodidact.runstate:main"
 autodidact-runner = "autodidact.runner:main"
 autodidact-train = "train:main"
 
