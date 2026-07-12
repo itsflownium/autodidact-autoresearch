@@ -16,9 +16,12 @@ from typing import Any
 from autodidact.data.integrity import canonical_json_bytes
 from autodidact.ledger import ExperimentLedger, LedgerError, WriterRole
 from autodidact.records import (
+    AllocationAction,
     CandidateRecord,
     DecisionRecord,
     DecisionVerdict,
+    DownstreamAllocation,
+    DownstreamPrediction,
     EffectEstimate,
     ExperimentStage,
     LineageRecord,
@@ -30,6 +33,8 @@ from autodidact.records import (
     TrialSchedule,
     TrialSpec,
     build_effect_estimate,
+    downstream_audit_assignment,
+    record_to_envelope,
 )
 
 CONTROLLER_SCHEMA_VERSION = 1
@@ -90,6 +95,11 @@ class PatchRCTPolicy:
     max_peak_process_rss_regression_fraction: float | None = 0.10
     max_peak_device_regression_fraction: float | None = 0.10
     force_full_evaluation: bool = False
+    use_downstream_allocation: bool = False
+    allocation_rejection_probability: float = 0.10
+    allocation_full_test_probability: float = 0.80
+    allocation_audit_fraction: float = 0.10
+    minimum_downstream_labels: int = 40
 
     def __post_init__(self) -> None:
         if not self.seed_pool or len(set(self.seed_pool)) != len(self.seed_pool):
@@ -144,8 +154,21 @@ class PatchRCTPolicy:
             self.rejection_probability < self.continuation_probability <= self.promotion_probability
         ):
             raise ControllerError("policy probability thresholds are not ordered")
-        if type(self.force_full_evaluation) is not bool:
-            raise ControllerError("force_full_evaluation must be boolean")
+        for name in ("force_full_evaluation", "use_downstream_allocation"):
+            if type(getattr(self, name)) is not bool:
+                raise ControllerError(f"{name} must be boolean")
+        for name in (
+            "allocation_rejection_probability",
+            "allocation_full_test_probability",
+            "allocation_audit_fraction",
+        ):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0.0 or value > 1.0:
+                raise ControllerError(f"{name} must lie between zero and one")
+        if self.allocation_rejection_probability >= self.allocation_full_test_probability:
+            raise ControllerError("allocation probability thresholds are not ordered")
+        if type(self.minimum_downstream_labels) is not int or self.minimum_downstream_labels <= 0:
+            raise ControllerError("minimum_downstream_labels must be a positive integer")
         self.resource_limits()
 
     def initial_pairs(self, stage: ExperimentStage) -> int:
@@ -501,6 +524,7 @@ class PatchRCTController:
         verdict: DecisionVerdict,
         *,
         effect: EffectEstimate | None,
+        downstream_prediction: DownstreamPrediction | None = None,
         probability_threshold: float,
         constraints_passed: bool,
         reasons: tuple[str, ...],
@@ -519,7 +543,9 @@ class PatchRCTController:
             stage=stage,
             verdict=verdict,
             effect_estimate_id=None if effect is None else effect.estimate_id,
-            downstream_prediction_id=None,
+            downstream_prediction_id=(
+                None if downstream_prediction is None else downstream_prediction.prediction_id
+            ),
             minimum_useful_gain_bpb=proposal.minimum_useful_gain_bpb,
             probability_threshold=probability_threshold,
             constraints_passed=constraints_passed,
@@ -572,14 +598,22 @@ class PatchRCTController:
         effect: EffectEstimate,
         *,
         forced_for_calibration: bool = False,
+        forced_for_allocation: bool = False,
     ) -> dict[str, Any]:
+        if forced_for_calibration and forced_for_allocation:
+            raise ControllerError("an escalation cannot use two forced policies")
         next_stage = _NEXT_STAGE[stage]
-        threshold = 0.0 if forced_for_calibration else self.policy.continuation_probability
-        reason = (
-            "calibration policy requires complete early and full-budget evidence"
-            if forced_for_calibration
-            else "useful-gain probability satisfies the stage continuation threshold"
-        )
+        forced = forced_for_calibration or forced_for_allocation
+        threshold = 0.0 if forced else self.policy.continuation_probability
+        if forced_for_calibration:
+            reason = "calibration policy requires complete early and full-budget evidence"
+            schedule_reason = f"{stage.value} calibration evidence advanced to {next_stage.value}"
+        elif forced_for_allocation:
+            reason = "allocation policy requires intermediate evidence before prediction"
+            schedule_reason = "cheap evidence advanced to intermediate allocation evidence"
+        else:
+            reason = "useful-gain probability satisfies the stage continuation threshold"
+            schedule_reason = f"{stage.value} evidence escalated to {next_stage.value}"
         decision = self._decision(
             candidate,
             proposal,
@@ -597,11 +631,7 @@ class PatchRCTController:
             stage=next_stage,
             seeds=self.policy.seed_pool[:count],
             source_effect=effect,
-            reason=(
-                f"{stage.value} calibration evidence advanced to {next_stage.value}"
-                if forced_for_calibration
-                else f"{stage.value} evidence escalated to {next_stage.value}"
-            ),
+            reason=schedule_reason,
         )
         self.ledger.append_many(
             (
@@ -666,6 +696,257 @@ class PatchRCTController:
             "stage": ExperimentStage.FULL.value,
         }
 
+    def _allocation_prediction(self, candidate_id: str) -> DownstreamPrediction:
+        trials = {
+            trial.trial_id: trial
+            for trial in self._records(TrialSpec, candidate_id)
+            if trial.stage in {ExperimentStage.CHEAP, ExperimentStage.INTERMEDIATE}
+        }
+        completed_trial_ids = {
+            pair.trial_id
+            for pair in self._records(PairedResult, candidate_id)
+            if pair.trial_id in trials
+        }
+        predictions = [
+            prediction
+            for prediction in self._records(DownstreamPrediction, candidate_id)
+            if prediction.target_stage is ExperimentStage.FULL
+            and set(prediction.source_trial_ids) == completed_trial_ids
+            and ExperimentStage.INTERMEDIATE in prediction.source_stages
+        ]
+        if not predictions:
+            raise ControllerError(
+                "downstream allocation requires a prediction from all current early evidence"
+            )
+        prediction = predictions[-1]
+        if prediction.full_budget_label_count < self.policy.minimum_downstream_labels:
+            raise ControllerError(
+                "downstream allocation requires a sufficiently calibrated reward model"
+            )
+        return prediction
+
+    def _allocation_record(
+        self,
+        candidate: CandidateRecord,
+        effect: EffectEstimate,
+        prediction: DownstreamPrediction,
+        *,
+        action: AllocationAction,
+        reason: str,
+        next_stage: ExperimentStage | None,
+        next_seed: int | None,
+        decision: DecisionRecord | None,
+        schedule: TrialSchedule | None,
+    ) -> DownstreamAllocation:
+        assignment_sha256, audit_score = downstream_audit_assignment(
+            candidate.candidate_id,
+            self.policy.sha256(),
+        )
+        return DownstreamAllocation(
+            allocation_id=_stable_id(
+                "allocation",
+                candidate.candidate_id,
+                effect.estimate_id,
+                prediction.prediction_id,
+                action.value,
+                self.policy.sha256(),
+            ),
+            candidate_id=candidate.candidate_id,
+            stage=ExperimentStage.INTERMEDIATE,
+            effect_estimate_id=effect.estimate_id,
+            downstream_prediction_id=prediction.prediction_id,
+            action=action,
+            rejection_probability=self.policy.allocation_rejection_probability,
+            full_test_probability=self.policy.allocation_full_test_probability,
+            audit_fraction=self.policy.allocation_audit_fraction,
+            audit_assignment_sha256=assignment_sha256,
+            audit_score=audit_score,
+            minimum_label_count=self.policy.minimum_downstream_labels,
+            next_stage=next_stage,
+            next_seed=next_seed,
+            planned_decision_id=None if decision is None else decision.decision_id,
+            planned_decision_sha256=(
+                None
+                if decision is None
+                else hashlib.sha256(canonical_json_bytes(record_to_envelope(decision))).hexdigest()
+            ),
+            planned_schedule_id=None if schedule is None else schedule.schedule_id,
+            planned_schedule_sha256=(
+                None
+                if schedule is None
+                else hashlib.sha256(canonical_json_bytes(record_to_envelope(schedule))).hexdigest()
+            ),
+            policy_sha256=self.policy.sha256(),
+            reason=reason,
+        )
+
+    def _allocate_downstream(
+        self,
+        candidate: CandidateRecord,
+        proposal: PatchProposal,
+        effect: EffectEstimate,
+        *,
+        remaining_seeds: tuple[int, ...],
+    ) -> dict[str, Any]:
+        prediction = self._allocation_prediction(candidate.candidate_id)
+        probability = prediction.probability_exceeds_minimum
+        _assignment_sha256, audit_score = downstream_audit_assignment(
+            candidate.candidate_id,
+            self.policy.sha256(),
+        )
+
+        if probability <= self.policy.allocation_rejection_probability:
+            if audit_score < self.policy.allocation_audit_fraction:
+                action = AllocationAction.AUDIT_FULL
+                reason = "protected audit sample requires a full label despite low prediction"
+            else:
+                action = AllocationAction.STOP
+                reason = "calibrated full-stage success probability is below the stop threshold"
+        elif probability >= self.policy.allocation_full_test_probability:
+            action = AllocationAction.RUN_FULL
+            reason = "calibrated full-stage success probability warrants full evaluation"
+        elif remaining_seeds:
+            action = AllocationAction.GATHER_MORE
+            reason = "downstream prediction is uncertain; gather the next predetermined seed"
+        else:
+            action = AllocationAction.UNCERTAIN_FULL
+            reason = "downstream prediction remains uncertain after exhausting early seeds"
+
+        if action is AllocationAction.STOP:
+            decision = self._decision(
+                candidate,
+                proposal,
+                ExperimentStage.INTERMEDIATE,
+                DecisionVerdict.REJECT,
+                effect=effect,
+                downstream_prediction=prediction,
+                probability_threshold=self.policy.allocation_rejection_probability,
+                constraints_passed=True,
+                reasons=(reason,),
+            )
+            allocation = self._allocation_record(
+                candidate,
+                effect,
+                prediction,
+                action=action,
+                reason=reason,
+                next_stage=None,
+                next_seed=None,
+                decision=decision,
+                schedule=None,
+            )
+            self.ledger.append_many(
+                (
+                    (allocation, WriterRole.CONTROLLER),
+                    (decision, WriterRole.CONTROLLER),
+                )
+            )
+            return {
+                "action": "reject",
+                "allocation_action": action.value,
+                "allocation_id": allocation.allocation_id,
+                "candidate_id": candidate.candidate_id,
+                "decision_id": decision.decision_id,
+                "prediction_id": prediction.prediction_id,
+                "probability_exceeds_minimum": probability,
+                "reasons": [reason],
+                "stage": ExperimentStage.INTERMEDIATE.value,
+            }
+
+        if action is AllocationAction.GATHER_MORE:
+            next_seed = remaining_seeds[0]
+            schedule = self._schedule(
+                candidate,
+                stage=ExperimentStage.INTERMEDIATE,
+                seeds=(next_seed,),
+                source_effect=effect,
+                reason=reason,
+            )
+            allocation = self._allocation_record(
+                candidate,
+                effect,
+                prediction,
+                action=action,
+                reason=reason,
+                next_stage=ExperimentStage.INTERMEDIATE,
+                next_seed=next_seed,
+                decision=None,
+                schedule=schedule,
+            )
+            self.ledger.append_many(
+                (
+                    (allocation, WriterRole.CONTROLLER),
+                    (schedule, WriterRole.CONTROLLER),
+                )
+            )
+            payload = self._schedule_payload(schedule)
+            payload.update(
+                {
+                    "allocation_action": action.value,
+                    "allocation_id": allocation.allocation_id,
+                    "prediction_id": prediction.prediction_id,
+                    "probability_exceeds_minimum": probability,
+                }
+            )
+            return payload
+
+        decision_threshold = (
+            self.policy.allocation_full_test_probability
+            if action is AllocationAction.RUN_FULL
+            else 0.0
+        )
+        decision = self._decision(
+            candidate,
+            proposal,
+            ExperimentStage.INTERMEDIATE,
+            DecisionVerdict.ESCALATE,
+            effect=effect,
+            downstream_prediction=prediction,
+            probability_threshold=decision_threshold,
+            constraints_passed=True,
+            reasons=(reason,),
+            next_stage=ExperimentStage.FULL,
+        )
+        count = self.policy.initial_pairs(ExperimentStage.FULL)
+        schedule = self._schedule(
+            candidate,
+            stage=ExperimentStage.FULL,
+            seeds=self.policy.seed_pool[:count],
+            source_effect=effect,
+            reason=reason,
+        )
+        allocation = self._allocation_record(
+            candidate,
+            effect,
+            prediction,
+            action=action,
+            reason=reason,
+            next_stage=ExperimentStage.FULL,
+            next_seed=None,
+            decision=decision,
+            schedule=schedule,
+        )
+        self.ledger.append_many(
+            (
+                (allocation, WriterRole.CONTROLLER),
+                (decision, WriterRole.CONTROLLER),
+                (schedule, WriterRole.CONTROLLER),
+            )
+        )
+        payload = self._schedule_payload(schedule)
+        payload.update(
+            {
+                "allocation_action": action.value,
+                "allocation_id": allocation.allocation_id,
+                "decision_id": decision.decision_id,
+                "from_stage": ExperimentStage.INTERMEDIATE.value,
+                "prediction_id": prediction.prediction_id,
+                "probability_exceeds_minimum": probability,
+                "verdict": DecisionVerdict.ESCALATE.value,
+            }
+        )
+        return payload
+
     def advance(self, candidate_id: str) -> dict[str, Any]:
         candidate, proposal = self._candidate(candidate_id)
         decisions = self._records(DecisionRecord, candidate_id)
@@ -722,7 +1003,13 @@ class PatchRCTController:
             )
         probability = effect.probability_exceeds_minimum
         forced_for_calibration = self.policy.force_full_evaluation and stage in _NEXT_STAGE
-        if not forced_for_calibration and probability <= self.policy.rejection_probability:
+        allocation_active = (
+            self.policy.use_downstream_allocation and not self.policy.force_full_evaluation
+        )
+        protected_early_stage = forced_for_calibration or (
+            allocation_active and stage in {ExperimentStage.CHEAP, ExperimentStage.INTERMEDIATE}
+        )
+        if not protected_early_stage and probability <= self.policy.rejection_probability:
             return self._reject(
                 candidate,
                 proposal,
@@ -747,9 +1034,7 @@ class PatchRCTController:
             )
             self.ledger.append(schedule, writer_role=WriterRole.CONTROLLER)
             return self._schedule_payload(schedule)
-        if stage in _NEXT_STAGE and (
-            forced_for_calibration or probability >= self.policy.continuation_probability
-        ):
+        if forced_for_calibration:
             return self._escalate(
                 candidate,
                 proposal,
@@ -757,6 +1042,23 @@ class PatchRCTController:
                 effect,
                 forced_for_calibration=forced_for_calibration,
             )
+        if allocation_active and stage is ExperimentStage.CHEAP:
+            return self._escalate(
+                candidate,
+                proposal,
+                stage,
+                effect,
+                forced_for_allocation=True,
+            )
+        if allocation_active and stage is ExperimentStage.INTERMEDIATE:
+            return self._allocate_downstream(
+                candidate,
+                proposal,
+                effect,
+                remaining_seeds=remaining,
+            )
+        if stage in _NEXT_STAGE and probability >= self.policy.continuation_probability:
+            return self._escalate(candidate, proposal, stage, effect)
         if stage is ExperimentStage.FULL and probability >= self.policy.promotion_probability:
             return self._promote(candidate, proposal, effect)
         if remaining:
@@ -788,6 +1090,7 @@ class PatchRCTController:
         schedules = self._records(TrialSchedule, candidate_id)
         decisions = self._records(DecisionRecord, candidate_id)
         effects = self._records(EffectEstimate, candidate_id)
+        allocations = self._records(DownstreamAllocation, candidate_id)
         latest_decision = decisions[-1] if decisions else None
         return {
             "action": "status",
@@ -806,8 +1109,18 @@ class PatchRCTController:
             "latest_verdict": (None if latest_decision is None else latest_decision.verdict.value),
             "policy_sha256": self.policy.sha256(),
             "force_full_evaluation": self.policy.force_full_evaluation,
+            "latest_allocation": (
+                None
+                if not allocations
+                else {
+                    "action": allocations[-1].action.value,
+                    "allocation_id": allocations[-1].allocation_id,
+                    "prediction_id": allocations[-1].downstream_prediction_id,
+                }
+            ),
             "schedule_ids": [schedule.schedule_id for schedule in schedules],
             "stages_scheduled": [schedule.stage.value for schedule in schedules],
+            "use_downstream_allocation": self.policy.use_downstream_allocation,
         }
 
 

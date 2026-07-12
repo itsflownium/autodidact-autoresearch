@@ -18,6 +18,7 @@ from autodidact.orchestrator import (
     main,
 )
 from autodidact.records import (
+    AllocationAction,
     ArtifactManifest,
     ArtifactRef,
     ArtifactRetention,
@@ -25,6 +26,7 @@ from autodidact.records import (
     ComputeRecord,
     DecisionRecord,
     DecisionVerdict,
+    DownstreamAllocation,
     DownstreamPrediction,
     ExperimentStage,
     PairedResult,
@@ -322,7 +324,11 @@ class SyntheticRunner:
         }
 
 
-def _policy() -> PatchRCTPolicy:
+def _policy(
+    *,
+    use_downstream_allocation: bool = False,
+    allocation_audit_fraction: float = 0.10,
+) -> PatchRCTPolicy:
     return PatchRCTPolicy(
         seed_pool=(11, 23, 37, 53, 71),
         cheap_initial_pairs=1,
@@ -340,6 +346,8 @@ def _policy() -> PatchRCTPolicy:
         prior_standard_deviation_bpb=0.1,
         seed_noise_standard_deviation_bpb=0.001,
         max_peak_device_regression_fraction=None,
+        use_downstream_allocation=use_downstream_allocation,
+        allocation_audit_fraction=allocation_audit_fraction,
     )
 
 
@@ -350,6 +358,7 @@ def _campaign(
     gain_bpb: float,
     max_training_tokens: int = 100_000,
     reward_calibration_labels: int = 0,
+    use_downstream_allocation: bool = False,
 ) -> tuple[
     AutonomousResearchOrchestrator,
     CampaignStore,
@@ -372,6 +381,7 @@ def _campaign(
             max_training_tokens=max_training_tokens,
             max_compute_seconds=10_000,
             reward_calibration_labels=reward_calibration_labels,
+            use_downstream_allocation=use_downstream_allocation,
         ),
     )
     output_root = tmp_path / "experiment-artifacts"
@@ -393,7 +403,10 @@ def _campaign(
         state=state,
         ledger=ledger,
         researcher=_researcher(tmp_path),
-        policy=_policy(),
+        policy=_policy(
+            use_downstream_allocation=use_downstream_allocation,
+            allocation_audit_fraction=0.0 if use_downstream_allocation else 0.10,
+        ),
         runner_factory=factory,
     )
     return orchestrator, state, ledger, factory, repository
@@ -557,6 +570,46 @@ def test_calibration_campaign_collects_target_then_restores_early_rejection(
     )
 
 
+def test_calibration_then_prediction_allocation_stops_bad_patch_before_full(
+    tmp_path: Path,
+) -> None:
+    orchestrator, state, ledger, factory, _repository_root = _campaign(
+        tmp_path,
+        max_proposals=3,
+        gain_bpb=-0.02,
+        reward_calibration_labels=2,
+        use_downstream_allocation=True,
+    )
+    parent = ledger.current_parent()
+
+    result = orchestrator.run()
+
+    assert result["status"] == "completed"
+    assert ledger.current_parent() == parent
+    assert state.snapshot().generation == 0
+    assert factory.run_calls == [
+        (ExperimentStage.CHEAP, (11,)),
+        (ExperimentStage.INTERMEDIATE, (11, 23)),
+        (ExperimentStage.FULL, (11, 23, 37)),
+        (ExperimentStage.CHEAP, (11,)),
+        (ExperimentStage.INTERMEDIATE, (11, 23)),
+        (ExperimentStage.FULL, (11, 23, 37)),
+        (ExperimentStage.CHEAP, (11,)),
+        (ExperimentStage.INTERMEDIATE, (11, 23)),
+    ]
+    assert result["downstream_allocation"]["ready"] is True
+    allocations = [
+        event.record for event in ledger.events() if isinstance(event.record, DownstreamAllocation)
+    ]
+    assert len(allocations) == 1
+    assert allocations[0].action is AllocationAction.STOP
+    decision = ledger.get(allocations[0].planned_decision_id or "missing").record
+    assert isinstance(decision, DecisionRecord)
+    assert decision.verdict is DecisionVerdict.REJECT
+    assert decision.downstream_prediction_id == allocations[0].downstream_prediction_id
+    assert len(load_labels(tmp_path / "reward" / "full-labels.jsonl")) == 2
+
+
 def test_uncertain_patch_runs_each_next_predetermined_seed(tmp_path: Path) -> None:
     orchestrator, state, ledger, factory, _repository_root = _campaign(
         tmp_path,
@@ -652,6 +705,7 @@ def test_cli_initializes_and_reports_campaign_without_researcher_call(
             "1000",
             "--reward-calibration-labels",
             "2",
+            "--use-downstream-allocation",
         ]
     )
 
@@ -659,6 +713,8 @@ def test_cli_initializes_and_reports_campaign_without_researcher_call(
     initialized = json.loads(capsys.readouterr().out)
     assert initialized["campaign"]["accepted_parent_commit"] == parent
     assert initialized["campaign"]["limits"]["reward_calibration_labels"] == 2
+    assert initialized["campaign"]["limits"]["use_downstream_allocation"] is True
+    assert initialized["downstream_allocation"]["ready"] is False
     assert initialized["reward_calibration"]["remaining_labels"] == 2
     assert _git(repository, "rev-parse", "refs/autodidact/accepted") == parent
 
@@ -666,6 +722,13 @@ def test_cli_initializes_and_reports_campaign_without_researcher_call(
     status = json.loads(capsys.readouterr().out)
     assert status["campaign"]["status"] == "running"
     assert status["ledger"]["event_count"] == 0
+    assert status["downstream_allocation"] == {
+        "enabled": True,
+        "label_count": 0,
+        "minimum_labels": 2,
+        "ready": False,
+        "reason": "reward calibration is still collecting labels",
+    }
     assert status["reward_calibration"] == {
         "active": True,
         "completed_labels": 0,

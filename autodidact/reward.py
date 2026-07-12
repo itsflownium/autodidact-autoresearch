@@ -904,6 +904,8 @@ def recommendation(
     reject_probability: float = 0.10,
     full_test_probability: float = 0.80,
 ) -> str:
+    if not 0.0 <= reject_probability < full_test_probability <= 1.0:
+        raise RewardError("allocation probability thresholds are not ordered")
     if not model.calibrated:
         return "run_full_for_calibration"
     if prediction.probability_exceeds_minimum <= reject_probability:
@@ -918,6 +920,9 @@ def build_downstream_prediction(
     candidate_id: str,
     features: LearningCurveFeatures,
     model: BayesianRewardModel,
+    *,
+    reject_probability: float = 0.10,
+    full_test_probability: float = 0.80,
 ) -> tuple[DownstreamPrediction, PredictiveDistribution, str]:
     candidate_event = ledger.get(candidate_id)
     if not isinstance(candidate_event.record, CandidateRecord):
@@ -953,7 +958,16 @@ def build_downstream_prediction(
         model_version=f"{MODEL_VERSION}:{model_hash[:16]}",
         full_budget_label_count=model.label_count,
     )
-    return prediction, distribution, recommendation(model, distribution)
+    return (
+        prediction,
+        distribution,
+        recommendation(
+            model,
+            distribution,
+            reject_probability=reject_probability,
+            full_test_probability=full_test_probability,
+        ),
+    )
 
 
 def _path(value: str) -> Path:

@@ -163,6 +163,7 @@ class CampaignLimits:
     max_training_tokens: int
     max_compute_seconds: float
     reward_calibration_labels: int = 0
+    use_downstream_allocation: bool = False
 
     def __post_init__(self) -> None:
         for name in ("max_proposals", "max_researcher_tokens", "max_training_tokens"):
@@ -179,6 +180,8 @@ class CampaignLimits:
             or self.reward_calibration_labels > self.max_proposals
         ):
             raise RunStateError("reward_calibration_labels must be between zero and max_proposals")
+        if type(self.use_downstream_allocation) is not bool:
+            raise RunStateError("use_downstream_allocation must be boolean")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1190,6 +1193,7 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--max-training-tokens", type=int, required=True)
     create.add_argument("--max-compute-seconds", type=float, required=True)
     create.add_argument("--reward-calibration-labels", type=int, default=0)
+    create.add_argument("--use-downstream-allocation", action="store_true")
 
     for name in ("pause", "cancel"):
         command = commands.add_parser(name)
@@ -1219,6 +1223,7 @@ def main(argv: list[str] | None = None) -> int:
                     max_training_tokens=args.max_training_tokens,
                     max_compute_seconds=args.max_compute_seconds,
                     reward_calibration_labels=args.reward_calibration_labels,
+                    use_downstream_allocation=args.use_downstream_allocation,
                 ),
             )
         else:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -10,6 +11,7 @@ import pytest
 
 from autodidact.controller import (
     DEFAULT_ACCEPTED_REF,
+    ControllerError,
     PatchRCTController,
     PatchRCTPolicy,
     main,
@@ -17,19 +19,24 @@ from autodidact.controller import (
 )
 from autodidact.ledger import ExperimentLedger, LedgerStateError, WriterRole
 from autodidact.records import (
+    AllocationAction,
     ArtifactManifest,
     ArtifactRef,
     ArtifactRetention,
     CandidateRecord,
     DecisionRecord,
     DecisionVerdict,
+    DownstreamAllocation,
+    DownstreamPrediction,
     EffectEstimate,
     ExperimentStage,
     LineageRecord,
+    PairedResult,
     PatchProposal,
     RunResult,
     RunStatus,
     TrialSchedule,
+    TrialSpec,
     build_paired_result,
 )
 from tests.experiment_fixtures import digest, evidence_records
@@ -232,6 +239,74 @@ def _complete_schedule(
         ledger.append(pair, writer_role=WriterRole.EVALUATOR)
 
 
+def _append_prediction(
+    ledger: ExperimentLedger,
+    candidate: CandidateRecord,
+    probability: float,
+    *,
+    label_count: int = 2,
+) -> DownstreamPrediction:
+    trials = {
+        event.record.trial_id: event.record
+        for event in ledger.events()
+        if isinstance(event.record, TrialSpec)
+        and event.record.candidate_id == candidate.candidate_id
+        and event.record.stage in {ExperimentStage.CHEAP, ExperimentStage.INTERMEDIATE}
+    }
+    source_trial_ids = tuple(
+        event.record.trial_id
+        for event in ledger.events()
+        if isinstance(event.record, PairedResult) and event.record.trial_id in trials
+    )
+    source_stages = tuple(
+        stage
+        for stage in (ExperimentStage.CHEAP, ExperimentStage.INTERMEDIATE)
+        if any(trials[trial_id].stage is stage for trial_id in source_trial_ids)
+    )
+    proposal = ledger.get(candidate.proposal_id).record
+    assert isinstance(proposal, PatchProposal)
+    prediction = DownstreamPrediction(
+        prediction_id=(
+            f"prediction-allocation-{len(source_trial_ids):02d}-{int(probability * 1000):03d}"
+        ),
+        candidate_id=candidate.candidate_id,
+        source_trial_ids=source_trial_ids,
+        source_stages=source_stages,
+        target_stage=ExperimentStage.FULL,
+        expected_gain_bpb=0.01 if probability >= 0.5 else -0.01,
+        predictive_standard_deviation=0.005,
+        interval_lower_bpb=-0.02,
+        interval_upper_bpb=0.02,
+        minimum_useful_gain_bpb=proposal.minimum_useful_gain_bpb,
+        probability_exceeds_minimum=probability,
+        model_version="test-bayesian-reward-v1",
+        full_budget_label_count=label_count,
+    )
+    ledger.append(prediction, writer_role=WriterRole.CONTROLLER)
+    return prediction
+
+
+def _complete_allocation_early_stages(
+    ledger: ExperimentLedger,
+    controller: PatchRCTController,
+    candidate: CandidateRecord,
+    *,
+    gain_bpb: float = -0.01,
+) -> None:
+    controller.initialize(candidate.candidate_id)
+    cheap = _latest_schedule(ledger, ExperimentStage.CHEAP)
+    _complete_schedule(ledger, candidate, cheap, {11: gain_bpb})
+    action = controller.advance(candidate.candidate_id)
+    assert action["stage"] == ExperimentStage.INTERMEDIATE.value
+    intermediate = _latest_schedule(ledger, ExperimentStage.INTERMEDIATE)
+    _complete_schedule(
+        ledger,
+        candidate,
+        intermediate,
+        {seed: gain_bpb for seed in intermediate.seeds},
+    )
+
+
 def _latest_schedule(
     ledger: ExperimentLedger,
     stage: ExperimentStage,
@@ -402,6 +477,172 @@ def test_calibration_policy_does_not_override_run_failure_rejection(tmp_path: Pa
 
     assert rejected["action"] == "reject"
     assert len([event for event in ledger.events() if isinstance(event.record, TrialSchedule)]) == 1
+
+
+def test_calibrated_low_prediction_stops_after_intermediate_evidence(tmp_path: Path) -> None:
+    policy = PatchRCTPolicy(
+        use_downstream_allocation=True,
+        allocation_audit_fraction=0.0,
+        minimum_downstream_labels=2,
+    )
+    ledger, controller, candidate, _repository_root = _setup(tmp_path, policy=policy)
+    _complete_allocation_early_stages(ledger, controller, candidate)
+    prediction = _append_prediction(ledger, candidate, 0.05)
+    before_allocation = tmp_path / "before-allocation.sqlite3"
+    shutil.copy2(ledger.path, before_allocation)
+
+    rejected = controller.advance(candidate.candidate_id)
+
+    assert rejected["action"] == "reject"
+    assert rejected["allocation_action"] == AllocationAction.STOP.value
+    allocations = [
+        event.record for event in ledger.events() if isinstance(event.record, DownstreamAllocation)
+    ]
+    assert len(allocations) == 1
+    allocation = allocations[0]
+    assert allocation.downstream_prediction_id == prediction.prediction_id
+    decision = ledger.get(allocation.planned_decision_id or "missing").record
+    assert isinstance(decision, DecisionRecord)
+    assert decision.verdict is DecisionVerdict.REJECT
+    assert decision.downstream_prediction_id == prediction.prediction_id
+    assert ledger.verify().event_count == len(ledger.events())
+
+    incomplete = ExperimentLedger.open(before_allocation, read_only=False)
+    effect = ledger.get(allocation.effect_estimate_id).record
+    assert isinstance(effect, EffectEstimate)
+    incomplete.append(effect, writer_role=WriterRole.CONTROLLER)
+    with pytest.raises(LedgerStateError, match="decision hash differs"):
+        incomplete.append_many(
+            (
+                (
+                    replace(allocation, planned_decision_sha256="f" * 64),
+                    WriterRole.CONTROLLER,
+                ),
+                (decision, WriterRole.CONTROLLER),
+            )
+        )
+    with pytest.raises(LedgerStateError, match="planned decision is missing"):
+        incomplete.append(allocation, writer_role=WriterRole.CONTROLLER)
+    assert not any(isinstance(event.record, DownstreamAllocation) for event in incomplete.events())
+
+
+def test_high_prediction_allocates_full_but_cannot_promote_without_full_effect(
+    tmp_path: Path,
+) -> None:
+    policy = PatchRCTPolicy(
+        use_downstream_allocation=True,
+        allocation_audit_fraction=0.0,
+        minimum_downstream_labels=2,
+    )
+    ledger, controller, candidate, _repository_root = _setup(tmp_path, policy=policy)
+    _complete_allocation_early_stages(ledger, controller, candidate)
+    prediction = _append_prediction(ledger, candidate, 0.90)
+
+    full_action = controller.advance(candidate.candidate_id)
+
+    assert full_action["allocation_action"] == AllocationAction.RUN_FULL.value
+    assert full_action["stage"] == ExperimentStage.FULL.value
+    allocation = next(
+        event.record for event in ledger.events() if isinstance(event.record, DownstreamAllocation)
+    )
+    assert allocation.downstream_prediction_id == prediction.prediction_id
+    full = _latest_schedule(ledger, ExperimentStage.FULL)
+    _complete_schedule(
+        ledger,
+        candidate,
+        full,
+        {seed: -0.01 for seed in full.seeds},
+    )
+
+    rejected = controller.advance(candidate.candidate_id)
+
+    assert rejected["action"] == "reject"
+    decisions = [
+        event.record for event in ledger.events() if isinstance(event.record, DecisionRecord)
+    ]
+    assert decisions[-1].stage is ExperimentStage.FULL
+    assert decisions[-1].verdict is DecisionVerdict.REJECT
+    assert decisions[-1].downstream_prediction_id is None
+
+
+def test_uncertain_prediction_gathers_next_fixed_intermediate_seed(tmp_path: Path) -> None:
+    policy = PatchRCTPolicy(
+        use_downstream_allocation=True,
+        allocation_audit_fraction=0.0,
+        minimum_downstream_labels=2,
+    )
+    ledger, controller, candidate, _repository_root = _setup(tmp_path, policy=policy)
+    _complete_allocation_early_stages(ledger, controller, candidate)
+    _append_prediction(ledger, candidate, 0.50)
+
+    for expected_seed in (37, 53, 71):
+        action = controller.advance(candidate.candidate_id)
+        assert action["allocation_action"] == AllocationAction.GATHER_MORE.value
+        assert action["stage"] == ExperimentStage.INTERMEDIATE.value
+        assert action["seeds"] == [expected_seed]
+        schedule = _latest_schedule(ledger, ExperimentStage.INTERMEDIATE)
+        _complete_schedule(ledger, candidate, schedule, {expected_seed: -0.01})
+        _append_prediction(ledger, candidate, 0.50)
+
+    full_action = controller.advance(candidate.candidate_id)
+
+    assert full_action["allocation_action"] == AllocationAction.UNCERTAIN_FULL.value
+    assert full_action["stage"] == ExperimentStage.FULL.value
+    allocations = [
+        event.record for event in ledger.events() if isinstance(event.record, DownstreamAllocation)
+    ]
+    assert [allocation.action for allocation in allocations] == [
+        AllocationAction.GATHER_MORE,
+        AllocationAction.GATHER_MORE,
+        AllocationAction.GATHER_MORE,
+        AllocationAction.UNCERTAIN_FULL,
+    ]
+    assert [allocation.next_seed for allocation in allocations[:3]] == [37, 53, 71]
+    assert all(allocation.planned_decision_id is None for allocation in allocations[:3])
+
+
+def test_low_prediction_audit_sample_runs_full_and_uncalibrated_prediction_fails_closed(
+    tmp_path: Path,
+) -> None:
+    policy = PatchRCTPolicy(
+        use_downstream_allocation=True,
+        allocation_audit_fraction=1.0,
+        minimum_downstream_labels=2,
+    )
+    ledger, controller, candidate, _repository_root = _setup(tmp_path, policy=policy)
+    _complete_allocation_early_stages(ledger, controller, candidate)
+    _append_prediction(ledger, candidate, 0.05, label_count=1)
+
+    with pytest.raises(ControllerError, match="sufficiently calibrated"):
+        controller.advance(candidate.candidate_id)
+
+    prediction = _append_prediction(ledger, candidate, 0.04, label_count=2)
+    action = controller.advance(candidate.candidate_id)
+
+    assert action["allocation_action"] == AllocationAction.AUDIT_FULL.value
+    assert action["stage"] == ExperimentStage.FULL.value
+    allocation = next(
+        event.record for event in ledger.events() if isinstance(event.record, DownstreamAllocation)
+    )
+    assert allocation.downstream_prediction_id == prediction.prediction_id
+
+
+def test_allocation_policy_does_not_override_run_failure_rejection(tmp_path: Path) -> None:
+    ledger, controller, candidate, _repository_root = _setup(
+        tmp_path,
+        policy=PatchRCTPolicy(
+            use_downstream_allocation=True,
+            minimum_downstream_labels=2,
+        ),
+    )
+    controller.initialize(candidate.candidate_id)
+    cheap = _latest_schedule(ledger, ExperimentStage.CHEAP)
+    _complete_schedule(ledger, candidate, cheap, {}, failed_seed=11)
+
+    rejected = controller.advance(candidate.candidate_id)
+
+    assert rejected["action"] == "reject"
+    assert not any(isinstance(event.record, DownstreamAllocation) for event in ledger.events())
 
 
 def test_terminal_run_failure_is_rejected_without_fabricating_effect(tmp_path: Path) -> None:
