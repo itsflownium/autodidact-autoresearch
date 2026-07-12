@@ -12,6 +12,7 @@ import pytest
 from autodidact.controller import (
     DEFAULT_ACCEPTED_REF,
     ControllerError,
+    DecisionMode,
     PatchRCTController,
     PatchRCTPolicy,
     main,
@@ -332,6 +333,59 @@ def test_posterior_probability_increases_with_stronger_and_repeated_gains() -> N
     assert neutral.probability_exceeds_minimum < strong.probability_exceeds_minimum
     assert repeated.probability_exceeds_minimum > strong.probability_exceeds_minimum
     assert repeated.standard_deviation_bpb < strong.standard_deviation_bpb
+
+
+def test_greedy_mode_keeps_one_positive_cheap_result_and_advances_lineage(
+    tmp_path: Path,
+) -> None:
+    policy = PatchRCTPolicy(decision_mode=DecisionMode.GREEDY)
+    ledger, controller, candidate, repository = _setup(
+        tmp_path,
+        repository=True,
+        policy=policy,
+    )
+    assert repository is not None
+    controller.initialize(candidate.candidate_id)
+    cheap = _latest_schedule(ledger, ExperimentStage.CHEAP)
+    _complete_schedule(ledger, candidate, cheap, {11: 0.0001})
+
+    action = controller.advance(candidate.candidate_id)
+
+    assert action["action"] == "promote"
+    assert action["stage"] == ExperimentStage.CHEAP.value
+    assert ledger.current_parent() == candidate.candidate_commit
+    decisions = [
+        event.record for event in ledger.events() if isinstance(event.record, DecisionRecord)
+    ]
+    assert decisions[-1].probability_threshold == 0.0
+    assert "greedy keep/discard" in decisions[-1].reasons[0]
+    assert _git(repository, "rev-parse", DEFAULT_ACCEPTED_REF) == candidate.candidate_commit
+
+
+def test_greedy_mode_discards_nonpositive_result_without_escalating(tmp_path: Path) -> None:
+    policy = PatchRCTPolicy(decision_mode=DecisionMode.GREEDY)
+    ledger, controller, candidate, _repository_root = _setup(tmp_path, policy=policy)
+    controller.initialize(candidate.candidate_id)
+    cheap = _latest_schedule(ledger, ExperimentStage.CHEAP)
+    _complete_schedule(ledger, candidate, cheap, {11: 0.0})
+
+    action = controller.advance(candidate.candidate_id)
+
+    assert action["action"] == "reject"
+    assert action["stage"] == ExperimentStage.CHEAP.value
+    schedules = [
+        event.record for event in ledger.events() if isinstance(event.record, TrialSchedule)
+    ]
+    assert [schedule.stage for schedule in schedules] == [ExperimentStage.CHEAP]
+    assert ledger.current_parent() == candidate.parent_commit
+
+
+def test_greedy_mode_cannot_enable_patchrct_calibration_or_allocation() -> None:
+    with pytest.raises(ControllerError, match="greedy mode"):
+        PatchRCTPolicy(
+            decision_mode=DecisionMode.GREEDY,
+            use_downstream_allocation=True,
+        )
 
 
 def test_controller_escalates_all_stages_and_atomically_promotes_git_parent(

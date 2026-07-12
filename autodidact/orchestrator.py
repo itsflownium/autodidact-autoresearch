@@ -15,6 +15,7 @@ from typing import Any, Protocol
 
 from autodidact.controller import (
     DEFAULT_ACCEPTED_REF,
+    DecisionMode,
     PatchRCTController,
     PatchRCTPolicy,
     synchronize_accepted_ref,
@@ -216,6 +217,7 @@ class OrchestratorConfig:
     max_parameter_count: int = 1_050_000
     target_name: str = "Autodidact TinyStories transformer"
     target_execution_location: str = "local"
+    accepted_ref: str = DEFAULT_ACCEPTED_REF
 
     def __post_init__(self) -> None:
         if type(self.researcher_token_allowance) is not int or self.researcher_token_allowance <= 0:
@@ -235,6 +237,10 @@ class OrchestratorConfig:
             raise OrchestratorError("target_name must be nonempty")
         if self.target_execution_location not in {"local", "gpu_host"}:
             raise OrchestratorError("target_execution_location is invalid")
+        if not self.accepted_ref.startswith("refs/autodidact/") or any(
+            part in {"", ".", ".."} for part in self.accepted_ref.split("/")
+        ):
+            raise OrchestratorError("accepted_ref must be a protected refs/autodidact Git ref")
 
     @property
     def features_path(self) -> Path:
@@ -311,6 +317,13 @@ class AutonomousResearchOrchestrator:
         )
 
     def _controller_for_candidate(self, candidate: CandidateRecord) -> PatchRCTController:
+        if self.policy.decision_mode is DecisionMode.GREEDY:
+            return PatchRCTController(
+                self.ledger,
+                policy=self.policy,
+                repository_root=self.repository_root,
+                accepted_ref=self.config.accepted_ref,
+            )
         minimum_labels = self._calibration_target() or self.config.minimum_reward_labels
         standard_policy = replace(
             self.policy,
@@ -359,6 +372,7 @@ class AutonomousResearchOrchestrator:
             self.ledger,
             policy=selected,
             repository_root=self.repository_root,
+            accepted_ref=self.config.accepted_ref,
         )
 
     def _assert_consistent_parent(self) -> None:
@@ -1015,6 +1029,13 @@ class AutonomousResearchOrchestrator:
         candidate: CandidateRecord,
         schedule: TrialSchedule,
     ) -> dict[str, Any]:
+        if self.policy.decision_mode is DecisionMode.GREEDY:
+            return {
+                "candidate_id": candidate.candidate_id,
+                "reason": "greedy arm does not fit or query the downstream reward model",
+                "recommendation": "not_applicable",
+                "stage": schedule.stage.value,
+            }
         operation_key = f"reward-{schedule.schedule_id}"
         evidence = self._record_snapshot()
         schedule_trials = self._schedule_trials(schedule, source=evidence)
@@ -1341,6 +1362,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--researcher-config", type=_path, default=DEFAULT_RESEARCHER_CONFIG_PATH)
     parser.add_argument("--target-config", type=_path)
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--accepted-ref", default=DEFAULT_ACCEPTED_REF)
+    parser.add_argument(
+        "--decision-mode",
+        type=DecisionMode,
+        choices=tuple(DecisionMode),
+        default=DecisionMode.PATCH_RCT,
+    )
     commands = parser.add_subparsers(dest="command", required=True)
 
     initialize = commands.add_parser("initialize")
@@ -1389,6 +1417,7 @@ def _config_from_args(args: argparse.Namespace) -> OrchestratorConfig:
         max_parameter_count=(1_050_000 if target is None else target.max_parameter_count),
         target_name=("Autodidact TinyStories transformer" if target is None else target.name),
         target_execution_location=("local" if target is None else target.execution_location.value),
+        accepted_ref=args.accepted_ref,
         researcher_token_allowance=getattr(
             args,
             "researcher_token_allowance",
@@ -1407,7 +1436,7 @@ def main(argv: list[str] | None = None) -> int:
                     ledger = ExperimentLedger.open(args.ledger_path, read_only=False)
                     parent = ledger.current_parent()
                 else:
-                    parent = _initial_parent(repository_root, DEFAULT_ACCEPTED_REF)
+                    parent = _initial_parent(repository_root, args.accepted_ref)
                     ledger = ExperimentLedger.create(
                         args.ledger_path,
                         initial_parent_commit=parent,
@@ -1426,7 +1455,7 @@ def main(argv: list[str] | None = None) -> int:
                         use_downstream_allocation=args.use_downstream_allocation,
                     ),
                 )
-                synchronize_accepted_ref(repository_root, DEFAULT_ACCEPTED_REF, parent)
+                synchronize_accepted_ref(repository_root, args.accepted_ref, parent)
             config = _config_from_args(args)
             calibration = _reward_calibration_status(
                 args.reward_calibration_labels,
@@ -1479,14 +1508,19 @@ def main(argv: list[str] | None = None) -> int:
             elif args.command == "resume":
                 payload = {"campaign": asdict(state.resume())}
             else:
+                config = _config_from_args(args)
                 researcher = build_researcher_adapter(
                     ResearcherConfig.from_path(args.researcher_config)
                 )
                 orchestrator = AutonomousResearchOrchestrator(
-                    _config_from_args(args),
+                    config,
                     state=state,
                     ledger=ledger,
                     researcher=researcher,
+                    policy=PatchRCTPolicy(
+                        decision_mode=args.decision_mode,
+                        max_parameter_count=config.max_parameter_count,
+                    ),
                 )
                 payload = orchestrator.run(max_new_proposals=args.max_new_proposals)
         print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
