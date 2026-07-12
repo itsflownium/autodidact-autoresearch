@@ -35,6 +35,7 @@ from autodidact.records import (
     build_paired_result,
 )
 from autodidact.researcher import CommandResearcherAdapter, ResearcherConfig
+from autodidact.reward import load_labels, load_model
 from autodidact.runner import ExperimentRequest, validate_candidate_patch
 from autodidact.runstate import CampaignLimits, CampaignStatus, CampaignStore
 
@@ -348,6 +349,7 @@ def _campaign(
     max_proposals: int,
     gain_bpb: float,
     max_training_tokens: int = 100_000,
+    reward_calibration_labels: int = 0,
 ) -> tuple[
     AutonomousResearchOrchestrator,
     CampaignStore,
@@ -369,6 +371,7 @@ def _campaign(
             max_researcher_tokens=10_000,
             max_training_tokens=max_training_tokens,
             max_compute_seconds=10_000,
+            reward_calibration_labels=reward_calibration_labels,
         ),
     )
     output_root = tmp_path / "experiment-artifacts"
@@ -498,6 +501,62 @@ def test_bad_patch_is_rejected_without_advancing_parent(tmp_path: Path) -> None:
     assert not (tmp_path / "reward" / "model.json").exists()
 
 
+def test_calibration_campaign_collects_target_then_restores_early_rejection(
+    tmp_path: Path,
+) -> None:
+    orchestrator, state, ledger, factory, _repository_root = _campaign(
+        tmp_path,
+        max_proposals=3,
+        gain_bpb=-0.02,
+        reward_calibration_labels=2,
+    )
+    parent = ledger.current_parent()
+
+    result = orchestrator.run()
+
+    assert result["status"] == "completed"
+    assert ledger.current_parent() == parent
+    assert state.snapshot().generation == 0
+    assert factory.run_calls == [
+        (ExperimentStage.CHEAP, (11,)),
+        (ExperimentStage.INTERMEDIATE, (11, 23)),
+        (ExperimentStage.FULL, (11, 23, 37)),
+        (ExperimentStage.CHEAP, (11,)),
+        (ExperimentStage.INTERMEDIATE, (11, 23)),
+        (ExperimentStage.FULL, (11, 23, 37)),
+        (ExperimentStage.CHEAP, (11,)),
+    ]
+    assert result["reward_calibration"] == {
+        "active": False,
+        "completed_labels": 2,
+        "remaining_labels": 0,
+        "target_labels": 2,
+    }
+    labels = load_labels(tmp_path / "reward" / "full-labels.jsonl")
+    assert len({label.candidate_id for label in labels}) == 2
+    model = load_model(tmp_path / "reward" / "model.json")
+    assert model.calibrated
+    assert model.label_count == 2
+    assert model.minimum_label_count == 2
+    decisions = [
+        event.record for event in ledger.events() if isinstance(event.record, DecisionRecord)
+    ]
+    assert [decision.verdict for decision in decisions] == [
+        DecisionVerdict.ESCALATE,
+        DecisionVerdict.ESCALATE,
+        DecisionVerdict.REJECT,
+        DecisionVerdict.ESCALATE,
+        DecisionVerdict.ESCALATE,
+        DecisionVerdict.REJECT,
+        DecisionVerdict.REJECT,
+    ]
+    assert all(
+        decision.probability_threshold == 0.0
+        for decision in decisions
+        if decision.verdict is DecisionVerdict.ESCALATE
+    )
+
+
 def test_uncertain_patch_runs_each_next_predetermined_seed(tmp_path: Path) -> None:
     orchestrator, state, ledger, factory, _repository_root = _campaign(
         tmp_path,
@@ -591,15 +650,25 @@ def test_cli_initializes_and_reports_campaign_without_researcher_call(
             "100000",
             "--max-compute-seconds",
             "1000",
+            "--reward-calibration-labels",
+            "2",
         ]
     )
 
     assert exit_code == 0
     initialized = json.loads(capsys.readouterr().out)
     assert initialized["campaign"]["accepted_parent_commit"] == parent
+    assert initialized["campaign"]["limits"]["reward_calibration_labels"] == 2
+    assert initialized["reward_calibration"]["remaining_labels"] == 2
     assert _git(repository, "rev-parse", "refs/autodidact/accepted") == parent
 
     assert main([*common, "status"]) == 0
     status = json.loads(capsys.readouterr().out)
     assert status["campaign"]["status"] == "running"
     assert status["ledger"]["event_count"] == 0
+    assert status["reward_calibration"] == {
+        "active": True,
+        "completed_labels": 0,
+        "remaining_labels": 2,
+        "target_labels": 2,
+    }

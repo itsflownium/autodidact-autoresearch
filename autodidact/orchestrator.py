@@ -9,7 +9,7 @@ import math
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -134,6 +134,26 @@ def _git(repository: Path, *arguments: str, check: bool = True) -> str:
     return completed.stdout.strip()
 
 
+def _reward_calibration_status(
+    target: int,
+    *,
+    features_path: Path,
+    labels_path: Path,
+) -> dict[str, Any]:
+    if features_path.is_file() and labels_path.is_file():
+        feature_candidates = {feature.candidate_id for feature in load_features(features_path)}
+        label_candidates = {label.candidate_id for label in load_labels(labels_path)}
+        completed = len(feature_candidates.intersection(label_candidates))
+    else:
+        completed = 0
+    return {
+        "active": target > 0 and completed < target,
+        "completed_labels": completed,
+        "remaining_labels": max(0, target - completed),
+        "target_labels": target,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class OrchestratorConfig:
     repository_root: Path
@@ -204,9 +224,39 @@ class AutonomousResearchOrchestrator:
         self.policy = policy or PatchRCTPolicy()
         self.runner_factory = runner_factory
         self.repository_root = config.repository_root.expanduser().resolve()
-        self.controller = PatchRCTController(
-            ledger,
-            policy=self.policy,
+
+    def _calibration_target(self) -> int:
+        return self.state.snapshot().limits.reward_calibration_labels
+
+    def calibration_status(self) -> dict[str, Any]:
+        target = self._calibration_target()
+        return _reward_calibration_status(
+            target,
+            features_path=self.config.features_path,
+            labels_path=self.config.labels_path,
+        )
+
+    def _controller_for_candidate(self, candidate: CandidateRecord) -> PatchRCTController:
+        standard_policy = replace(self.policy, force_full_evaluation=False)
+        calibration_policy = replace(self.policy, force_full_evaluation=True)
+        schedules = self._records(TrialSchedule, candidate.candidate_id)
+        if schedules:
+            policy_hashes = {schedule.policy_sha256 for schedule in schedules}
+            if len(policy_hashes) != 1:
+                raise OrchestratorError("candidate schedules use inconsistent controller policies")
+            policy_hash = next(iter(policy_hashes))
+            if policy_hash == calibration_policy.sha256():
+                selected = calibration_policy
+            elif policy_hash == standard_policy.sha256():
+                selected = standard_policy
+            else:
+                raise OrchestratorError("candidate schedule policy differs from campaign policy")
+        else:
+            status = self.calibration_status()
+            selected = calibration_policy if status["active"] else standard_policy
+        return PatchRCTController(
+            self.ledger,
+            policy=selected,
             repository_root=self.repository_root,
         )
 
@@ -946,7 +996,9 @@ class AutonomousResearchOrchestrator:
                 model = calibrate_model(
                     load_features(self.config.features_path),
                     load_labels(self.config.labels_path),
-                    minimum_label_count=self.config.minimum_reward_labels,
+                    minimum_label_count=(
+                        self._calibration_target() or self.config.minimum_reward_labels
+                    ),
                 )
                 save_model(self.config.model_path, model)
                 result = {
@@ -1002,11 +1054,12 @@ class AutonomousResearchOrchestrator:
         )
 
     def _drive_candidate(self, candidate: CandidateRecord) -> ProposalOutcome:
+        controller = self._controller_for_candidate(candidate)
         for _transition in range(MAX_CONTROL_TRANSITIONS):
             status = self.state.checkpoint_control()
             if status is not CampaignStatus.RUNNING:
                 raise _CampaignStopped(f"campaign stopped while {status.value}")
-            action = self.controller.advance(candidate.candidate_id)
+            action = controller.advance(candidate.candidate_id)
             if action.get("action") in {"reject", "promote"}:
                 return self._terminal_outcome(candidate, action)
             if action.get("action") == "status" and action.get("latest_verdict") in {
@@ -1096,7 +1149,7 @@ class AutonomousResearchOrchestrator:
             active_proposal_id=proposal.proposal_id,
             active_candidate_id=candidate.candidate_id,
         )
-        self.controller.initialize(candidate.candidate_id)
+        self._controller_for_candidate(candidate).initialize(candidate.candidate_id)
         return self._drive_candidate(candidate)
 
     def run(self, *, max_new_proposals: int | None = None) -> dict[str, Any]:
@@ -1144,6 +1197,7 @@ class AutonomousResearchOrchestrator:
                 "generation": final.generation,
                 "outcomes": outcomes,
                 "phase": final.phase,
+                "reward_calibration": self.calibration_status(),
                 "status": final.status.value,
                 "usage": asdict(final.used),
             }
@@ -1190,6 +1244,7 @@ def build_parser() -> argparse.ArgumentParser:
     initialize.add_argument("--max-researcher-tokens", type=int, required=True)
     initialize.add_argument("--max-training-tokens", type=int, required=True)
     initialize.add_argument("--max-compute-seconds", type=float, required=True)
+    initialize.add_argument("--reward-calibration-labels", type=int, default=0)
 
     run = commands.add_parser("run")
     run.add_argument("--max-new-proposals", type=int)
@@ -1250,12 +1305,19 @@ def main(argv: list[str] | None = None) -> int:
                         max_researcher_tokens=args.max_researcher_tokens,
                         max_training_tokens=args.max_training_tokens,
                         max_compute_seconds=args.max_compute_seconds,
+                        reward_calibration_labels=args.reward_calibration_labels,
                     ),
                 )
                 synchronize_accepted_ref(repository_root, DEFAULT_ACCEPTED_REF, parent)
+            config = _config_from_args(args)
             payload: dict[str, Any] = {
                 "campaign": asdict(state.snapshot()),
                 "ledger": ledger.summary(),
+                "reward_calibration": _reward_calibration_status(
+                    args.reward_calibration_labels,
+                    features_path=config.features_path,
+                    labels_path=config.labels_path,
+                ),
             }
         else:
             state = CampaignStore.open(args.state_path)
@@ -1264,7 +1326,17 @@ def main(argv: list[str] | None = None) -> int:
                 read_only=args.command == "status",
             )
             if args.command == "status":
-                payload = {"campaign": asdict(state.snapshot()), "ledger": ledger.summary()}
+                config = _config_from_args(args)
+                target = state.snapshot().limits.reward_calibration_labels
+                payload = {
+                    "campaign": asdict(state.snapshot()),
+                    "ledger": ledger.summary(),
+                    "reward_calibration": _reward_calibration_status(
+                        target,
+                        features_path=config.features_path,
+                        labels_path=config.labels_path,
+                    ),
+                }
             elif args.command == "pause":
                 payload = {"campaign": asdict(state.request_pause(args.reason))}
             elif args.command == "cancel":
