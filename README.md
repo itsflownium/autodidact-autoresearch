@@ -8,7 +8,7 @@ Autodidact starts with a **1,016,960-parameter transformer** that can run locall
 
 Autodidact builds on the compact workflow introduced by [Karpathy's autoresearch](https://github.com/karpathy/autoresearch), then adds **PatchRCT**, paired experiments, hidden evaluation, and Bayesian downstream-reward estimation.
 
-> **Status:** the immutable data system, 1,016,960-parameter baseline, local noise calibration, protected paired runner, PatchRCT controller, downstream-reward estimator, generic researcher adapter, durable recovery state, and autonomous orchestration loop are implemented. The three-seed, 20M-token parent baseline is complete. The real patch campaign, 40-label reward calibration, and sealed evaluation have not run, and no candidate-patch improvement is claimed.
+> **Status:** the immutable data system, 1,016,960-parameter baseline, local noise calibration, protected paired runner, PatchRCT controller, downstream-reward estimator and allocation policy, generic researcher adapter, durable recovery state, and autonomous orchestration loop are implemented. The three-seed, 20M-token parent baseline is complete. The real patch campaign, 40-label reward calibration, and sealed evaluation have not run, and no candidate-patch improvement is claimed.
 
 ## How it works
 
@@ -428,8 +428,10 @@ flowchart TB
     subgraph decision["4. Evidence and decision plane"]
         metrics --> effect["Paired treatment-effect estimator"]
         metrics --> reward["Bayesian downstream-reward estimator"]
+        reward --> allocation["Protected compute allocator"]
         effect --> promotion["Sequential promotion controller"]
-        reward --> promotion
+        allocation -->|Gather or run full| scheduler
+        allocation -->|Stop| rejected
         promotion -->|Reject| rejected["Rejected archive"]
         promotion -->|Escalate| scheduler
         promotion -->|Promote| accepted["Accepted commit<br/>new parent"]
@@ -448,6 +450,7 @@ flowchart TB
     metrics -.-> ledger
     effect -.-> ledger
     reward -.-> ledger
+    allocation -.-> ledger
     promotion -.-> ledger
     interactions -.-> ledger
     hidden -.-> ledger
@@ -466,6 +469,7 @@ flowchart TB
 | Metric collector | Computes trusted BPB, throughput, memory, and stability measurements instead of accepting agent-reported scores. | Standardized paired trial results |
 | Treatment-effect estimator | Calculates per-seed gains and the uncertainty around the patch's observed effect. | Effect estimate and probability of useful gain |
 | Downstream-reward estimator | Predicts the patch's full-budget held-out gain from its early learning curves and resource signals. | Predictive distribution and calibrated interval |
+| Protected compute allocator | Uses calibrated predictions to stop, gather another predetermined seed, run full, or select an outcome-independent audit. | Downstream allocation record and authorized schedule |
 | Promotion controller | Applies the predeclared evidence threshold and resource constraints. | Reject, escalate, or promote decision |
 | Patch-interaction auditor | Tests whether promoted changes remain helpful in the accepted stack and through leave-one-out ablations. | Interaction and stack-validity records |
 | Evidence ledger | Stores claims, commits, trial specifications, artifacts, estimates, decisions, and compute usage. | Reproducible experiment history |
@@ -484,6 +488,7 @@ Every component communicates through versioned, machine-readable records:
 - **Paired result:** parent-minus-candidate BPB gain, resource deltas, and protected constraint failures for one matched seed.
 - **Effect estimate:** paired evidence IDs, seeds, mean gain, sample variance, standard error, useful-gain probability, and estimator version.
 - **Downstream prediction:** source trials and stages, target stage, predictive distribution, useful-gain probability, model version, and label count.
+- **Downstream allocation:** linked effect and prediction, probability thresholds, deterministic audit assignment, action, and exact authorized decision or schedule.
 - **Decision:** linked effect and prediction evidence, threshold, constraint status, reject/escalate/promote verdict, and reason.
 - **Lineage:** accepted parent transition, promotion decision, generation, and previous lineage link.
 - **Compute:** run-linked wall and accelerator time, training and evaluation tokens, attempts, and optional estimated cost.
@@ -501,6 +506,7 @@ The ledger also enforces the trust boundary:
 - successful paired runs require hashed checkpoint and metrics manifests;
 - paired gains, uncertainty statistics, and resource failures are recomputed from linked evidence;
 - predictions and decisions must use the proposal's predeclared minimum useful effect;
+- downstream allocations require current intermediate evidence, enough full-budget labels, deterministic audit assignment, and atomically linked decisions and schedules;
 - only a valid promotion decision can advance the accepted Git lineage;
 - machine-local paths are rejected, and exports support additional value redaction.
 
@@ -530,7 +536,7 @@ Ledger databases, WAL files, and shared-memory files remain local and ignored by
 
 `autodidact-state` maintains the mutable control state that must survive a controller restart without weakening the immutable evidence ledger. Its transactional SQLite store tracks the accepted parent, generation, active proposal and candidate, current phase, pause or cancellation request, replay-safe operation keys, and separate used and reserved budgets.
 
-Campaign limits also persist an optional reward-calibration label target. This makes calibration behavior restart-stable: a command-line change cannot silently switch an active campaign between ordinary early stopping and forced full-label collection.
+Campaign limits also persist an optional reward-calibration label target and whether calibrated predictions control allocation. This makes both behaviors restart-stable: a command-line change cannot silently switch an active campaign between ordinary early stopping, forced full-label collection, and prediction-guided allocation.
 
 Before an external researcher call or paired run starts, the controller records a deterministic operation key and reserves its worst-case proposal, researcher-token, training-token, and compute allowance. A completed key replays its stored result. A key left running by a process crash becomes `interrupted` and must be reconciled against its transcript, Git commit, or ledger evidence before it can be completed or explicitly restarted. Settling records actual usage and releases the unused reservation; exceeding the reservation or campaign maximum fails before new work starts.
 
@@ -545,7 +551,8 @@ uv run autodidact-state create \
   --max-researcher-tokens 1000000 \
   --max-training-tokens 1000000000 \
   --max-compute-seconds 86400 \
-  --reward-calibration-labels 40
+  --reward-calibration-labels 40 \
+  --use-downstream-allocation
 
 uv run autodidact-state status
 uv run autodidact-state pause --reason "finish after the active operation"
@@ -576,6 +583,8 @@ For each proposal, the orchestrator:
 
 When a campaign has a nonzero reward-calibration target, each safe candidate is advanced through the initial cheap, intermediate, and full paired stages until the target number of unique candidates has both an early feature snapshot and a full label. Low efficacy cannot stop those calibration candidates early, but crashes, non-finite outcomes, integrity failures, parameter violations, and resource regressions still reject them immediately. Full-stage promotion continues to use the normal PatchRCT threshold. Once the target is reached, ordinary early rejection resumes automatically.
 
+With `--use-downstream-allocation`, reaching the calibration target switches later candidates to protected prediction-guided allocation. Every safe candidate first receives cheap and intermediate paired evidence. A calibrated probability at or below 10% stops it unless its deterministic audit assignment selects a full run; a probability at or above 80% schedules full evaluation; an intermediate probability gathers the next unused seed and eventually runs full if uncertainty remains after the fixed pool is exhausted. The allocation and its exact decision or schedule are committed atomically. Predictions can spend or save compute, but they cannot promote a patch: promotion still requires the full-stage PatchRCT effect to reach 95% with every protected constraint passing.
+
 Every external invocation and paired schedule has a deterministic operation key. Completed operations replay their retained result. After a process restart, interrupted researcher calls are recovered from verified transcripts and interrupted experiments are reconciled against ledger evidence before the idempotent runner may resume. A campaign-wide Git lock prevents concurrent lineage advancement, while pause and cancellation are honored between retained operations.
 
 Initialize a bounded local campaign, then run it continuously or one proposal at a time:
@@ -588,7 +597,8 @@ uv run autodidact-orchestrator initialize \
   --max-researcher-tokens 1000000 \
   --max-training-tokens 1000000000 \
   --max-compute-seconds 86400 \
-  --reward-calibration-labels 40
+  --reward-calibration-labels 40 \
+  --use-downstream-allocation
 
 uv run autodidact-orchestrator run
 uv run autodidact-orchestrator run --max-new-proposals 1
@@ -665,7 +675,7 @@ expected full-budget gain:  +0.0031 bpb
 probability gain is useful: 87%
 ```
 
-The uncertainty drives compute allocation. Clearly poor candidates die early, uncertain candidates receive another seed or a longer run, and strong candidates proceed to held-out confirmation. A random sample of rejected patches is still fully evaluated so that missed improvements and estimator bias remain measurable.
+The uncertainty drives compute allocation. Clearly poor candidates die early, uncertain candidates receive another seed or a longer run, and strong candidates proceed to held-out confirmation. An outcome-independent deterministic sample of predicted rejections is still fully evaluated so that missed improvements and estimator bias remain measurable without repeatedly rerolling the sample.
 
 The downstream estimator does not replace PatchRCT. It helps PatchRCT decide **which experiment would be most useful next**.
 
@@ -682,6 +692,8 @@ The default model is considered calibrated only after 40 unique candidates have 
 - useful-gain probability at or below 10% returns `stop`;
 - probability at or above 80% returns `run_full`;
 - intermediate probability returns `gather_more_early_evidence`.
+
+The autonomous allocator records those recommendations as protected `DownstreamAllocation` evidence. Low-probability audit selection hashes only the candidate ID and complete policy hash, never the observed outcome. A stopped candidate receives a prediction-linked rejection; a selected candidate receives a prediction-linked escalation and full schedule; uncertain candidates receive only the next fixed intermediate seed. Full-stage decisions deliberately omit the prediction and use direct paired PatchRCT evidence.
 
 Capture evidence and fit the model with:
 
@@ -762,6 +774,7 @@ assets/                  final figures
 - [x] Implement protected paired parent-versus-patch experiments.
 - [x] Implement PatchRCT promotion, rejection, and escalation gates.
 - [x] Connect the researcher, recovery state, runner, reward estimator, and controller.
+- [x] Add forced reward-calibration campaigns and protected downstream compute allocation.
 - [ ] Collect 40 full-budget patch labels and calibrate downstream prediction.
 - [ ] Run the three-arm, 50-proposal local pilot.
 - [ ] Expand to repeated 100-proposal studies.

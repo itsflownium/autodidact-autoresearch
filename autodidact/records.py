@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 import statistics
@@ -11,7 +12,11 @@ from enum import StrEnum
 from pathlib import PurePosixPath
 from typing import Any, ClassVar, TypeAlias
 
-from autodidact.data.integrity import ProtectedPathError, assert_research_paths_allowed
+from autodidact.data.integrity import (
+    ProtectedPathError,
+    assert_research_paths_allowed,
+    canonical_json_bytes,
+)
 
 RECORD_SCHEMA_VERSION = 1
 MAX_PYTHON_SEED = 2**32 - 1
@@ -55,6 +60,14 @@ class DecisionVerdict(StrEnum):
     PROMOTE = "promote"
 
 
+class AllocationAction(StrEnum):
+    STOP = "stop"
+    GATHER_MORE = "gather_more"
+    RUN_FULL = "run_full"
+    AUDIT_FULL = "audit_full"
+    UNCERTAIN_FULL = "uncertain_full"
+
+
 class ArtifactRetention(StrEnum):
     EPHEMERAL = "ephemeral"
     RETAINED = "retained"
@@ -94,6 +107,23 @@ def validate_git_commit(value: str) -> None:
     """Validate a full SHA-1 or SHA-256 Git object ID."""
 
     _validate_git_commit("git commit", value)
+
+
+def downstream_audit_assignment(candidate_id: str, policy_sha256: str) -> tuple[str, float]:
+    """Return the outcome-independent audit assignment for an allocation policy."""
+
+    _validate_id("candidate_id", candidate_id)
+    _validate_sha256("policy_sha256", policy_sha256)
+    digest = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "candidate_id": candidate_id,
+                "domain": "autodidact-downstream-audit-v1",
+                "policy_sha256": policy_sha256,
+            }
+        )
+    ).digest()
+    return digest.hex(), int.from_bytes(digest[:8], "big") / 2**64
 
 
 def _validate_seed(seed: int) -> None:
@@ -674,6 +704,97 @@ class DownstreamPrediction:
 
 
 @dataclass(frozen=True, slots=True)
+class DownstreamAllocation:
+    RECORD_TYPE: ClassVar[str] = "downstream_allocation"
+
+    allocation_id: str
+    candidate_id: str
+    stage: ExperimentStage
+    effect_estimate_id: str
+    downstream_prediction_id: str
+    action: AllocationAction
+    rejection_probability: float
+    full_test_probability: float
+    audit_fraction: float
+    audit_assignment_sha256: str
+    audit_score: float
+    minimum_label_count: int
+    next_stage: ExperimentStage | None
+    next_seed: int | None
+    planned_decision_id: str | None
+    planned_decision_sha256: str | None
+    planned_schedule_id: str | None
+    planned_schedule_sha256: str | None
+    policy_sha256: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "allocation_id",
+            "candidate_id",
+            "effect_estimate_id",
+            "downstream_prediction_id",
+        ):
+            _validate_id(name, getattr(self, name))
+        if self.planned_decision_id is not None:
+            _validate_id("planned_decision_id", self.planned_decision_id)
+        if self.planned_decision_sha256 is not None:
+            _validate_sha256("planned_decision_sha256", self.planned_decision_sha256)
+        if self.planned_schedule_id is not None:
+            _validate_id("planned_schedule_id", self.planned_schedule_id)
+        if self.planned_schedule_sha256 is not None:
+            _validate_sha256("planned_schedule_sha256", self.planned_schedule_sha256)
+        if (self.planned_decision_id is None) != (self.planned_decision_sha256 is None):
+            raise RecordValidationError("planned decision ID and hash must appear together")
+        if (self.planned_schedule_id is None) != (self.planned_schedule_sha256 is None):
+            raise RecordValidationError("planned schedule ID and hash must appear together")
+        _validate_enum("stage", self.stage, ExperimentStage)
+        if self.stage is not ExperimentStage.INTERMEDIATE:
+            raise RecordValidationError("downstream allocation requires intermediate evidence")
+        _validate_enum("action", self.action, AllocationAction)
+        _validate_probability("rejection_probability", self.rejection_probability)
+        _validate_probability("full_test_probability", self.full_test_probability)
+        if self.rejection_probability >= self.full_test_probability:
+            raise RecordValidationError("allocation probability thresholds are not ordered")
+        _validate_probability("audit_fraction", self.audit_fraction)
+        _validate_sha256("audit_assignment_sha256", self.audit_assignment_sha256)
+        _validate_probability("audit_score", self.audit_score)
+        if self.audit_score >= 1.0:
+            raise RecordValidationError("audit_score must be less than one")
+        _validate_integer("minimum_label_count", self.minimum_label_count, minimum=1)
+        if self.next_stage is not None:
+            _validate_enum("next_stage", self.next_stage, ExperimentStage)
+        if self.next_seed is not None:
+            _validate_seed(self.next_seed)
+        _validate_sha256("policy_sha256", self.policy_sha256)
+        _validate_text("reason", self.reason)
+
+        if self.action is AllocationAction.STOP:
+            if (
+                self.next_stage is not None
+                or self.next_seed is not None
+                or self.planned_decision_id is None
+                or self.planned_schedule_id is not None
+            ):
+                raise RecordValidationError("stop allocation requires only a rejection decision")
+        elif self.action is AllocationAction.GATHER_MORE:
+            if (
+                self.next_stage is not ExperimentStage.INTERMEDIATE
+                or self.next_seed is None
+                or self.planned_decision_id is not None
+                or self.planned_schedule_id is None
+            ):
+                raise RecordValidationError("gather allocation requires one intermediate seed")
+        elif (
+            self.next_stage is not ExperimentStage.FULL
+            or self.next_seed is not None
+            or self.planned_decision_id is None
+            or self.planned_schedule_id is None
+        ):
+            raise RecordValidationError("full allocation requires a full-stage decision")
+
+
+@dataclass(frozen=True, slots=True)
 class DecisionRecord:
     RECORD_TYPE: ClassVar[str] = "decision"
 
@@ -790,6 +911,7 @@ ExperimentRecord: TypeAlias = (
     | PairedResult
     | EffectEstimate
     | DownstreamPrediction
+    | DownstreamAllocation
     | DecisionRecord
     | LineageRecord
     | ComputeRecord
@@ -807,6 +929,7 @@ _RECORD_CLASSES: dict[str, type[ExperimentRecord]] = {
         PairedResult,
         EffectEstimate,
         DownstreamPrediction,
+        DownstreamAllocation,
         DecisionRecord,
         LineageRecord,
         ComputeRecord,
@@ -823,6 +946,7 @@ _RECORD_ID_FIELDS: dict[type[ExperimentRecord], str] = {
     PairedResult: "paired_result_id",
     EffectEstimate: "estimate_id",
     DownstreamPrediction: "prediction_id",
+    DownstreamAllocation: "allocation_id",
     DecisionRecord: "decision_id",
     LineageRecord: "lineage_id",
     ComputeRecord: "compute_id",
@@ -924,6 +1048,11 @@ def _parse_record(record_type: str, payload: dict[str, Any]) -> ExperimentRecord
                 ExperimentStage(item) for item in values["source_stages"]
             )
             values["target_stage"] = ExperimentStage(values["target_stage"])
+        elif record_type == DownstreamAllocation.RECORD_TYPE:
+            values["stage"] = ExperimentStage(values["stage"])
+            values["action"] = AllocationAction(values["action"])
+            if values["next_stage"] is not None:
+                values["next_stage"] = ExperimentStage(values["next_stage"])
         elif record_type == DecisionRecord.RECORD_TYPE:
             values["stage"] = ExperimentStage(values["stage"])
             values["verdict"] = DecisionVerdict(values["verdict"])

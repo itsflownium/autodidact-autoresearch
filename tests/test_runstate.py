@@ -114,6 +114,7 @@ def test_reward_calibration_target_is_validated_and_persisted(tmp_path: Path) ->
         max_training_tokens=100_000_000,
         max_compute_seconds=20_000.0,
         reward_calibration_labels=3,
+        use_downstream_allocation=True,
     )
     store = CampaignStore.create(
         tmp_path / "calibration.sqlite3",
@@ -124,6 +125,7 @@ def test_reward_calibration_target_is_validated_and_persisted(tmp_path: Path) ->
     )
 
     assert store.snapshot().limits.reward_calibration_labels == 3
+    assert store.snapshot().limits.use_downstream_allocation is True
     assert CampaignStore.open(store.path, clock=FakeClock()).snapshot().limits == limits
 
     with pytest.raises(RunStateError, match="between zero and max_proposals"):
@@ -391,11 +393,16 @@ def test_cli_creates_controls_and_recovers_campaign(
                 "1000000",
                 "--max-compute-seconds",
                 "1000",
+                "--reward-calibration-labels",
+                "2",
+                "--use-downstream-allocation",
             ]
         )
         == 0
     )
-    assert json.loads(capsys.readouterr().out)["status"] == "running"
+    created = json.loads(capsys.readouterr().out)
+    assert created["status"] == "running"
+    assert created["limits"]["use_downstream_allocation"] is True
 
     store = CampaignStore.open(state_path)
     store.begin_operation("operation-cli-001", "research", {})

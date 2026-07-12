@@ -154,6 +154,49 @@ def _reward_calibration_status(
     }
 
 
+def _downstream_allocation_status(
+    enabled: bool,
+    *,
+    calibration: dict[str, Any],
+    minimum_labels: int,
+    model_path: Path,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "enabled": enabled,
+        "minimum_labels": minimum_labels,
+        "ready": False,
+    }
+    if not enabled:
+        result["reason"] = "disabled"
+        return result
+    if calibration["active"]:
+        result.update(
+            {
+                "label_count": calibration["completed_labels"],
+                "reason": "reward calibration is still collecting labels",
+            }
+        )
+        return result
+    if not model_path.is_file():
+        result.update({"label_count": 0, "reason": "reward model is missing"})
+        return result
+    try:
+        model = load_model(model_path)
+    except (OSError, RewardError):
+        result.update({"label_count": 0, "reason": "reward model cannot be verified"})
+        return result
+    ready = model.calibrated and model.label_count >= minimum_labels
+    result.update(
+        {
+            "label_count": model.label_count,
+            "model_sha256": model.sha256(),
+            "ready": ready,
+            "reason": "ready" if ready else "reward model is not sufficiently calibrated",
+        }
+    )
+    return result
+
+
 @dataclass(frozen=True, slots=True)
 class OrchestratorConfig:
     repository_root: Path
@@ -236,9 +279,37 @@ class AutonomousResearchOrchestrator:
             labels_path=self.config.labels_path,
         )
 
+    def downstream_allocation_status(self) -> dict[str, Any]:
+        enabled = self.state.snapshot().limits.use_downstream_allocation
+        minimum_labels = self._calibration_target() or self.config.minimum_reward_labels
+        calibration = self.calibration_status()
+        return _downstream_allocation_status(
+            enabled,
+            calibration=calibration,
+            minimum_labels=minimum_labels,
+            model_path=self.config.model_path,
+        )
+
     def _controller_for_candidate(self, candidate: CandidateRecord) -> PatchRCTController:
-        standard_policy = replace(self.policy, force_full_evaluation=False)
-        calibration_policy = replace(self.policy, force_full_evaluation=True)
+        minimum_labels = self._calibration_target() or self.config.minimum_reward_labels
+        standard_policy = replace(
+            self.policy,
+            force_full_evaluation=False,
+            use_downstream_allocation=False,
+            minimum_downstream_labels=minimum_labels,
+        )
+        calibration_policy = replace(
+            self.policy,
+            force_full_evaluation=True,
+            use_downstream_allocation=False,
+            minimum_downstream_labels=minimum_labels,
+        )
+        allocation_policy = replace(
+            self.policy,
+            force_full_evaluation=False,
+            use_downstream_allocation=True,
+            minimum_downstream_labels=minimum_labels,
+        )
         schedules = self._records(TrialSchedule, candidate.candidate_id)
         if schedules:
             policy_hashes = {schedule.policy_sha256 for schedule in schedules}
@@ -247,13 +318,23 @@ class AutonomousResearchOrchestrator:
             policy_hash = next(iter(policy_hashes))
             if policy_hash == calibration_policy.sha256():
                 selected = calibration_policy
+            elif policy_hash == allocation_policy.sha256():
+                selected = allocation_policy
             elif policy_hash == standard_policy.sha256():
                 selected = standard_policy
             else:
                 raise OrchestratorError("candidate schedule policy differs from campaign policy")
         else:
             status = self.calibration_status()
-            selected = calibration_policy if status["active"] else standard_policy
+            if status["active"]:
+                selected = calibration_policy
+            elif self.state.snapshot().limits.use_downstream_allocation:
+                allocation_status = self.downstream_allocation_status()
+                if not allocation_status["ready"]:
+                    raise OrchestratorError(str(allocation_status["reason"]))
+                selected = allocation_policy
+            else:
+                selected = standard_policy
         return PatchRCTController(
             self.ledger,
             policy=selected,
@@ -978,6 +1059,8 @@ class AutonomousResearchOrchestrator:
                         candidate.candidate_id,
                         features,
                         model,
+                        reject_probability=self.policy.allocation_rejection_probability,
+                        full_test_probability=self.policy.allocation_full_test_probability,
                     )
                     self.ledger.ensure(prediction, writer_role=WriterRole.CONTROLLER)
                     result.update(
@@ -1198,6 +1281,7 @@ class AutonomousResearchOrchestrator:
                 "outcomes": outcomes,
                 "phase": final.phase,
                 "reward_calibration": self.calibration_status(),
+                "downstream_allocation": self.downstream_allocation_status(),
                 "status": final.status.value,
                 "usage": asdict(final.used),
             }
@@ -1245,6 +1329,7 @@ def build_parser() -> argparse.ArgumentParser:
     initialize.add_argument("--max-training-tokens", type=int, required=True)
     initialize.add_argument("--max-compute-seconds", type=float, required=True)
     initialize.add_argument("--reward-calibration-labels", type=int, default=0)
+    initialize.add_argument("--use-downstream-allocation", action="store_true")
 
     run = commands.add_parser("run")
     run.add_argument("--max-new-proposals", type=int)
@@ -1306,18 +1391,26 @@ def main(argv: list[str] | None = None) -> int:
                         max_training_tokens=args.max_training_tokens,
                         max_compute_seconds=args.max_compute_seconds,
                         reward_calibration_labels=args.reward_calibration_labels,
+                        use_downstream_allocation=args.use_downstream_allocation,
                     ),
                 )
                 synchronize_accepted_ref(repository_root, DEFAULT_ACCEPTED_REF, parent)
             config = _config_from_args(args)
+            calibration = _reward_calibration_status(
+                args.reward_calibration_labels,
+                features_path=config.features_path,
+                labels_path=config.labels_path,
+            )
             payload: dict[str, Any] = {
                 "campaign": asdict(state.snapshot()),
-                "ledger": ledger.summary(),
-                "reward_calibration": _reward_calibration_status(
-                    args.reward_calibration_labels,
-                    features_path=config.features_path,
-                    labels_path=config.labels_path,
+                "downstream_allocation": _downstream_allocation_status(
+                    args.use_downstream_allocation,
+                    calibration=calibration,
+                    minimum_labels=(args.reward_calibration_labels or config.minimum_reward_labels),
+                    model_path=config.model_path,
                 ),
+                "ledger": ledger.summary(),
+                "reward_calibration": calibration,
             }
         else:
             state = CampaignStore.open(args.state_path)
@@ -1327,15 +1420,23 @@ def main(argv: list[str] | None = None) -> int:
             )
             if args.command == "status":
                 config = _config_from_args(args)
-                target = state.snapshot().limits.reward_calibration_labels
+                limits = state.snapshot().limits
+                target = limits.reward_calibration_labels
+                calibration = _reward_calibration_status(
+                    target,
+                    features_path=config.features_path,
+                    labels_path=config.labels_path,
+                )
                 payload = {
                     "campaign": asdict(state.snapshot()),
-                    "ledger": ledger.summary(),
-                    "reward_calibration": _reward_calibration_status(
-                        target,
-                        features_path=config.features_path,
-                        labels_path=config.labels_path,
+                    "downstream_allocation": _downstream_allocation_status(
+                        limits.use_downstream_allocation,
+                        calibration=calibration,
+                        minimum_labels=target or config.minimum_reward_labels,
+                        model_path=config.model_path,
                     ),
+                    "ledger": ledger.summary(),
+                    "reward_calibration": calibration,
                 }
             elif args.command == "pause":
                 payload = {"campaign": asdict(state.request_pause(args.reason))}
