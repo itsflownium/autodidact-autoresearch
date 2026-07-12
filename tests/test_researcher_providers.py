@@ -14,6 +14,7 @@ from autodidact.researcher import (
     ResearcherProvider,
     ResearchRequest,
     ResearchStatus,
+    load_research_attempt,
 )
 from autodidact.researcher import (
     main as researcher_main,
@@ -265,6 +266,34 @@ def test_native_provider_normalizes_patch_response_and_trusted_usage(
         "input_tokens": expected_usage - {500: 90, 600: 80, 700: 70}[expected_usage],
         "output_tokens": {500: 90, 600: 80, 700: 70}[expected_usage],
     }
+    assert (
+        load_research_attempt(
+            attempt.transcript_path,
+            _request(parent),
+            workspace=repository,
+        )
+        == attempt
+    )
+
+    response_raw = transcript["response_raw"]
+    transcript["response_raw"] += " "
+    attempt.transcript_path.write_text(json.dumps(transcript), encoding="utf-8")
+    with pytest.raises(ResearcherError, match="response hash is invalid"):
+        load_research_attempt(
+            attempt.transcript_path,
+            _request(parent),
+            workspace=repository,
+        )
+
+    transcript["response_raw"] = response_raw
+    transcript["usage_verified"] = False
+    attempt.transcript_path.write_text(json.dumps(transcript), encoding="utf-8")
+    with pytest.raises(ResearcherError, match="lacks trusted provider evidence"):
+        load_research_attempt(
+            attempt.transcript_path,
+            _request(parent),
+            workspace=repository,
+        )
 
 
 def test_native_provider_fails_closed_without_trusted_usage(tmp_path: Path) -> None:
