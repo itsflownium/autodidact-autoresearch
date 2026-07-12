@@ -482,7 +482,7 @@ def run_process(
     )
 
 
-def _sanitized_environment(seed: int, controller_root: Path) -> dict[str, str]:
+def sanitized_environment(seed: int, controller_root: Path) -> dict[str, str]:
     allowed = {
         "CUDA_VISIBLE_DEVICES",
         "DYLD_LIBRARY_PATH",
@@ -716,7 +716,7 @@ class PairedExperimentRunner:
         return self.process_runner(
             command,
             cwd=cwd,
-            environment=_sanitized_environment(seed, self.repository_root),
+            environment=sanitized_environment(seed, self.repository_root),
             stdout_path=stdout_path,
             stderr_path=stderr_path,
             timeout_seconds=self.request.timeout_seconds,

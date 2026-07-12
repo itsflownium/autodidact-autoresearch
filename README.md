@@ -8,7 +8,7 @@ Autodidact starts with a **1,016,960-parameter transformer** that can run locall
 
 Autodidact builds on the compact workflow introduced by [Karpathy's autoresearch](https://github.com/karpathy/autoresearch), then adds **PatchRCT**, paired experiments, hidden evaluation, and Bayesian downstream-reward estimation.
 
-> **Status:** the immutable data system, 1,016,960-parameter baseline, local noise calibration, protected paired runner, PatchRCT controller, downstream-reward estimator and allocation policy, generic researcher adapter, durable recovery state, and autonomous orchestration loop are implemented. The three-seed, 20M-token parent baseline is complete. The real patch campaign, 40-label reward calibration, and sealed evaluation have not run, and no candidate-patch improvement is claimed.
+> **Status:** the immutable data system, 1,016,960-parameter baseline, local noise calibration, protected paired runner, PatchRCT controller, downstream-reward estimator and allocation policy, generic researcher adapter, durable recovery state, autonomous orchestration loop, and frozen sealed-evaluation/reporting workflow are implemented. The three-seed, 20M-token parent baseline is complete. The real patch campaign, 40-label reward calibration, and sealed evaluation have not run, and no candidate-patch improvement is claimed.
 
 ## How it works
 
@@ -753,6 +753,15 @@ The baseline is small enough to train locally on an Apple Silicon laptop using P
 A single H100 can later be used for more seeds, longer runs, repeated research lineages, and cross-hardware confirmation. No multi-GPU setup is required.
 
 Fixed-token results provide the cleanest comparison across hardware. Fixed-time results are platform-specific, so the laptop and H100 receive separate baseline timing calibrations.
+
+## Sealed evaluation
+
+`autodidact-sealed` freezes every accepted lineage and ledger hash before opening the protected
+`sealed_final` split. It then trains each unique accepted commit on predetermined seeds, measures
+paired sealed gains across generations, classifies useful confirmations and false promotions, and
+produces hashed JSON, Markdown, CSV, and SVG reports. The sealed workflow never promotes or changes
+a research parent. See [`docs/sealed-evaluation.md`](docs/sealed-evaluation.md) for the freeze/run
+boundary, recovery behavior, and report definitions.
 
 ## Design choices
 
