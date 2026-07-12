@@ -269,6 +269,14 @@ The reviewed report is in [`docs/baseline/m4-full.md`](docs/baseline/m4-full.md)
 
 Seeds come from the protected scheduler. The agent may reason about a code change, but it may not select, search, retry, discard, or report seeds according to favorable outcomes. It submits a patch for protected measurement; it does not grade or promote itself.
 
+## Researcher adapter
+
+`autodidact-researcher` runs the configured proposal command in a clean candidate workspace. It sends `program.md`, the accepted parent, prior experiment summaries, and the exact editable paths as one structured prompt. The command may edit `train.py` and must return exactly one structured proposal response containing its hypothesis, mechanism, expected BPB effect, minimum useful gain, risks, and reported token usage.
+
+The adapter has no ledger or promotion interface. It rejects unknown response fields, protected-file changes, Git-history changes, oversized output, oversized diffs, timeouts, and proposals without a code change. Each invocation writes an ignored compact transcript containing the prompt, response, stderr, code diff, hashes, claim, usage, and failure reason. An existing transcript blocks another invocation with the same request ID so recovery can inspect prior evidence instead of paying for a duplicate call.
+
+The runtime command is supplied in ignored `artifacts/control/researcher.json`; model choice and credentials therefore remain outside source control. Tests use local fake commands and never invoke the configured external researcher.
+
 ## Continuous integration
 
 GitHub Actions runs the locked Python 3.11 environment with read-only repository permissions. Pull requests and pushes to `main` must pass linting, formatting, all tests, bytecode compilation, the 1,016,960-parameter inspection contract, and package construction. Local equivalents are:

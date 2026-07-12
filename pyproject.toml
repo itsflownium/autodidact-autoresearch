@@ -13,6 +13,7 @@ dependencies = [
 ]
 
 [project.scripts]
+autodidact-researcher = "autodidact.researcher:main"
 autodidact-reward = "autodidact.reward:main"
 autodidact-baseline = "autodidact.baseline:main"
 autodidact-calibrate = "autodidact.calibration:main"
