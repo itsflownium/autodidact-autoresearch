@@ -277,32 +277,45 @@ The adapter has no ledger or promotion interface. It rejects unknown response fi
 
 Native adapters are provided for Codex, Claude Code, and Hermes Agent. They use each CLI's non-interactive interface while normalizing structured output and trusted token accounting into the same proposal contract. Codex runs ephemerally with workspace-write sandboxing and a final-output schema. Claude Code runs without session persistence, with a JSON Schema and a restricted tool set. Hermes Agent uses its script-oriented one-shot mode, terminal-only tools, a temporary request file, and its per-run usage report. The post-run Git and path checks apply identically to every provider.
 
-Create the ignored local configuration with one of:
+The researcher model and the model under autoresearch are independent. `--model` below selects the
+researcher model used to propose patches; it does not select or download the target model. The loop
+does not preload a trained 1M-parameter checkpoint. The included `train.py` is the initial target
+implementation, and every paired arm trains it from scratch under the protected experiment budget.
+
+Create or repair the ignored local configuration with one of:
 
 ```bash
-uv run autodidact-agent setup \
+uv run autodidact-agent bootstrap \
   --provider codex \
   --model MODEL_ID \
-  --reasoning-effort high
+  --reasoning-effort high \
+  --fix
 
-uv run autodidact-agent setup \
+uv run autodidact-agent bootstrap \
   --provider claude-code \
   --model MODEL_ID \
   --reasoning-effort high \
   --max-turns 40 \
-  --max-budget-usd 5
+  --max-budget-usd 5 \
+  --fix
 
-uv run autodidact-agent setup \
+uv run autodidact-agent bootstrap \
   --provider hermes-agent \
   --backend-provider PROVIDER_ID \
-  --model MODEL_ID
+  --model MODEL_ID \
+  --fix
 ```
 
-Omit both Hermes model flags to use its existing configured default. Codex also accepts `--profile` for a locally defined profile. Setup performs a no-inference `--version` probe before atomically writing `artifacts/control/researcher.json` with mode `0600`; it never copies credentials into the project. Diagnose the selected executable later with:
+Omit both Hermes model flags to use its existing configured default. Codex also accepts `--profile` for a locally defined profile. Bootstrap performs no-inference version and help-capability probes before atomically writing `artifacts/control/researcher.json`; it never copies credentials into the project. Diagnose and repair the selected executable later with:
 
 ```bash
-uv run autodidact-agent doctor
+uv run autodidact-agent doctor --fix
 ```
+
+Configure the target architecture, data location, parameter cap, and local CPU/MPS/CUDA device with
+`autodidact-target`. Run the orchestrator on the GPU host when using a remote H100. See
+[`docs/configuration.md`](docs/configuration.md) for the complete laptop, GPU-host, researcher-model,
+and target-model setup.
 
 Hermes one-shot mode automatically approves tool calls, so its terminal sandbox must be configured before a real campaign. Autodidact still uses a detached candidate worktree and rejects every change outside the allowed research paths, but that repository check is not an operating-system sandbox.
 

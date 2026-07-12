@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import platform
+import re
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -32,6 +35,32 @@ _PROPOSAL_TEXT_FIELDS = (
     "failure_signal",
     "interaction_risk",
 )
+_COMPATIBILITY_SCHEMA_VERSION = 1
+_CAPABILITY_CONTRACTS: dict[ResearcherProvider, tuple[tuple[str, tuple[str, ...]], ...]] = {
+    ResearcherProvider.CODEX: (
+        ("ephemeral execution", ("--ephemeral",)),
+        ("workspace sandbox", ("--sandbox",)),
+        ("JSON event output", ("--json",)),
+        ("response schema", ("--output-schema",)),
+        ("final response file", ("--output-last-message",)),
+    ),
+    ResearcherProvider.CLAUDE_CODE: (
+        ("non-interactive execution", ("--print",)),
+        ("JSON output", ("--output-format",)),
+        ("response schema", ("--json-schema",)),
+        ("ephemeral session", ("--no-session-persistence",)),
+        ("isolated MCP configuration", ("--strict-mcp-config",)),
+        ("permission mode", ("--permission-mode",)),
+        ("tool restriction", ("--tools",)),
+        ("allowed tools", ("--allowedTools", "--allowed-tools")),
+    ),
+    ResearcherProvider.HERMES_AGENT: (
+        ("one-shot execution", ("--oneshot", "-z")),
+        ("usage report", ("--usage-file",)),
+        ("toolset restriction", ("--toolsets",)),
+        ("non-interactive approval", ("--ignore-rules",)),
+    ),
+}
 
 
 def response_json_schema() -> dict[str, Any]:
@@ -111,6 +140,56 @@ def _probe_version(
     return output[:1_000], None
 
 
+def _has_flag(help_text: str, flag: str) -> bool:
+    return (
+        re.search(rf"(?<![A-Za-z0-9_-]){re.escape(flag)}(?![A-Za-z0-9_-])", help_text) is not None
+    )
+
+
+def _capability_command(provider: ResearcherProvider, executable: str) -> list[str]:
+    if provider is ResearcherProvider.CODEX:
+        return [executable, "exec", "--help"]
+    return [executable, "--help"]
+
+
+def _probe_capabilities(
+    provider: ResearcherProvider,
+    executable: str,
+    *,
+    workspace: Path,
+    environment: dict[str, str],
+) -> tuple[dict[str, str], list[str], str | None]:
+    try:
+        completed = subprocess.run(
+            _capability_command(provider, executable),
+            cwd=workspace,
+            env=environment,
+            capture_output=True,
+            timeout=15.0,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {}, [], str(error)
+    raw = completed.stdout or completed.stderr
+    help_text = raw.decode("utf-8", errors="replace")
+    if completed.returncode != 0 or not help_text.strip():
+        detail = help_text.strip() or "capability probe failed without output"
+        return {}, [], detail[:4_000]
+    selected: dict[str, str] = {}
+    missing: list[str] = []
+    for name, alternatives in _CAPABILITY_CONTRACTS[provider]:
+        selected_flag = next((flag for flag in alternatives if _has_flag(help_text, flag)), None)
+        if selected_flag is None:
+            missing.append(name)
+        else:
+            selected[name] = selected_flag
+    return selected, missing, None
+
+
+def _issue(code: str, message: str, remediation: str) -> dict[str, str]:
+    return {"code": code, "message": message, "remediation": remediation}
+
+
 def probe_provider(config: ResearcherConfig, *, workspace: Path) -> dict[str, Any]:
     if config.provider is ResearcherProvider.COMMAND:
         executable = config.command[0]
@@ -119,17 +198,66 @@ def probe_provider(config: ResearcherConfig, *, workspace: Path) -> dict[str, An
         executable = config.executable
     environment = {key: os.environ[key] for key in config.inherit_environment if key in os.environ}
     environment.update(dict(config.environment))
+    resolved = shutil.which(executable, path=environment.get("PATH"))
+    if resolved is None and Path(executable).is_file():
+        resolved = str(Path(executable).resolve())
+    probe_executable = resolved or executable
+    issues: list[dict[str, str]] = []
     version, error = _probe_version(
-        executable,
+        probe_executable,
         workspace=workspace.resolve(),
         environment=environment,
     )
+    selected_flags: dict[str, str] = {}
+    missing_capabilities: list[str] = []
+    capability_error: str | None = None
+    if error is not None:
+        code = "executable_not_found" if resolved is None else "version_probe_failed"
+        issues.append(
+            _issue(
+                code,
+                error.decode("utf-8", errors="replace")[:4_000],
+                "Run autodidact-agent doctor --fix or install a supported provider CLI.",
+            )
+        )
+    elif config.provider is not ResearcherProvider.COMMAND:
+        selected_flags, missing_capabilities, capability_error = _probe_capabilities(
+            config.provider,
+            probe_executable,
+            workspace=workspace.resolve(),
+            environment=environment,
+        )
+        if capability_error is not None:
+            issues.append(
+                _issue(
+                    "capability_probe_failed",
+                    capability_error,
+                    "Run autodidact-agent doctor --fix or upgrade the provider CLI.",
+                )
+            )
+        if missing_capabilities:
+            issues.append(
+                _issue(
+                    "missing_capabilities",
+                    "CLI help is missing required capabilities: " + ", ".join(missing_capabilities),
+                    "Upgrade to a provider CLI version that supports every listed capability.",
+                )
+            )
     return {
+        "compatibility_schema_version": _COMPATIBILITY_SCHEMA_VERSION,
         "executable": executable,
+        "resolved_executable": resolved,
         "provider": config.provider.value,
-        "ready": error is None,
+        "platform": {
+            "machine": platform.machine(),
+            "system": platform.system(),
+        },
+        "ready": not issues,
         "version": version,
-        "error": None if error is None else error.decode("utf-8", errors="replace")[:4_000],
+        "selected_flags": selected_flags,
+        "missing_capabilities": missing_capabilities,
+        "issues": issues,
+        "error": None if not issues else issues[0]["message"],
     }
 
 
@@ -165,24 +293,20 @@ class NativeResearcherAdapter(CommandResearcherAdapter):
         assert self.config.executable is not None
         return self.config.executable
 
-    def _version_or_failure(
+    def _compatibility_or_failure(
         self,
         request: ResearchRequest,
         workspace: Path,
-    ) -> tuple[str | None, InvocationResult | None]:
-        environment = self._environment(request)
-        version, error = _probe_version(
-            self.executable,
-            workspace=workspace,
-            environment=environment,
-        )
-        if error is None:
-            return version, None
+    ) -> tuple[dict[str, Any] | None, InvocationResult | None]:
+        probe = probe_provider(self.config, workspace=workspace)
+        if probe["ready"]:
+            return probe, None
+        detail = json.dumps(probe["issues"], sort_keys=True).encode("utf-8")
         return None, InvocationResult(
             returncode=None,
             response_bytes=b"",
             stdout_bytes=b"",
-            stderr_bytes=error,
+            stderr_bytes=detail,
             timed_out=False,
             provider=self.provider,
         )
@@ -215,9 +339,10 @@ class CodexResearcherAdapter(NativeResearcherAdapter):
         workspace: Path,
         prompt: str,
     ) -> InvocationResult:
-        version, failure = self._version_or_failure(request, workspace)
+        compatibility, failure = self._compatibility_or_failure(request, workspace)
         if failure is not None:
             return failure
+        assert compatibility is not None
         with tempfile.TemporaryDirectory(prefix="autodidact-codex-") as temporary:
             temporary_root = Path(temporary)
             schema_path = temporary_root / "response-schema.json"
@@ -260,7 +385,7 @@ class CodexResearcherAdapter(NativeResearcherAdapter):
             stderr_bytes=stderr,
             timed_out=timed_out,
             provider=self.provider,
-            cli_version=version,
+            cli_version=compatibility["version"],
             resolved_model=resolved_model or self.config.model,
             inference_provider="openai",
             trusted_usage=usage,
@@ -305,9 +430,11 @@ class ClaudeCodeResearcherAdapter(NativeResearcherAdapter):
         workspace: Path,
         prompt: str,
     ) -> InvocationResult:
-        version, failure = self._version_or_failure(request, workspace)
+        compatibility, failure = self._compatibility_or_failure(request, workspace)
         if failure is not None:
             return failure
+        assert compatibility is not None
+        allowed_tools_flag = compatibility["selected_flags"]["allowed tools"]
         command = [
             self.executable,
             "--print",
@@ -325,7 +452,7 @@ class ClaudeCodeResearcherAdapter(NativeResearcherAdapter):
             "dontAsk",
             "--tools",
             "Read,Edit,Bash",
-            "--allowedTools",
+            allowed_tools_flag,
             "Read",
             "Edit",
             "Bash(git diff *)",
@@ -357,7 +484,7 @@ class ClaudeCodeResearcherAdapter(NativeResearcherAdapter):
             stderr_bytes=stderr,
             timed_out=timed_out,
             provider=self.provider,
-            cli_version=version,
+            cli_version=compatibility["version"],
             resolved_model=resolved_model or self.config.model,
             inference_provider="anthropic",
             trusted_usage=usage,
@@ -374,9 +501,11 @@ class HermesAgentResearcherAdapter(NativeResearcherAdapter):
         workspace: Path,
         prompt: str,
     ) -> InvocationResult:
-        version, failure = self._version_or_failure(request, workspace)
+        compatibility, failure = self._compatibility_or_failure(request, workspace)
         if failure is not None:
             return failure
+        assert compatibility is not None
+        one_shot_flag = compatibility["selected_flags"]["one-shot execution"]
         request_path = workspace / f".autodidact-request-{request.request_id}.json"
         if request_path.exists():
             raise ResearcherError("temporary native request path already exists")
@@ -385,7 +514,7 @@ class HermesAgentResearcherAdapter(NativeResearcherAdapter):
             request_path.write_text(prompt, encoding="utf-8")
             command = [
                 self.executable,
-                "--oneshot",
+                one_shot_flag,
                 (
                     f"Read {request_path.name}, carry out that research request, then return "
                     "only its required JSON response."
@@ -438,7 +567,7 @@ class HermesAgentResearcherAdapter(NativeResearcherAdapter):
             stderr_bytes=stderr,
             timed_out=timed_out,
             provider=self.provider,
-            cli_version=version,
+            cli_version=compatibility["version"],
             resolved_model=resolved_model,
             inference_provider=inference_provider,
             trusted_usage=usage,

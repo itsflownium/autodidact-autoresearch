@@ -31,6 +31,20 @@ DEFAULT_ARTIFACT_ROOT = Path("artifacts/researcher")
 _ID_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 _COMMIT_PATTERN = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _ENVIRONMENT_KEY_PATTERN = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+_DEFAULT_INHERITED_ENVIRONMENT = (
+    "HOME",
+    "LANG",
+    "PATH",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "SYSTEMROOT",
+    "COMSPEC",
+    "PATHEXT",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+)
 _PROPOSAL_KEYS = frozenset(
     {
         "title",
@@ -373,7 +387,7 @@ class ResearcherConfig:
     timeout_seconds: float = 900.0
     max_output_bytes: int = 1_000_000
     max_diff_bytes: int = 2_000_000
-    inherit_environment: tuple[str, ...] = ("HOME", "LANG", "PATH", "TMPDIR")
+    inherit_environment: tuple[str, ...] = _DEFAULT_INHERITED_ENVIRONMENT
     environment: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
@@ -496,7 +510,7 @@ class ResearcherConfig:
         ):
             raise ResearcherError("environment must map strings to strings")
         command = value.get("command", [])
-        inherited = value.get("inherit_environment", ["HOME", "LANG", "PATH", "TMPDIR"])
+        inherited = value.get("inherit_environment", list(_DEFAULT_INHERITED_ENVIRONMENT))
         if not isinstance(command, list) or not isinstance(inherited, list):
             raise ResearcherError("command and inherit_environment must be arrays")
         provider_value = value.get("provider")
@@ -742,7 +756,33 @@ def load_research_attempt(
     )
 
 
-def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
+def _process_group_options(*, windows: bool | None = None) -> dict[str, Any]:
+    windows = os.name == "nt" if windows is None else windows
+    if windows:
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)}
+    return {"start_new_session": True}
+
+
+def _kill_process_group(
+    process: subprocess.Popen[bytes],
+    *,
+    windows: bool | None = None,
+) -> None:
+    windows = os.name == "nt" if windows is None else windows
+    if windows:
+        try:
+            process.send_signal(getattr(signal, "CTRL_BREAK_EVENT", signal.SIGTERM))
+            process.wait(timeout=2.0)
+            return
+        except (OSError, subprocess.TimeoutExpired):
+            with suppress(OSError):
+                process.terminate()
+        try:
+            process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            with suppress(OSError):
+                process.kill()
+        return
     try:
         os.killpg(process.pid, signal.SIGTERM)
         process.wait(timeout=2.0)
@@ -767,7 +807,7 @@ def run_researcher_process(
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            start_new_session=True,
+            **_process_group_options(),
         )
     except OSError as error:
         return None, b"", str(error).encode("utf-8", errors="replace"), False

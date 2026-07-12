@@ -15,9 +15,50 @@ from autodidact.researcher import (
     ResearchRequest,
     ResearchStatus,
     StructuredResearchResponse,
+    _kill_process_group,
+    _process_group_options,
     load_research_attempt,
     main,
 )
+
+
+def test_process_group_options_are_cross_platform() -> None:
+    assert _process_group_options(windows=False) == {"start_new_session": True}
+    assert "creationflags" in _process_group_options(windows=True)
+    inherited = ResearcherConfig(command=("researcher",)).inherit_environment
+    assert {"PATH", "TMP", "TEMP", "SYSTEMROOT", "PATHEXT"}.issubset(inherited)
+
+
+def test_windows_process_group_timeout_falls_back_to_terminate() -> None:
+    class FakeProcess:
+        pid = 7
+
+        def __init__(self) -> None:
+            self.signals: list[int] = []
+            self.terminated = False
+            self.waits = 0
+
+        def send_signal(self, value: int) -> None:
+            self.signals.append(value)
+
+        def wait(self, *, timeout: float) -> None:
+            assert timeout == 2.0
+            self.waits += 1
+            if self.waits == 1:
+                raise subprocess.TimeoutExpired("agent", timeout)
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            raise AssertionError("second wait succeeds")
+
+    process = FakeProcess()
+
+    _kill_process_group(process, windows=True)  # type: ignore[arg-type]
+
+    assert process.signals
+    assert process.terminated is True
 
 
 def _git(repository: Path, *arguments: str) -> str:

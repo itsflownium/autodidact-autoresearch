@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,7 @@ from autodidact.researcher_providers import (
     CodexResearcherAdapter,
     HermesAgentResearcherAdapter,
     build_researcher_adapter,
+    probe_provider,
     response_json_schema,
 )
 
@@ -101,6 +103,9 @@ import sys
 if "--version" in sys.argv:
     print("codex-cli test-1")
     raise SystemExit(0)
+if sys.argv[1:] == ["exec", "--help"]:
+    print("--ephemeral --sandbox --json --output-schema --output-last-message")
+    raise SystemExit(0)
 assert sys.argv[1] == "exec"
 assert "--ephemeral" in sys.argv
 sandbox_index = sys.argv.index("--sandbox")
@@ -134,6 +139,10 @@ import sys
 if "--version" in sys.argv:
     print("Claude Code test-1")
     raise SystemExit(0)
+if "--help" in sys.argv:
+    print("--print --output-format --json-schema --no-session-persistence "
+          "--strict-mcp-config --permission-mode --tools --allowedTools")
+    raise SystemExit(0)
 for required in ("--print", "--json-schema", "--no-session-persistence", "--strict-mcp-config"):
     assert required in sys.argv
 schema = json.loads(sys.argv[sys.argv.index("--json-schema") + 1])
@@ -164,6 +173,9 @@ import sys
 
 if "--version" in sys.argv:
     print("Hermes Agent test-1")
+    raise SystemExit(0)
+if "--help" in sys.argv:
+    print("--oneshot --usage-file --toolsets --ignore-rules")
     raise SystemExit(0)
 assert "--oneshot" in sys.argv
 toolsets_index = sys.argv.index("--toolsets")
@@ -526,3 +538,195 @@ def test_native_configuration_rejects_cross_provider_options() -> None:
             executable="hermes",
             max_budget_usd=1.0,
         )
+
+
+def test_capability_probe_fails_before_inference_with_exact_missing_feature(
+    tmp_path: Path,
+) -> None:
+    executable = _executable(
+        tmp_path,
+        "old-codex",
+        """
+import sys
+if "--version" in sys.argv:
+    print("codex-cli old")
+    raise SystemExit(0)
+if "--help" in sys.argv:
+    print("--ephemeral --sandbox --json --output-last-message")
+    raise SystemExit(0)
+raise RuntimeError("inference must not run")
+""",
+    )
+    config = ResearcherConfig(provider=ResearcherProvider.CODEX, executable=str(executable))
+
+    probe = probe_provider(config, workspace=tmp_path)
+
+    assert probe["ready"] is False
+    assert probe["missing_capabilities"] == ["response schema"]
+    assert probe["issues"][0]["code"] == "missing_capabilities"
+    assert "response schema" in probe["issues"][0]["message"]
+
+
+def test_hermes_adapter_selects_short_one_shot_flag(tmp_path: Path) -> None:
+    repository, parent = _repository(tmp_path)
+    executable = _executable(
+        tmp_path,
+        "new-hermes",
+        f"""
+import json
+import pathlib
+import sys
+if "--version" in sys.argv:
+    print("Hermes Agent new")
+    raise SystemExit(0)
+if "--help" in sys.argv:
+    print("-z --usage-file --toolsets --ignore-rules")
+    raise SystemExit(0)
+assert "-z" in sys.argv and "--oneshot" not in sys.argv
+pathlib.Path("train.py").write_text("LEARNING_RATE = 0.008\\n")
+usage_path = pathlib.Path(sys.argv[sys.argv.index("--usage-file") + 1])
+usage_path.write_text(json.dumps({{
+    "input_tokens": 10, "output_tokens": 5, "model": "model", "provider": "backend"
+}}))
+print(json.dumps({repr(_response())}))
+""",
+    )
+    adapter = HermesAgentResearcherAdapter(
+        ResearcherConfig(provider=ResearcherProvider.HERMES_AGENT, executable=str(executable))
+    )
+
+    attempt = adapter.run(
+        _request(parent),
+        workspace=repository,
+        artifact_root=tmp_path / "artifacts",
+    )
+
+    assert attempt.status is ResearchStatus.PROPOSED
+    assert attempt.usage.total_tokens == 15
+
+
+def test_bootstrap_fix_installs_missing_codex_with_fake_npm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    bin_root = tmp_path / "bin"
+    bin_root.mkdir()
+    codex_path = bin_root / "codex"
+    installed_source = (
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "if '--version' in sys.argv: print('codex-cli repaired')\n"
+        "elif '--help' in sys.argv: "
+        "print('--ephemeral --sandbox --json --output-schema --output-last-message')\n"
+    )
+    npm = _executable(
+        bin_root,
+        "npm",
+        f"""
+import pathlib
+import sys
+assert sys.argv[1:] == ["install", "-g", "@openai/codex"]
+path = pathlib.Path({str(codex_path)!r})
+path.write_text({installed_source!r})
+path.chmod(0o755)
+""",
+    )
+    assert npm.is_file()
+    monkeypatch.setenv("PATH", os.pathsep.join((str(bin_root), str(Path(sys.executable).parent))))
+    config_path = tmp_path / "researcher.json"
+
+    exit_code = agent_main(
+        [
+            "bootstrap",
+            "--provider",
+            "codex",
+            "--config",
+            str(config_path),
+            "--fix",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is True
+    assert payload["repair_actions"][0]["status"] == "fixed"
+    assert ResearcherConfig.from_path(config_path).executable == "codex"
+
+
+def test_doctor_fix_repairs_private_config_permissions(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    if os.name == "nt":
+        pytest.skip("POSIX mode bits are not a Windows privacy contract")
+    config_path = tmp_path / "researcher.json"
+    config_path.write_text(
+        json.dumps(
+            ResearcherConfig(
+                provider=ResearcherProvider.CLAUDE_CODE,
+                executable=str(_claude_executable(tmp_path)),
+            ).to_mapping()
+        ),
+        encoding="utf-8",
+    )
+    config_path.chmod(0o644)
+
+    assert agent_main(["doctor", "--config", str(config_path), "--fix"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is True
+    assert payload["repair_actions"][0]["code"] == "config_permissions"
+    assert stat_mode(config_path) == 0o600
+
+
+def test_bootstrap_fix_persists_discovered_compatible_executable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    bin_root = tmp_path / "bin"
+    bin_root.mkdir()
+    executable = _executable(
+        bin_root,
+        "codex",
+        """
+import sys
+if "--version" in sys.argv:
+    print("codex-cli discovered")
+elif "--help" in sys.argv:
+    print("--ephemeral --sandbox --json --output-schema --output-last-message")
+""",
+    )
+    monkeypatch.setenv("PATH", os.pathsep.join((str(bin_root), str(Path(sys.executable).parent))))
+    missing = tmp_path / "old" / "codex"
+    config_path = tmp_path / "researcher.json"
+    config_path.write_text(
+        json.dumps(
+            ResearcherConfig(
+                provider=ResearcherProvider.CODEX,
+                executable=str(missing),
+            ).to_mapping()
+        ),
+        encoding="utf-8",
+    )
+
+    assert (
+        agent_main(
+            [
+                "bootstrap",
+                "--provider",
+                "codex",
+                "--executable",
+                str(missing),
+                "--config",
+                str(config_path),
+                "--fix",
+            ]
+        )
+        == 0
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["repair_actions"][0]["code"] == "select_compatible_executable"
+    assert ResearcherConfig.from_path(config_path).executable == str(executable)
