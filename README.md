@@ -8,7 +8,7 @@ Autodidact starts with a **1,016,960-parameter transformer** that can run locall
 
 Autodidact builds on the compact workflow introduced by [Karpathy's autoresearch](https://github.com/karpathy/autoresearch), then adds **PatchRCT**, paired experiments, hidden evaluation, and Bayesian downstream-reward estimation.
 
-> **Status:** the immutable data system, baseline trainer, local seed-noise calibration, research-agent contract, versioned experiment records, append-only evidence ledger, CI checks, and resumable full-baseline runner are implemented. The three-seed, 20M-token parent baseline is complete. The paired experiment runner and automatic PatchRCT promotion controller are not integrated yet, and no candidate-patch improvement is claimed.
+> **Status:** the immutable data system, 1,016,960-parameter baseline, local noise calibration, protected paired runner, PatchRCT controller, downstream-reward estimator, generic researcher adapter, durable recovery state, and autonomous orchestration loop are implemented. The three-seed, 20M-token parent baseline is complete. The real patch campaign, 40-label reward calibration, and sealed evaluation have not run, and no candidate-patch improvement is claimed.
 
 ## How it works
 
@@ -522,6 +522,47 @@ uv run autodidact-state recover
 
 Campaign databases and lock metadata remain ignored runtime state. Store verification checks schema identity, operation evidence, canonical results, reservation lifecycle, and exact agreement between budget rows and campaign counters.
 
+## Autonomous research orchestrator
+
+`autodidact-orchestrator` connects the configured researcher, Git workspaces, evidence ledger, protected runner, PatchRCT controller, downstream-reward estimator, and durable campaign state into one resumable loop. It always starts from the ledger's accepted parent and synchronizes `refs/autodidact/accepted` before requesting a proposal.
+
+For each proposal, the orchestrator:
+
+1. reserves proposal and researcher-token budget;
+2. creates a detached workspace at the accepted parent;
+3. supplies `program.md`, prior terminal results, and the `train.py`-only edit scope;
+4. validates the structured hypothesis and minimum useful BPB gain;
+5. creates one direct candidate commit and a retained candidate Git ref;
+6. appends the proposal, performs protected model inspection, and registers the candidate;
+7. asks PatchRCT to persist the next predetermined stage and seed schedule;
+8. reserves worst-case training and compute budget before launching the paired runner;
+9. extracts early reward features or full-budget labels, updates the Bayesian model, and records available predictions;
+10. lets PatchRCT reject, request the next seed, escalate, or promote; and
+11. starts the next proposal from the newly accepted parent after promotion.
+
+Every external invocation and paired schedule has a deterministic operation key. Completed operations replay their retained result. After a process restart, interrupted researcher calls are recovered from verified transcripts and interrupted experiments are reconciled against ledger evidence before the idempotent runner may resume. A campaign-wide Git lock prevents concurrent lineage advancement, while pause and cancellation are honored between retained operations.
+
+Initialize a bounded local campaign, then run it continuously or one proposal at a time:
+
+```bash
+uv run autodidact-orchestrator initialize \
+  --campaign-id campaign-local-001 \
+  --max-proposals 50 \
+  --max-wall-seconds 86400 \
+  --max-researcher-tokens 1000000 \
+  --max-training-tokens 1000000000 \
+  --max-compute-seconds 86400
+
+uv run autodidact-orchestrator run
+uv run autodidact-orchestrator run --max-new-proposals 1
+uv run autodidact-orchestrator status
+uv run autodidact-orchestrator pause --reason "finish the active operation"
+uv run autodidact-orchestrator resume
+uv run autodidact-orchestrator cancel --reason "retain evidence and stop"
+```
+
+The test suite substitutes a deterministic local proposal command and synthetic paired measurements. It exercises the real worktree, commit, ledger, PatchRCT, reward, state, recovery, and parent-advancement paths without invoking the configured external researcher or performing full model training.
+
 ## PatchRCT decision controller
 
 `autodidact.controller` is the protected sequential state machine above the evidence ledger. It never chooses a seed because that seed performed well. Each stage receives a prefix of the fixed policy seed pool, and uncertainty can request only the next unused seed in that predetermined order.
@@ -681,8 +722,9 @@ assets/                  final figures
 - [x] Train and verify the 1,016,960-parameter TinyStories baseline.
 - [x] Measure seed noise and execution noise locally.
 - [x] Implement versioned experiment records and the append-only evidence ledger.
-- [ ] Implement protected paired parent-versus-patch experiments.
-- [ ] Implement PatchRCT promotion, rejection, and escalation gates.
+- [x] Implement protected paired parent-versus-patch experiments.
+- [x] Implement PatchRCT promotion, rejection, and escalation gates.
+- [x] Connect the researcher, recovery state, runner, reward estimator, and controller.
 - [ ] Collect 40 full-budget patch labels and calibrate downstream prediction.
 - [ ] Run the three-arm, 50-proposal local pilot.
 - [ ] Expand to repeated 100-proposal studies.

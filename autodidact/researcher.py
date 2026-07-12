@@ -63,6 +63,26 @@ _REQUEST_KEYS = frozenset(
         "program_path",
         "previous_results",
         "allowed_paths",
+        "maximum_total_tokens",
+    }
+)
+_TRANSCRIPT_KEYS = frozenset(
+    {
+        "changed_paths",
+        "diff",
+        "diff_sha256",
+        "failure_reason",
+        "prompt",
+        "prompt_sha256",
+        "request_id",
+        "response",
+        "response_sha256",
+        "returncode",
+        "schema_version",
+        "status",
+        "stderr",
+        "stdout",
+        "timed_out",
     }
 )
 
@@ -235,6 +255,7 @@ class ResearchRequest:
     proposal_number: int
     program_text: str
     previous_results: tuple[dict[str, Any], ...]
+    maximum_total_tokens: int = 50_000
     allowed_paths: tuple[str, ...] = ("train.py",)
 
     def __post_init__(self) -> None:
@@ -244,6 +265,8 @@ class ResearchRequest:
             raise ResearcherError("parent_commit must be a full lowercase Git commit")
         if type(self.proposal_number) is not int or self.proposal_number <= 0:
             raise ResearcherError("proposal_number must be positive")
+        if type(self.maximum_total_tokens) is not int or self.maximum_total_tokens <= 0:
+            raise ResearcherError("maximum_total_tokens must be positive")
         _required_text("program_text", self.program_text, maximum=200_000)
         if len(self.previous_results) > 200:
             raise ResearcherError("previous_results contains too many entries")
@@ -277,6 +300,7 @@ class ResearchRequest:
                 "usage": {"input_tokens": "integer", "output_tokens": "integer"},
             },
             "parent_commit": self.parent_commit,
+            "maximum_total_tokens": self.maximum_total_tokens,
             "previous_results": list(self.previous_results),
             "program_md": self.program_text,
             "proposal_number": self.proposal_number,
@@ -410,6 +434,86 @@ def _changed_paths(workspace: Path) -> tuple[str, ...]:
     return tuple(sorted(paths))
 
 
+def load_research_attempt(
+    transcript_path: Path,
+    request: ResearchRequest,
+    *,
+    workspace: Path,
+) -> ResearchAttempt:
+    """Recover a completed invocation from its transcript without calling the researcher."""
+    try:
+        transcript = json.loads(transcript_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ResearcherError(f"cannot read researcher transcript: {error}") from error
+    if not isinstance(transcript, dict):
+        raise ResearcherError("researcher transcript must be an object")
+    _strict_keys(transcript, _TRANSCRIPT_KEYS, name="transcript")
+    if transcript["schema_version"] != RESEARCHER_SCHEMA_VERSION:
+        raise ResearcherError("researcher transcript schema is unsupported")
+    if transcript["request_id"] != request.request_id:
+        raise ResearcherError("researcher transcript belongs to another request")
+
+    workspace = workspace.resolve()
+    head = str(_git(workspace, "rev-parse", "HEAD")).strip()
+    if head != request.parent_commit:
+        raise ResearcherError("research workspace moved after its recorded invocation")
+    changed_paths = _changed_paths(workspace)
+    if transcript["changed_paths"] != list(changed_paths):
+        raise ResearcherError("researcher transcript changed paths differ from the workspace")
+    diff_bytes = _git(workspace, "diff", "--binary", "HEAD", text=False)
+    assert isinstance(diff_bytes, bytes)
+    diff = diff_bytes.decode("utf-8", errors="replace")
+    diff_hash = hashlib.sha256(diff_bytes).hexdigest() if diff_bytes else None
+    if transcript["diff"] != diff or transcript["diff_sha256"] != diff_hash:
+        raise ResearcherError("researcher transcript diff differs from the workspace")
+
+    prompt = request.prompt()
+    prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    if transcript["prompt"] != prompt or transcript["prompt_sha256"] != prompt_hash:
+        raise ResearcherError("researcher transcript prompt differs from the request")
+    stdout = transcript["stdout"]
+    if not isinstance(stdout, str):
+        raise ResearcherError("researcher transcript stdout must be text")
+    response_hash = hashlib.sha256(stdout.encode("utf-8")).hexdigest()
+    if transcript["response_sha256"] != response_hash:
+        raise ResearcherError("researcher transcript response hash is invalid")
+    try:
+        status = ResearchStatus(transcript["status"])
+    except (TypeError, ValueError) as error:
+        raise ResearcherError("researcher transcript status is invalid") from error
+    response = (
+        None if transcript["response"] is None else StructuredResearchResponse.from_json(stdout)
+    )
+    if response is not None:
+        if json.loads(stdout) != transcript["response"] or response.status is not status:
+            raise ResearcherError("researcher transcript structured response is inconsistent")
+    elif status is not ResearchStatus.FAILED:
+        raise ResearcherError("successful researcher transcript is missing its response")
+    failure_reason = transcript["failure_reason"]
+    if failure_reason is not None:
+        failure_reason = _required_text("failure_reason", failure_reason)
+    if status is ResearchStatus.FAILED and failure_reason is None:
+        raise ResearcherError("failed researcher transcript is missing its reason")
+    returncode = transcript["returncode"]
+    if returncode is not None and type(returncode) is not int:
+        raise ResearcherError("researcher transcript returncode is invalid")
+    if type(transcript["timed_out"]) is not bool:
+        raise ResearcherError("researcher transcript timed_out must be boolean")
+    return ResearchAttempt(
+        request_id=request.request_id,
+        status=status,
+        response=response,
+        failure_reason=failure_reason,
+        changed_paths=changed_paths,
+        diff_sha256=diff_hash,
+        prompt_sha256=prompt_hash,
+        response_sha256=response_hash,
+        transcript_path=transcript_path.resolve(),
+        returncode=returncode,
+        timed_out=transcript["timed_out"],
+    )
+
+
 def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
     try:
         os.killpg(process.pid, signal.SIGTERM)
@@ -434,6 +538,7 @@ class CommandResearcherAdapter:
             {
                 "AUTODIDACT_ALLOWED_PATHS": json.dumps(list(request.allowed_paths)),
                 "AUTODIDACT_REQUEST_ID": request.request_id,
+                "AUTODIDACT_RESEARCHER_TOKEN_BUDGET": str(request.maximum_total_tokens),
                 "PYTHONUNBUFFERED": "1",
             }
         )
@@ -525,7 +630,10 @@ class CommandResearcherAdapter:
                     failure_reason = str(error)
 
         if response is not None:
-            if response.status is ResearchStatus.PROPOSED and not changed_paths:
+            if response.usage.total_tokens > request.maximum_total_tokens:
+                failure_reason = "researcher reported usage above its assigned token budget"
+                response = None
+            elif response.status is ResearchStatus.PROPOSED and not changed_paths:
                 failure_reason = "researcher proposed a patch without changing an allowed file"
                 response = None
             elif response.status is not ResearchStatus.PROPOSED and changed_paths:
@@ -603,6 +711,7 @@ def _load_request(path: Path) -> ResearchRequest:
         proposal_number=value["proposal_number"],
         program_text=program_text,
         previous_results=tuple(previous),
+        maximum_total_tokens=value["maximum_total_tokens"],
         allowed_paths=tuple(allowed),
     )
 
