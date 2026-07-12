@@ -1430,9 +1430,7 @@ def _config_from_args(args: argparse.Namespace) -> OrchestratorConfig:
         allowed_paths=(("train.py",) if plugin is None else plugin.editable_paths),
         target_plugin_id=(None if plugin is None else plugin.plugin_id),
         target_metric_name=("validation_bpb" if plugin is None else plugin.metric.name),
-        target_metric_direction=(
-            "lower" if plugin is None else plugin.metric.direction.value
-        ),
+        target_metric_direction=("lower" if plugin is None else plugin.metric.direction.value),
         researcher_token_allowance=getattr(
             args,
             "researcher_token_allowance",

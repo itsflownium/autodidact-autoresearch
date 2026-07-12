@@ -664,9 +664,7 @@ class PairedExperimentRunner:
             except (TargetError, TargetPluginError) as error:
                 raise RunnerError(str(error)) from error
         self.trainer_path = "train.py" if self.plugin is None else self.plugin.trainer_path
-        self.editable_paths = (
-            ("train.py",) if self.plugin is None else self.plugin.editable_paths
-        )
+        self.editable_paths = ("train.py",) if self.plugin is None else self.plugin.editable_paths
         self.policy_contract_sha256 = (
             policy_sha256()
             if self.target_config is None
@@ -759,16 +757,12 @@ class PairedExperimentRunner:
             raise RunnerError(f"protected {arm.value} model inspection failed")
         payload = _last_json_object(stdout_path)
         expected_event = "protected_inspection" if self.plugin is None else "target_inspection"
-        if payload.get("event") != expected_event or payload.get(
-            "trainer_sha256"
-        ) != file_sha256(trainer):
+        if payload.get("event") != expected_event or payload.get("trainer_sha256") != file_sha256(
+            trainer
+        ):
             raise RunnerError(f"protected {arm.value} inspection contract mismatch")
         count = payload.get("parameter_count")
-        if (
-            type(count) is not int
-            or count <= 0
-            or count > self.request.limits.max_parameter_count
-        ):
+        if type(count) is not int or count <= 0 or count > self.request.limits.max_parameter_count:
             raise RunnerError(f"protected {arm.value} parameter count is invalid")
         return payload
 
@@ -1532,9 +1526,7 @@ class PairedExperimentRunner:
                 candidate_commit=validation.candidate_commit,
                 diff_sha256=validation.diff_sha256,
                 changed_paths=validation.changed_paths,
-                trainer_sha256=file_sha256(
-                    worktrees[RunArm.CANDIDATE] / self.trainer_path
-                ),
+                trainer_sha256=file_sha256(worktrees[RunArm.CANDIDATE] / self.trainer_path),
                 policy_sha256=self.policy_contract_sha256,
                 parameter_count=int(inspections[RunArm.CANDIDATE]["parameter_count"]),
             )
@@ -1558,9 +1550,7 @@ class PairedExperimentRunner:
             trainer_path=self.trainer_path,
         )
         if self.plugin is None:
-            data_manifest: dict[str, Any] | None = verify_dataset(
-                self.data_root, scope="public"
-            )
+            data_manifest: dict[str, Any] | None = verify_dataset(self.data_root, scope="public")
         else:
             data_manifest = None
             if self.public_data_root is None or not self.public_data_root.is_dir():
@@ -1606,9 +1596,7 @@ class PairedExperimentRunner:
                 raise RunnerError("registered candidate differs from protected inspection")
             trials = self._trial_specs(
                 candidate,
-                parent_trainer_sha256=file_sha256(
-                    worktrees[RunArm.PARENT] / self.trainer_path
-                ),
+                parent_trainer_sha256=file_sha256(worktrees[RunArm.PARENT] / self.trainer_path),
                 data_manifest=data_manifest,
                 evaluator_sha256=(
                     None
@@ -1758,9 +1746,7 @@ def request_from_args(args: argparse.Namespace) -> ExperimentRequest:
     eval_tokens = defaults.eval_tokens if args.eval_tokens is None else args.eval_tokens
     target = None if args.target_config is None else TargetConfig.from_path(args.target_config)
     repository_root = args.repository_root.resolve()
-    parameter_cap = (
-        args.max_parameter_count if target is None else target.max_parameter_count
-    )
+    parameter_cap = args.max_parameter_count if target is None else target.max_parameter_count
     limits = ResourceLimits(
         timeout_seconds=args.timeout_seconds,
         max_parameter_count=parameter_cap,

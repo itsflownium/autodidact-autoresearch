@@ -245,9 +245,7 @@ class ExternalTargetProcesses:
         stderr_path.write_text("", encoding="utf-8")
         operation = command[2]
         trainer = (
-            Path(_argument(command, "--trainer"))
-            if "--trainer" in command
-            else Path(command[1])
+            Path(_argument(command, "--trainer")) if "--trainer" in command else Path(command[1])
         )
         if operation == "inspect":
             stdout_path.write_text(

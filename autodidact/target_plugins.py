@@ -151,9 +151,7 @@ def _command_template(value: Any, *, name: str) -> tuple[str, ...]:
         "evaluate": ("{python}", "{evaluator}"),
     }[name]
     if tuple(result[:2]) != expected_prefix:
-        raise TargetPluginError(
-            f"commands.{name} must start with {' '.join(expected_prefix)}"
-        )
+        raise TargetPluginError(f"commands.{name} must start with {' '.join(expected_prefix)}")
     return tuple(result)
 
 
@@ -261,9 +259,7 @@ class TargetPluginSpec:
             inspect_command=_command_template(commands["inspect"], name="inspect"),
             train_command=_command_template(commands["train"], name="train"),
             evaluate_command=_command_template(commands["evaluate"], name="evaluate"),
-            data_config_sha256=_sha256(
-                mapping["data_config_sha256"], field="data_config_sha256"
-            ),
+            data_config_sha256=_sha256(mapping["data_config_sha256"], field="data_config_sha256"),
             tokenizer_sha256=_sha256(mapping["tokenizer_sha256"], field="tokenizer_sha256"),
         )
 
