@@ -89,6 +89,7 @@ class PatchRCTPolicy:
     max_training_throughput_regression_fraction: float | None = 0.10
     max_peak_process_rss_regression_fraction: float | None = 0.10
     max_peak_device_regression_fraction: float | None = 0.10
+    force_full_evaluation: bool = False
 
     def __post_init__(self) -> None:
         if not self.seed_pool or len(set(self.seed_pool)) != len(self.seed_pool):
@@ -143,6 +144,8 @@ class PatchRCTPolicy:
             self.rejection_probability < self.continuation_probability <= self.promotion_probability
         ):
             raise ControllerError("policy probability thresholds are not ordered")
+        if type(self.force_full_evaluation) is not bool:
+            raise ControllerError("force_full_evaluation must be boolean")
         self.resource_limits()
 
     def initial_pairs(self, stage: ExperimentStage) -> int:
@@ -567,17 +570,25 @@ class PatchRCTController:
         proposal: PatchProposal,
         stage: ExperimentStage,
         effect: EffectEstimate,
+        *,
+        forced_for_calibration: bool = False,
     ) -> dict[str, Any]:
         next_stage = _NEXT_STAGE[stage]
+        threshold = 0.0 if forced_for_calibration else self.policy.continuation_probability
+        reason = (
+            "calibration policy requires complete early and full-budget evidence"
+            if forced_for_calibration
+            else "useful-gain probability satisfies the stage continuation threshold"
+        )
         decision = self._decision(
             candidate,
             proposal,
             stage,
             DecisionVerdict.ESCALATE,
             effect=effect,
-            probability_threshold=self.policy.continuation_probability,
+            probability_threshold=threshold,
             constraints_passed=True,
-            reasons=("useful-gain probability satisfies the stage continuation threshold",),
+            reasons=(reason,),
             next_stage=next_stage,
         )
         count = self.policy.initial_pairs(next_stage)
@@ -586,7 +597,11 @@ class PatchRCTController:
             stage=next_stage,
             seeds=self.policy.seed_pool[:count],
             source_effect=effect,
-            reason=f"{stage.value} evidence escalated to {next_stage.value}",
+            reason=(
+                f"{stage.value} calibration evidence advanced to {next_stage.value}"
+                if forced_for_calibration
+                else f"{stage.value} evidence escalated to {next_stage.value}"
+            ),
         )
         self.ledger.append_many(
             (
@@ -706,7 +721,8 @@ class PatchRCTController:
                 reasons=("one or more paired resource constraints failed",),
             )
         probability = effect.probability_exceeds_minimum
-        if probability <= self.policy.rejection_probability:
+        forced_for_calibration = self.policy.force_full_evaluation and stage in _NEXT_STAGE
+        if not forced_for_calibration and probability <= self.policy.rejection_probability:
             return self._reject(
                 candidate,
                 proposal,
@@ -731,8 +747,16 @@ class PatchRCTController:
             )
             self.ledger.append(schedule, writer_role=WriterRole.CONTROLLER)
             return self._schedule_payload(schedule)
-        if stage in _NEXT_STAGE and probability >= self.policy.continuation_probability:
-            return self._escalate(candidate, proposal, stage, effect)
+        if stage in _NEXT_STAGE and (
+            forced_for_calibration or probability >= self.policy.continuation_probability
+        ):
+            return self._escalate(
+                candidate,
+                proposal,
+                stage,
+                effect,
+                forced_for_calibration=forced_for_calibration,
+            )
         if stage is ExperimentStage.FULL and probability >= self.policy.promotion_probability:
             return self._promote(candidate, proposal, effect)
         if remaining:
@@ -781,6 +805,7 @@ class PatchRCTController:
             ),
             "latest_verdict": (None if latest_decision is None else latest_decision.verdict.value),
             "policy_sha256": self.policy.sha256(),
+            "force_full_evaluation": self.policy.force_full_evaluation,
             "schedule_ids": [schedule.schedule_id for schedule in schedules],
             "stages_scheduled": [schedule.stage.value for schedule in schedules],
         }

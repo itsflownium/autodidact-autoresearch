@@ -162,6 +162,7 @@ class CampaignLimits:
     max_researcher_tokens: int
     max_training_tokens: int
     max_compute_seconds: float
+    reward_calibration_labels: int = 0
 
     def __post_init__(self) -> None:
         for name in ("max_proposals", "max_researcher_tokens", "max_training_tokens"):
@@ -172,6 +173,12 @@ class CampaignLimits:
             value = getattr(self, name)
             if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
                 raise RunStateError(f"{name} must be finite and positive")
+        if (
+            type(self.reward_calibration_labels) is not int
+            or self.reward_calibration_labels < 0
+            or self.reward_calibration_labels > self.max_proposals
+        ):
+            raise RunStateError("reward_calibration_labels must be between zero and max_proposals")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1182,6 +1189,7 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--max-researcher-tokens", type=int, required=True)
     create.add_argument("--max-training-tokens", type=int, required=True)
     create.add_argument("--max-compute-seconds", type=float, required=True)
+    create.add_argument("--reward-calibration-labels", type=int, default=0)
 
     for name in ("pause", "cancel"):
         command = commands.add_parser(name)
@@ -1210,6 +1218,7 @@ def main(argv: list[str] | None = None) -> int:
                     max_researcher_tokens=args.max_researcher_tokens,
                     max_training_tokens=args.max_training_tokens,
                     max_compute_seconds=args.max_compute_seconds,
+                    reward_calibration_labels=args.reward_calibration_labels,
                 ),
             )
         else:

@@ -345,6 +345,65 @@ def test_low_probability_is_rejected_without_searching_more_seeds(tmp_path: Path
     assert len([event for event in ledger.events() if isinstance(event.record, TrialSchedule)]) == 1
 
 
+def test_calibration_policy_forces_safe_low_gain_patch_to_full_label(tmp_path: Path) -> None:
+    policy = PatchRCTPolicy(force_full_evaluation=True)
+    ledger, controller, candidate, _repository_root = _setup(tmp_path, policy=policy)
+    controller.initialize(candidate.candidate_id)
+
+    cheap = _latest_schedule(ledger, ExperimentStage.CHEAP)
+    _complete_schedule(ledger, candidate, cheap, {11: -0.01})
+    intermediate_action = controller.advance(candidate.candidate_id)
+    assert intermediate_action["stage"] == "intermediate"
+
+    intermediate = _latest_schedule(ledger, ExperimentStage.INTERMEDIATE)
+    _complete_schedule(ledger, candidate, intermediate, {11: -0.01, 23: -0.01})
+    full_action = controller.advance(candidate.candidate_id)
+    assert full_action["stage"] == "full"
+
+    full = _latest_schedule(ledger, ExperimentStage.FULL)
+    _complete_schedule(
+        ledger,
+        candidate,
+        full,
+        {11: -0.01, 23: -0.01, 37: -0.01},
+    )
+    rejected = controller.advance(candidate.candidate_id)
+
+    assert rejected["action"] == "reject"
+    decisions = [
+        event.record for event in ledger.events() if isinstance(event.record, DecisionRecord)
+    ]
+    assert [decision.verdict for decision in decisions] == [
+        DecisionVerdict.ESCALATE,
+        DecisionVerdict.ESCALATE,
+        DecisionVerdict.REJECT,
+    ]
+    assert [decision.probability_threshold for decision in decisions[:2]] == [0.0, 0.0]
+    assert all("calibration policy" in decision.reasons[0] for decision in decisions[:2])
+    assert [
+        schedule.stage for schedule in controller._records(TrialSchedule, candidate.candidate_id)
+    ] == [
+        ExperimentStage.CHEAP,
+        ExperimentStage.INTERMEDIATE,
+        ExperimentStage.FULL,
+    ]
+
+
+def test_calibration_policy_does_not_override_run_failure_rejection(tmp_path: Path) -> None:
+    ledger, controller, candidate, _repository_root = _setup(
+        tmp_path,
+        policy=PatchRCTPolicy(force_full_evaluation=True),
+    )
+    controller.initialize(candidate.candidate_id)
+    cheap = _latest_schedule(ledger, ExperimentStage.CHEAP)
+    _complete_schedule(ledger, candidate, cheap, {}, failed_seed=11)
+
+    rejected = controller.advance(candidate.candidate_id)
+
+    assert rejected["action"] == "reject"
+    assert len([event for event in ledger.events() if isinstance(event.record, TrialSchedule)]) == 1
+
+
 def test_terminal_run_failure_is_rejected_without_fabricating_effect(tmp_path: Path) -> None:
     ledger, controller, candidate, _repository_root = _setup(tmp_path)
     controller.initialize(candidate.candidate_id)
