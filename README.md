@@ -530,6 +530,8 @@ Ledger databases, WAL files, and shared-memory files remain local and ignored by
 
 `autodidact-state` maintains the mutable control state that must survive a controller restart without weakening the immutable evidence ledger. Its transactional SQLite store tracks the accepted parent, generation, active proposal and candidate, current phase, pause or cancellation request, replay-safe operation keys, and separate used and reserved budgets.
 
+Campaign limits also persist an optional reward-calibration label target. This makes calibration behavior restart-stable: a command-line change cannot silently switch an active campaign between ordinary early stopping and forced full-label collection.
+
 Before an external researcher call or paired run starts, the controller records a deterministic operation key and reserves its worst-case proposal, researcher-token, training-token, and compute allowance. A completed key replays its stored result. A key left running by a process crash becomes `interrupted` and must be reconciled against its transcript, Git commit, or ledger evidence before it can be completed or explicitly restarted. Settling records actual usage and releases the unused reservation; exceeding the reservation or campaign maximum fails before new work starts.
 
 A nonblocking lock in the Git common directory is shared by every worktree, preventing two controller processes from advancing the same accepted parent. Pause and cancellation requests become terminal control states only at orchestrator checkpoints, after the active operation has retained its evidence.
@@ -542,7 +544,8 @@ uv run autodidact-state create \
   --max-wall-seconds 86400 \
   --max-researcher-tokens 1000000 \
   --max-training-tokens 1000000000 \
-  --max-compute-seconds 86400
+  --max-compute-seconds 86400 \
+  --reward-calibration-labels 40
 
 uv run autodidact-state status
 uv run autodidact-state pause --reason "finish after the active operation"
@@ -571,6 +574,8 @@ For each proposal, the orchestrator:
 10. lets PatchRCT reject, request the next seed, escalate, or promote; and
 11. starts the next proposal from the newly accepted parent after promotion.
 
+When a campaign has a nonzero reward-calibration target, each safe candidate is advanced through the initial cheap, intermediate, and full paired stages until the target number of unique candidates has both an early feature snapshot and a full label. Low efficacy cannot stop those calibration candidates early, but crashes, non-finite outcomes, integrity failures, parameter violations, and resource regressions still reject them immediately. Full-stage promotion continues to use the normal PatchRCT threshold. Once the target is reached, ordinary early rejection resumes automatically.
+
 Every external invocation and paired schedule has a deterministic operation key. Completed operations replay their retained result. After a process restart, interrupted researcher calls are recovered from verified transcripts and interrupted experiments are reconciled against ledger evidence before the idempotent runner may resume. A campaign-wide Git lock prevents concurrent lineage advancement, while pause and cancellation are honored between retained operations.
 
 Initialize a bounded local campaign, then run it continuously or one proposal at a time:
@@ -582,7 +587,8 @@ uv run autodidact-orchestrator initialize \
   --max-wall-seconds 86400 \
   --max-researcher-tokens 1000000 \
   --max-training-tokens 1000000000 \
-  --max-compute-seconds 86400
+  --max-compute-seconds 86400 \
+  --reward-calibration-labels 40
 
 uv run autodidact-orchestrator run
 uv run autodidact-orchestrator run --max-new-proposals 1
@@ -652,7 +658,7 @@ For this project, **downstream reward** is the patch's held-out BPB improvement 
 - throughput and peak memory;
 - loss spikes, failures, and parameter changes.
 
-The first 40 valid patches receive both short and full evaluations. Those completed experiments train a Bayesian learning-curve model that predicts a distribution rather than a single final score:
+The calibration campaign gives the first 40 safe, valid patches both short and full evaluations, including patches whose early efficacy looks poor. Those completed experiments train a Bayesian learning-curve model that predicts a distribution rather than a single final score:
 
 ```text
 expected full-budget gain:  +0.0031 bpb
@@ -671,7 +677,7 @@ Feature snapshots can contain only cheap and intermediate evidence. Their ledger
 
 Calibration uses conjugate Bayesian linear regression with a normal-inverse-gamma prior. The saved model contains feature standardization, posterior coefficients, posterior precision, noise parameters, source feature and label IDs, and leave-one-out RMSE, mean absolute error, and 90% predictive-interval coverage. Predictions are Student-t distributions rather than point estimates.
 
-The default model is considered calibrated only after 40 candidates have both early features and full labels. Before then, predictions remain diagnostic and the allocation is `run_full_for_calibration`. After calibration:
+The default model is considered calibrated only after 40 unique candidates have both an early feature snapshot and a later full label. The persisted campaign target and the model's minimum label count are the same value. Before then, predictions remain diagnostic and the allocation is `run_full_for_calibration`. After calibration:
 
 - useful-gain probability at or below 10% returns `stop`;
 - probability at or above 80% returns `run_full`;

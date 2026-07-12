@@ -106,6 +106,37 @@ def test_campaign_creation_progress_and_persistent_snapshot(tmp_path: Path) -> N
         )
 
 
+def test_reward_calibration_target_is_validated_and_persisted(tmp_path: Path) -> None:
+    limits = CampaignLimits(
+        max_proposals=5,
+        max_wall_seconds=3_600.0,
+        max_researcher_tokens=50_000,
+        max_training_tokens=100_000_000,
+        max_compute_seconds=20_000.0,
+        reward_calibration_labels=3,
+    )
+    store = CampaignStore.create(
+        tmp_path / "calibration.sqlite3",
+        campaign_id="campaign-calibration-001",
+        initial_parent_commit=PARENT,
+        limits=limits,
+        clock=FakeClock(),
+    )
+
+    assert store.snapshot().limits.reward_calibration_labels == 3
+    assert CampaignStore.open(store.path, clock=FakeClock()).snapshot().limits == limits
+
+    with pytest.raises(RunStateError, match="between zero and max_proposals"):
+        CampaignLimits(
+            max_proposals=2,
+            max_wall_seconds=3_600.0,
+            max_researcher_tokens=50_000,
+            max_training_tokens=100_000_000,
+            max_compute_seconds=20_000.0,
+            reward_calibration_labels=3,
+        )
+
+
 def test_repository_lock_excludes_second_controller(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
     first = RepositoryLock(repository, campaign_id="campaign-001")
