@@ -24,11 +24,13 @@ from typing import Any
 from autodidact.data.integrity import canonical_json_bytes
 from autodidact.records import (
     RECORD_SCHEMA_VERSION,
+    AllocationAction,
     ArtifactManifest,
     CandidateRecord,
     ComputeRecord,
     DecisionRecord,
     DecisionVerdict,
+    DownstreamAllocation,
     DownstreamPrediction,
     EffectEstimate,
     ExperimentRecord,
@@ -43,6 +45,7 @@ from autodidact.records import (
     TrialSpec,
     build_effect_estimate,
     build_paired_result,
+    downstream_audit_assignment,
     new_record_id,
     record_from_envelope,
     record_id,
@@ -232,6 +235,7 @@ _ALLOWED_WRITERS: dict[str, frozenset[WriterRole]] = {
     PairedResult.RECORD_TYPE: frozenset({WriterRole.CONTROLLER, WriterRole.EVALUATOR}),
     EffectEstimate.RECORD_TYPE: frozenset({WriterRole.CONTROLLER, WriterRole.EVALUATOR}),
     DownstreamPrediction.RECORD_TYPE: frozenset({WriterRole.CONTROLLER, WriterRole.EVALUATOR}),
+    DownstreamAllocation.RECORD_TYPE: frozenset({WriterRole.CONTROLLER}),
     DecisionRecord.RECORD_TYPE: frozenset({WriterRole.CONTROLLER}),
     LineageRecord.RECORD_TYPE: frozenset({WriterRole.CONTROLLER}),
     ComputeRecord.RECORD_TYPE: frozenset({WriterRole.CONTROLLER, WriterRole.EVALUATOR}),
@@ -645,6 +649,7 @@ class ExperimentLedger:
                         event.event_sha256,
                     ),
                 )
+            cls._validate_allocation_links(replay)
         except LedgerError as error:
             raise LedgerIntegrityError(f"ledger semantic history is invalid: {error}") from error
         finally:
@@ -765,6 +770,7 @@ class ExperimentLedger:
                 appended.append(event)
                 previous = event_hash
                 next_sequence += 1
+            self._validate_allocation_links(connection)
             connection.commit()
             return tuple(appended)
         except Exception:
@@ -1085,6 +1091,10 @@ class ExperimentLedger:
                 )
             return
 
+        if isinstance(record, DownstreamAllocation):
+            cls._validate_downstream_allocation(connection, record, current_parent)
+            return
+
         if isinstance(record, DecisionRecord):
             cls._validate_decision(connection, record, current_parent)
             return
@@ -1188,6 +1198,245 @@ class ExperimentLedger:
             raise LedgerStateError("paired result does not match protected run outcomes")
 
     @classmethod
+    def _allocation_for_decision(
+        cls,
+        connection: sqlite3.Connection,
+        decision_id: str,
+    ) -> DownstreamAllocation | None:
+        matches = [
+            item
+            for item in cls._records_of_type(connection, DownstreamAllocation)
+            if item.planned_decision_id == decision_id
+        ]
+        if len(matches) > 1:
+            raise LedgerStateError("multiple allocations authorize the same decision")
+        return matches[0] if matches else None
+
+    @classmethod
+    def _validate_downstream_allocation(
+        cls,
+        connection: sqlite3.Connection,
+        record: DownstreamAllocation,
+        current_parent: str,
+    ) -> None:
+        candidate = cls._require_record(connection, record.candidate_id, CandidateRecord)
+        proposal = cls._require_record(connection, candidate.proposal_id, PatchProposal)
+        if candidate.parent_commit != current_parent:
+            raise LedgerStateError("cannot allocate compute for a stale candidate")
+        decisions = [
+            item
+            for item in cls._records_of_type(connection, DecisionRecord)
+            if item.candidate_id == record.candidate_id
+        ]
+        if any(
+            item.verdict in {DecisionVerdict.REJECT, DecisionVerdict.PROMOTE} for item in decisions
+        ):
+            raise LedgerStateError("terminal candidates cannot receive allocations")
+        if any(item.stage is record.stage for item in decisions):
+            raise LedgerStateError("a decided stage cannot receive an allocation")
+
+        prior_allocations = [
+            item
+            for item in cls._records_of_type(connection, DownstreamAllocation)
+            if item.candidate_id == record.candidate_id
+        ]
+        if any(
+            item.effect_estimate_id == record.effect_estimate_id
+            or item.downstream_prediction_id == record.downstream_prediction_id
+            for item in prior_allocations
+        ):
+            raise LedgerStateError("early evidence already has a downstream allocation")
+        planned_ids = {
+            item
+            for allocation in prior_allocations
+            for item in (allocation.planned_decision_id, allocation.planned_schedule_id)
+            if item is not None
+        }
+        if any(
+            item in planned_ids
+            for item in (record.planned_decision_id, record.planned_schedule_id)
+            if item is not None
+        ):
+            raise LedgerStateError("allocation plan reuses an authorized record ID")
+
+        schedules = [
+            item
+            for item in cls._records_of_type(connection, TrialSchedule)
+            if item.candidate_id == record.candidate_id
+        ]
+        if (
+            not schedules
+            or max(
+                schedules,
+                key=lambda item: _STAGE_ORDER[item.stage],
+            ).stage
+            is not ExperimentStage.INTERMEDIATE
+        ):
+            raise LedgerStateError("downstream allocation requires intermediate schedules")
+        if any(item.policy_sha256 != record.policy_sha256 for item in schedules):
+            raise LedgerStateError("allocation policy differs from protected schedules")
+
+        effect = cls._require_record(connection, record.effect_estimate_id, EffectEstimate)
+        if (
+            effect.candidate_id != record.candidate_id
+            or effect.stage is not record.stage
+            or not effect.constraints_passed
+        ):
+            raise LedgerStateError("allocation requires safe matching intermediate evidence")
+        if effect.minimum_useful_gain_bpb != proposal.minimum_useful_gain_bpb:
+            raise LedgerStateError("allocation effect differs from proposal contract")
+
+        pairs = [
+            item
+            for item in cls._records_of_type(connection, PairedResult)
+            if item.candidate_id == record.candidate_id
+        ]
+        pair_trials = {
+            pair.paired_result_id: cls._require_record(
+                connection,
+                pair.trial_id,
+                TrialSpec,
+            )
+            for pair in pairs
+        }
+        intermediate_pair_ids = {
+            pair_id
+            for pair_id, trial in pair_trials.items()
+            if trial.stage is ExperimentStage.INTERMEDIATE
+        }
+        if set(effect.paired_result_ids) != intermediate_pair_ids:
+            raise LedgerStateError("allocation effect omits current intermediate evidence")
+
+        prediction = cls._require_record(
+            connection,
+            record.downstream_prediction_id,
+            DownstreamPrediction,
+        )
+        if (
+            prediction.candidate_id != record.candidate_id
+            or prediction.target_stage is not ExperimentStage.FULL
+            or ExperimentStage.INTERMEDIATE not in prediction.source_stages
+        ):
+            raise LedgerStateError("allocation prediction does not target this full experiment")
+        early_trial_ids = {
+            pair_trials[pair.paired_result_id].trial_id
+            for pair in pairs
+            if pair_trials[pair.paired_result_id].stage
+            in {ExperimentStage.CHEAP, ExperimentStage.INTERMEDIATE}
+        }
+        if set(prediction.source_trial_ids) != early_trial_ids:
+            raise LedgerStateError("allocation prediction omits current early evidence")
+        if prediction.minimum_useful_gain_bpb != proposal.minimum_useful_gain_bpb:
+            raise LedgerStateError("allocation prediction differs from proposal contract")
+        if prediction.full_budget_label_count < record.minimum_label_count:
+            raise LedgerStateError("allocation prediction is not sufficiently calibrated")
+
+        assignment_sha256, audit_score = downstream_audit_assignment(
+            record.candidate_id,
+            record.policy_sha256,
+        )
+        if record.audit_assignment_sha256 != assignment_sha256 or record.audit_score != audit_score:
+            raise LedgerStateError("allocation audit assignment is not deterministic")
+
+        probability = prediction.probability_exceeds_minimum
+        if probability <= record.rejection_probability:
+            expected = (
+                AllocationAction.AUDIT_FULL
+                if audit_score < record.audit_fraction
+                else AllocationAction.STOP
+            )
+            if record.action is not expected:
+                raise LedgerStateError("low-probability allocation violates protected auditing")
+        elif probability >= record.full_test_probability:
+            if record.action is not AllocationAction.RUN_FULL:
+                raise LedgerStateError("high-probability allocation must run the full stage")
+        elif record.action not in {
+            AllocationAction.GATHER_MORE,
+            AllocationAction.UNCERTAIN_FULL,
+        }:
+            raise LedgerStateError("uncertain allocation must gather evidence or run full")
+
+        if record.action is AllocationAction.GATHER_MORE:
+            used_seeds = {
+                seed
+                for schedule in schedules
+                if schedule.stage is ExperimentStage.INTERMEDIATE
+                for seed in schedule.seeds
+            }
+            if record.next_seed in used_seeds:
+                raise LedgerStateError("allocation repeats an intermediate seed")
+
+    @classmethod
+    def _validate_allocation_links(cls, connection: sqlite3.Connection) -> None:
+        for allocation in cls._records_of_type(connection, DownstreamAllocation):
+            allocation_event = cls._event_by_record_id(connection, allocation.allocation_id)
+            assert allocation_event is not None
+            if allocation.planned_decision_id is not None:
+                decision_event = cls._event_by_record_id(
+                    connection,
+                    allocation.planned_decision_id,
+                )
+                if decision_event is None or not isinstance(decision_event.record, DecisionRecord):
+                    raise LedgerStateError("allocation planned decision is missing")
+                if decision_event.sequence <= allocation_event.sequence:
+                    raise LedgerStateError("allocation must precede its planned decision")
+                if decision_event.payload_sha256 != allocation.planned_decision_sha256:
+                    raise LedgerStateError("allocation planned decision hash differs")
+                decision = decision_event.record
+                expected_verdict = (
+                    DecisionVerdict.REJECT
+                    if allocation.action is AllocationAction.STOP
+                    else DecisionVerdict.ESCALATE
+                )
+                expected_threshold = {
+                    AllocationAction.STOP: allocation.rejection_probability,
+                    AllocationAction.RUN_FULL: allocation.full_test_probability,
+                    AllocationAction.AUDIT_FULL: 0.0,
+                    AllocationAction.UNCERTAIN_FULL: 0.0,
+                }[allocation.action]
+                if (
+                    decision.candidate_id != allocation.candidate_id
+                    or decision.stage is not allocation.stage
+                    or decision.verdict is not expected_verdict
+                    or decision.effect_estimate_id != allocation.effect_estimate_id
+                    or decision.downstream_prediction_id != allocation.downstream_prediction_id
+                    or decision.probability_threshold != expected_threshold
+                    or not decision.constraints_passed
+                    or decision.next_stage is not allocation.next_stage
+                ):
+                    raise LedgerStateError(
+                        "allocation planned decision does not match its evidence"
+                    )
+
+            if allocation.planned_schedule_id is not None:
+                schedule_event = cls._event_by_record_id(
+                    connection,
+                    allocation.planned_schedule_id,
+                )
+                if schedule_event is None or not isinstance(schedule_event.record, TrialSchedule):
+                    raise LedgerStateError("allocation planned schedule is missing")
+                if schedule_event.sequence <= allocation_event.sequence:
+                    raise LedgerStateError("allocation must precede its planned schedule")
+                if schedule_event.payload_sha256 != allocation.planned_schedule_sha256:
+                    raise LedgerStateError("allocation planned schedule hash differs")
+                schedule = schedule_event.record
+                expected_seeds = (
+                    (allocation.next_seed,)
+                    if allocation.action is AllocationAction.GATHER_MORE
+                    else schedule.seeds
+                )
+                if (
+                    schedule.candidate_id != allocation.candidate_id
+                    or schedule.stage is not allocation.next_stage
+                    or schedule.seeds != expected_seeds
+                    or schedule.source_effect_estimate_id != allocation.effect_estimate_id
+                    or schedule.policy_sha256 != allocation.policy_sha256
+                ):
+                    raise LedgerStateError(
+                        "allocation planned schedule does not match its evidence"
+                    )
+
+    @classmethod
     def _validate_decision(
         cls,
         connection: sqlite3.Connection,
@@ -1238,6 +1487,22 @@ class ExperimentLedger:
                 )
         else:
             prediction = None
+        allocation = cls._allocation_for_decision(connection, record.decision_id)
+        if (
+            prediction is not None
+            and record.stage is ExperimentStage.INTERMEDIATE
+            and record.verdict in {DecisionVerdict.REJECT, DecisionVerdict.ESCALATE}
+            and allocation is None
+        ):
+            raise LedgerStateError(
+                "prediction-linked decisions require a protected allocation record"
+            )
+        if allocation is not None and (
+            prediction is None
+            or allocation.downstream_prediction_id != prediction.prediction_id
+            or allocation.effect_estimate_id != record.effect_estimate_id
+        ):
+            raise LedgerStateError("decision differs from its protected allocation")
 
         prior = [
             item
@@ -1258,7 +1523,10 @@ class ExperimentLedger:
                 raise LedgerStateError("escalation must advance to a later stage")
             if candidate.parent_commit != current_parent:
                 raise LedgerStateError("cannot escalate a candidate from a stale parent")
-            if effect.probability_exceeds_minimum < record.probability_threshold:
+            if (
+                allocation is None
+                and effect.probability_exceeds_minimum < record.probability_threshold
+            ):
                 raise LedgerStateError("effect probability does not satisfy escalation threshold")
         elif record.verdict is DecisionVerdict.PROMOTE:
             assert effect is not None
