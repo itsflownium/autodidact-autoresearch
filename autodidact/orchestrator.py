@@ -38,7 +38,6 @@ from autodidact.records import (
     record_to_envelope,
 )
 from autodidact.researcher import (
-    CommandResearcherAdapter,
     ProposalDraft,
     ResearchAttempt,
     ResearcherAdapter,
@@ -47,6 +46,7 @@ from autodidact.researcher import (
     ResearchRequest,
     load_research_attempt,
 )
+from autodidact.researcher_providers import build_researcher_adapter
 from autodidact.reward import (
     DEFAULT_MINIMUM_LABELS,
     RewardError,
@@ -83,6 +83,7 @@ from autodidact.runstate import (
     ReservationStatus,
     RunStateError,
 )
+from autodidact.target import TargetConfig, TargetError
 
 ORCHESTRATOR_SCHEMA_VERSION = 1
 DEFAULT_PROGRAM_PATH = Path("program.md")
@@ -212,6 +213,9 @@ class OrchestratorConfig:
     previous_result_limit: int = DEFAULT_PREVIOUS_RESULT_LIMIT
     minimum_reward_labels: int = DEFAULT_MINIMUM_LABELS
     estimated_accelerator_hour_usd: float | None = None
+    max_parameter_count: int = 1_050_000
+    target_name: str = "Autodidact TinyStories transformer"
+    target_execution_location: str = "local"
 
     def __post_init__(self) -> None:
         if type(self.researcher_token_allowance) is not int or self.researcher_token_allowance <= 0:
@@ -225,6 +229,12 @@ class OrchestratorConfig:
             or self.estimated_accelerator_hour_usd < 0.0
         ):
             raise OrchestratorError("estimated accelerator price must be finite and nonnegative")
+        if type(self.max_parameter_count) is not int or self.max_parameter_count <= 0:
+            raise OrchestratorError("max_parameter_count must be positive")
+        if not isinstance(self.target_name, str) or not self.target_name.strip():
+            raise OrchestratorError("target_name must be nonempty")
+        if self.target_execution_location not in {"local", "gpu_host"}:
+            raise OrchestratorError("target_execution_location is invalid")
 
     @property
     def features_path(self) -> Path:
@@ -237,6 +247,16 @@ class OrchestratorConfig:
     @property
     def model_path(self) -> Path:
         return self.reward_root / "model.json"
+
+    def target_summary(self) -> dict[str, Any]:
+        return {
+            "data_root": str(self.data_root.expanduser().resolve()),
+            "device": self.device,
+            "max_parameter_count": self.max_parameter_count,
+            "name": self.target_name,
+            "execution_location": self.target_execution_location,
+            "trainer_path": "train.py",
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,7 +284,7 @@ class AutonomousResearchOrchestrator:
         self.state = state
         self.ledger = ledger
         self.researcher = researcher
-        self.policy = policy or PatchRCTPolicy()
+        self.policy = policy or PatchRCTPolicy(max_parameter_count=config.max_parameter_count)
         self.runner_factory = runner_factory
         self.repository_root = config.repository_root.expanduser().resolve()
 
@@ -1283,6 +1303,7 @@ class AutonomousResearchOrchestrator:
                 "reward_calibration": self.calibration_status(),
                 "downstream_allocation": self.downstream_allocation_status(),
                 "status": final.status.value,
+                "target": self.config.target_summary(),
                 "usage": asdict(final.used),
             }
 
@@ -1318,6 +1339,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reward-root", type=_path, default=DEFAULT_REWARD_ROOT)
     parser.add_argument("--program", type=_path, default=DEFAULT_PROGRAM_PATH)
     parser.add_argument("--researcher-config", type=_path, default=DEFAULT_RESEARCHER_CONFIG_PATH)
+    parser.add_argument("--target-config", type=_path)
     parser.add_argument("--device", default="auto")
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -1347,16 +1369,26 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _config_from_args(args: argparse.Namespace) -> OrchestratorConfig:
+    target = None if args.target_config is None else TargetConfig.from_path(args.target_config)
+    repository_root = args.repository_root.resolve()
     return OrchestratorConfig(
         repository_root=args.repository_root,
         ledger_path=args.ledger_path,
-        data_root=args.data_root,
+        data_root=(
+            args.data_root if target is None else target.resolved_data_root(repository_root)
+        ),
         output_root=args.output_root,
         workspace_root=args.workspace_root,
         researcher_artifact_root=args.researcher_artifact_root,
         reward_root=args.reward_root,
         program_path=args.program,
-        device=args.device,
+        device=args.device if target is None else target.device,
+        estimated_accelerator_hour_usd=(
+            None if target is None else target.estimated_accelerator_hour_usd
+        ),
+        max_parameter_count=(1_050_000 if target is None else target.max_parameter_count),
+        target_name=("Autodidact TinyStories transformer" if target is None else target.name),
+        target_execution_location=("local" if target is None else target.execution_location.value),
         researcher_token_allowance=getattr(
             args,
             "researcher_token_allowance",
@@ -1411,6 +1443,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 "ledger": ledger.summary(),
                 "reward_calibration": calibration,
+                "target": config.target_summary(),
             }
         else:
             state = CampaignStore.open(args.state_path)
@@ -1437,6 +1470,7 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                     "ledger": ledger.summary(),
                     "reward_calibration": calibration,
+                    "target": config.target_summary(),
                 }
             elif args.command == "pause":
                 payload = {"campaign": asdict(state.request_pause(args.reason))}
@@ -1445,7 +1479,7 @@ def main(argv: list[str] | None = None) -> int:
             elif args.command == "resume":
                 payload = {"campaign": asdict(state.resume())}
             else:
-                researcher = CommandResearcherAdapter(
+                researcher = build_researcher_adapter(
                     ResearcherConfig.from_path(args.researcher_config)
                 )
                 orchestrator = AutonomousResearchOrchestrator(
@@ -1465,6 +1499,7 @@ def main(argv: list[str] | None = None) -> int:
         RewardError,
         RunnerError,
         RunStateError,
+        TargetError,
         ValueError,
     ) as error:
         print(f"error: {error}", file=sys.stderr)
