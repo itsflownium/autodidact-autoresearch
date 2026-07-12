@@ -708,21 +708,20 @@ def load_research_attempt(
     try:
         canonical_json_bytes(provider_configuration)
     except (TypeError, ValueError) as error:
-        raise ResearcherError(
-            "researcher transcript provider_configuration is invalid"
-        ) from error
+        raise ResearcherError("researcher transcript provider_configuration is invalid") from error
     optional_text = {}
     for name in ("cli_version", "resolved_model", "inference_provider"):
         value = transcript[name]
-        optional_text[name] = (
-            None if value is None else _required_text(name, value, maximum=1_000)
-        )
+        optional_text[name] = None if value is None else _required_text(name, value, maximum=1_000)
     usage_verified = transcript["usage_verified"]
     if type(usage_verified) is not bool:
         raise ResearcherError("researcher transcript usage_verified must be boolean")
-    if provider is not ResearcherProvider.COMMAND and response is not None:
-        if optional_text["cli_version"] is None or not usage_verified:
-            raise ResearcherError("native researcher transcript lacks trusted provider evidence")
+    if (
+        provider is not ResearcherProvider.COMMAND
+        and response is not None
+        and (optional_text["cli_version"] is None or not usage_verified)
+    ):
+        raise ResearcherError("native researcher transcript lacks trusted provider evidence")
     return ResearchAttempt(
         request_id=request.request_id,
         status=status,

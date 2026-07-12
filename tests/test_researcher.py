@@ -253,7 +253,7 @@ print(RESPONSE)
 
     assert attempt.status is ResearchStatus.FAILED
     assert attempt.proposal is None
-    assert attempt.failure_reason == ("researcher reported usage above its assigned token budget")
+    assert attempt.failure_reason == "researcher usage exceeded its assigned token budget"
 
 
 def test_no_change_response_requires_clean_workspace(tmp_path: Path) -> None:
