@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from autodidact.researcher import (
     ResearchRequest,
     ResearchStatus,
     StructuredResearchResponse,
+    load_research_attempt,
     main,
 )
 
@@ -128,12 +130,20 @@ print(RESPONSE)
     prompt = json.loads(transcript["prompt"])
     assert prompt["program_md"].startswith("# Research contract")
     assert prompt["previous_results"][0]["verdict"] == "rejected"
+    assert prompt["maximum_total_tokens"] == 50_000
     assert prompt["contract"]["evaluation"].startswith("Do not grade")
     assert transcript["response"]["proposal"]["hypothesis"] == (
         "A smaller step should reduce optimization noise."
     )
     assert "LEARNING_RATE = 0.008" in transcript["diff"]
     assert transcript["failure_reason"] is None
+
+    recovered = load_research_attempt(
+        attempt.transcript_path,
+        _request(parent),
+        workspace=repository,
+    )
+    assert recovered == attempt
 
 
 def test_adapter_rejects_protected_file_changes_and_records_failure(tmp_path: Path) -> None:
@@ -220,6 +230,32 @@ time.sleep(30)
     assert attempt.failure_reason == "researcher command timed out"
 
 
+def test_adapter_rejects_reported_usage_above_assigned_budget(tmp_path: Path) -> None:
+    repository, parent = _repository(tmp_path)
+    response = _response()
+    response["usage"] = {"input_tokens": 80, "output_tokens": 30}
+    script = _script(
+        tmp_path,
+        """
+import pathlib
+
+path = pathlib.Path("train.py")
+path.write_text(path.read_text() + "LEARNING_RATE = 0.008\\n")
+print(RESPONSE)
+""".replace("RESPONSE", repr(json.dumps(response))),
+    )
+
+    attempt = _adapter(script).run(
+        replace(_request(parent), maximum_total_tokens=100),
+        workspace=repository,
+        artifact_root=tmp_path / "artifacts",
+    )
+
+    assert attempt.status is ResearchStatus.FAILED
+    assert attempt.proposal is None
+    assert attempt.failure_reason == "researcher usage exceeded its assigned token budget"
+
+
 def test_no_change_response_requires_clean_workspace(tmp_path: Path) -> None:
     repository, parent = _repository(tmp_path)
     response = _response(status="no_change")
@@ -290,6 +326,7 @@ def test_configuration_is_strict_and_cli_uses_fake_command(
             {
                 "allowed_paths": ["train.py"],
                 "parent_commit": parent,
+                "maximum_total_tokens": 500,
                 "previous_results": [],
                 "program_path": str(program_path),
                 "proposal_number": 1,

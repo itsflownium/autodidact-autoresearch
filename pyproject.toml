@@ -14,6 +14,7 @@ dependencies = [
 
 [project.scripts]
 autodidact-agent = "autodidact.agent_cli:main"
+autodidact-orchestrator = "autodidact.orchestrator:main"
 autodidact-researcher = "autodidact.researcher:main"
 autodidact-reward = "autodidact.reward:main"
 autodidact-baseline = "autodidact.baseline:main"

@@ -76,6 +76,42 @@ _REQUEST_KEYS = frozenset(
         "maximum_total_tokens",
     }
 )
+_TRANSCRIPT_KEYS = frozenset(
+    {
+        "changed_paths",
+        "diff",
+        "diff_sha256",
+        "failure_reason",
+        "prompt",
+        "prompt_sha256",
+        "provider",
+        "provider_configuration",
+        "request_id",
+        "response",
+        "response_raw",
+        "response_sha256",
+        "inference_provider",
+        "resolved_model",
+        "returncode",
+        "schema_version",
+        "status",
+        "stderr",
+        "stdout",
+        "timed_out",
+        "cli_version",
+        "usage_verified",
+    }
+)
+_PROVIDER_CONFIGURATION_KEYS = frozenset(
+    {
+        "backend_provider",
+        "max_budget_usd",
+        "max_turns",
+        "model",
+        "profile",
+        "reasoning_effort",
+    }
+)
 
 
 class ResearcherError(RuntimeError):
@@ -589,6 +625,123 @@ def _changed_paths(workspace: Path) -> tuple[str, ...]:
     return tuple(sorted(paths))
 
 
+def load_research_attempt(
+    transcript_path: Path,
+    request: ResearchRequest,
+    *,
+    workspace: Path,
+) -> ResearchAttempt:
+    """Recover a completed invocation from its transcript without calling the researcher."""
+    try:
+        transcript = json.loads(transcript_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ResearcherError(f"cannot read researcher transcript: {error}") from error
+    if not isinstance(transcript, dict):
+        raise ResearcherError("researcher transcript must be an object")
+    _strict_keys(transcript, _TRANSCRIPT_KEYS, name="transcript")
+    if transcript["schema_version"] != RESEARCHER_SCHEMA_VERSION:
+        raise ResearcherError("researcher transcript schema is unsupported")
+    if transcript["request_id"] != request.request_id:
+        raise ResearcherError("researcher transcript belongs to another request")
+
+    workspace = workspace.resolve()
+    head = str(_git(workspace, "rev-parse", "HEAD")).strip()
+    if head != request.parent_commit:
+        raise ResearcherError("research workspace moved after its recorded invocation")
+    changed_paths = _changed_paths(workspace)
+    if transcript["changed_paths"] != list(changed_paths):
+        raise ResearcherError("researcher transcript changed paths differ from the workspace")
+    diff_bytes = _git(workspace, "diff", "--binary", "HEAD", text=False)
+    assert isinstance(diff_bytes, bytes)
+    diff = diff_bytes.decode("utf-8", errors="replace")
+    diff_hash = hashlib.sha256(diff_bytes).hexdigest() if diff_bytes else None
+    if transcript["diff"] != diff or transcript["diff_sha256"] != diff_hash:
+        raise ResearcherError("researcher transcript diff differs from the workspace")
+
+    prompt = request.prompt()
+    prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    if transcript["prompt"] != prompt or transcript["prompt_sha256"] != prompt_hash:
+        raise ResearcherError("researcher transcript prompt differs from the request")
+    for name in ("stdout", "stderr", "response_raw"):
+        if not isinstance(transcript[name], str):
+            raise ResearcherError(f"researcher transcript {name} must be text")
+    response_raw = transcript["response_raw"]
+    response_hash = hashlib.sha256(response_raw.encode("utf-8")).hexdigest()
+    if transcript["response_sha256"] != response_hash:
+        raise ResearcherError("researcher transcript response hash is invalid")
+    try:
+        status = ResearchStatus(transcript["status"])
+    except (TypeError, ValueError) as error:
+        raise ResearcherError("researcher transcript status is invalid") from error
+    response = (
+        None
+        if transcript["response"] is None
+        else StructuredResearchResponse.from_json(response_raw)
+    )
+    if response is not None:
+        if json.loads(response_raw) != transcript["response"] or response.status is not status:
+            raise ResearcherError("researcher transcript structured response is inconsistent")
+    elif status is not ResearchStatus.FAILED:
+        raise ResearcherError("successful researcher transcript is missing its response")
+    failure_reason = transcript["failure_reason"]
+    if failure_reason is not None:
+        failure_reason = _required_text("failure_reason", failure_reason)
+    if status is ResearchStatus.FAILED and failure_reason is None:
+        raise ResearcherError("failed researcher transcript is missing its reason")
+    returncode = transcript["returncode"]
+    if returncode is not None and type(returncode) is not int:
+        raise ResearcherError("researcher transcript returncode is invalid")
+    if type(transcript["timed_out"]) is not bool:
+        raise ResearcherError("researcher transcript timed_out must be boolean")
+    try:
+        provider = ResearcherProvider(transcript["provider"])
+    except (TypeError, ValueError) as error:
+        raise ResearcherError("researcher transcript provider is invalid") from error
+    provider_configuration = transcript["provider_configuration"]
+    if not isinstance(provider_configuration, dict):
+        raise ResearcherError("researcher transcript provider_configuration must be an object")
+    _strict_keys(
+        provider_configuration,
+        _PROVIDER_CONFIGURATION_KEYS,
+        name="provider_configuration",
+    )
+    try:
+        canonical_json_bytes(provider_configuration)
+    except (TypeError, ValueError) as error:
+        raise ResearcherError("researcher transcript provider_configuration is invalid") from error
+    optional_text = {}
+    for name in ("cli_version", "resolved_model", "inference_provider"):
+        value = transcript[name]
+        optional_text[name] = None if value is None else _required_text(name, value, maximum=1_000)
+    usage_verified = transcript["usage_verified"]
+    if type(usage_verified) is not bool:
+        raise ResearcherError("researcher transcript usage_verified must be boolean")
+    if (
+        provider is not ResearcherProvider.COMMAND
+        and response is not None
+        and (optional_text["cli_version"] is None or not usage_verified)
+    ):
+        raise ResearcherError("native researcher transcript lacks trusted provider evidence")
+    return ResearchAttempt(
+        request_id=request.request_id,
+        status=status,
+        response=response,
+        failure_reason=failure_reason,
+        changed_paths=changed_paths,
+        diff_sha256=diff_hash,
+        prompt_sha256=prompt_hash,
+        response_sha256=response_hash,
+        transcript_path=transcript_path.resolve(),
+        returncode=returncode,
+        timed_out=transcript["timed_out"],
+        provider=provider,
+        cli_version=optional_text["cli_version"],
+        resolved_model=optional_text["resolved_model"],
+        inference_provider=optional_text["inference_provider"],
+        usage_verified=usage_verified,
+    )
+
+
 def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
     try:
         os.killpg(process.pid, signal.SIGTERM)
@@ -776,6 +929,7 @@ class CommandResearcherAdapter:
             },
             "request_id": request.request_id,
             "response": None if response is None else json.loads(response_text),
+            "response_raw": response_text,
             "response_sha256": response_hash,
             "inference_provider": invocation.inference_provider,
             "resolved_model": invocation.resolved_model,

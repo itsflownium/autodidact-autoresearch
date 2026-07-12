@@ -1183,9 +1183,85 @@ class PairedExperimentRunner:
             for seed, order in zip(self.request.seeds, orders, strict=True)
         )
 
-    def run(self) -> dict[str, Any]:
+    def register_candidate(self) -> CandidateRecord:
+        """Inspect and register a candidate before the controller schedules its trials."""
         if not self.evaluator_path.is_file():
             raise RunnerError("protected evaluator is missing")
+        ledger = ExperimentLedger.open(self.request.ledger_path, read_only=False)
+        proposal_event = ledger.get(self.request.proposal_id)
+        if not isinstance(proposal_event.record, PatchProposal):
+            raise RunnerError("proposal_id does not identify a patch proposal")
+        proposal = proposal_event.record
+        if proposal.parent_commit != ledger.current_parent():
+            raise RunnerError("proposal parent is no longer the accepted ledger parent")
+        validation = validate_candidate_patch(
+            self.repository_root,
+            parent_commit=proposal.parent_commit,
+            candidate_commit=self.request.candidate_commit,
+        )
+        existing = [
+            event.record
+            for event in ledger.events()
+            if isinstance(event.record, CandidateRecord)
+            and event.record.proposal_id == proposal.proposal_id
+        ]
+        if existing:
+            if len(existing) != 1:
+                raise RunnerError("proposal has multiple candidate records")
+            candidate = existing[0]
+            trainer_blob = _git(
+                self.repository_root,
+                "show",
+                f"{validation.candidate_commit}:train.py",
+                text=False,
+            )
+            assert isinstance(trainer_blob, bytes)
+            if (
+                candidate.candidate_commit != validation.candidate_commit
+                or candidate.parent_commit != validation.parent_commit
+                or candidate.changed_paths != validation.changed_paths
+                or candidate.diff_sha256 != validation.diff_sha256
+                or candidate.trainer_sha256 != hashlib.sha256(trainer_blob).hexdigest()
+                or candidate.policy_sha256 != policy_sha256()
+            ):
+                raise RunnerError("existing candidate record differs from its immutable commit")
+            return candidate
+        self.output_root.mkdir(parents=True, exist_ok=True)
+        control_root = self.output_root / ".control"
+        with isolated_worktrees(
+            self.repository_root,
+            control_root / "registration-worktrees",
+            parent_commit=validation.parent_commit,
+            candidate_commit=validation.candidate_commit,
+        ) as worktrees:
+            inspections = {
+                arm: self._inspect_trainer(
+                    worktrees[arm] / "train.py",
+                    arm=arm,
+                    control_root=control_root,
+                )
+                for arm in (RunArm.PARENT, RunArm.CANDIDATE)
+            }
+            if any(not _worktree_is_clean(path) for path in worktrees.values()):
+                raise RunnerError("protected inspection changed an isolated worktree")
+            candidate = CandidateRecord(
+                candidate_id=_stable_id(
+                    "candidate", proposal.proposal_id, validation.candidate_commit
+                ),
+                proposal_id=proposal.proposal_id,
+                parent_commit=validation.parent_commit,
+                candidate_commit=validation.candidate_commit,
+                diff_sha256=validation.diff_sha256,
+                changed_paths=validation.changed_paths,
+                trainer_sha256=file_sha256(worktrees[RunArm.CANDIDATE] / "train.py"),
+                policy_sha256=policy_sha256(),
+                parameter_count=int(inspections[RunArm.CANDIDATE]["parameter_count"]),
+            )
+        ledger.ensure(candidate, writer_role=WriterRole.CONTROLLER)
+        return candidate
+
+    def run(self) -> dict[str, Any]:
+        candidate = self.register_candidate()
         ledger = ExperimentLedger.open(self.request.ledger_path, read_only=False)
         proposal_event = ledger.get(self.request.proposal_id)
         if not isinstance(proposal_event.record, PatchProposal):
@@ -1217,21 +1293,14 @@ class PairedExperimentRunner:
                 )
                 for arm in (RunArm.PARENT, RunArm.CANDIDATE)
             }
-            candidate_id = _stable_id(
-                "candidate", proposal.proposal_id, validation.candidate_commit
-            )
-            candidate = CandidateRecord(
-                candidate_id=candidate_id,
-                proposal_id=proposal.proposal_id,
-                parent_commit=validation.parent_commit,
-                candidate_commit=validation.candidate_commit,
-                diff_sha256=validation.diff_sha256,
-                changed_paths=validation.changed_paths,
-                trainer_sha256=file_sha256(worktrees[RunArm.CANDIDATE] / "train.py"),
-                policy_sha256=policy_sha256(),
-                parameter_count=int(inspections[RunArm.CANDIDATE]["parameter_count"]),
-            )
-            ledger.ensure(candidate, writer_role=WriterRole.CONTROLLER)
+            if (
+                candidate.parent_commit != validation.parent_commit
+                or candidate.candidate_commit != validation.candidate_commit
+                or candidate.trainer_sha256 != file_sha256(worktrees[RunArm.CANDIDATE] / "train.py")
+                or candidate.parameter_count
+                != int(inspections[RunArm.CANDIDATE]["parameter_count"])
+            ):
+                raise RunnerError("registered candidate differs from protected inspection")
             trials = self._trial_specs(
                 candidate,
                 parent_trainer_sha256=file_sha256(worktrees[RunArm.PARENT] / "train.py"),

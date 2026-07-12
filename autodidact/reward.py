@@ -497,6 +497,14 @@ def load_model(path: Path) -> BayesianRewardModel:
     return BayesianRewardModel.from_dict(value)
 
 
+def store_learning_curve_features(path: Path, features: LearningCurveFeatures) -> None:
+    _append_unique_jsonl(path, features.to_dict(), key="feature_id")
+
+
+def store_full_budget_label(path: Path, label: FullBudgetLabel) -> None:
+    _append_unique_jsonl(path, label.to_dict(), key="label_id")
+
+
 def save_model(path: Path, model: BayesianRewardModel) -> None:
     _atomic_write(
         path,
@@ -1025,15 +1033,11 @@ def main(argv: list[str] | None = None) -> int:
                     args.artifact_root,
                     args.candidate_id,
                 )
-                _append_unique_jsonl(
-                    args.output,
-                    features.to_dict(),
-                    key="feature_id",
-                )
+                store_learning_curve_features(args.output, features)
                 payload = features.to_dict()
             elif args.command == "label":
                 label = build_full_budget_label(ledger, args.candidate_id)
-                _append_unique_jsonl(args.output, label.to_dict(), key="label_id")
+                store_full_budget_label(args.output, label)
                 payload = label.to_dict()
             else:
                 features = _latest_candidate_features(
