@@ -283,6 +283,22 @@ def test_calibrated_recommendations_allocate_longer_tests_by_probability() -> No
     assert recommendation(model, distribution(0.05)) == "stop"
     assert recommendation(model, distribution(0.50)) == "gather_more_early_evidence"
     assert recommendation(model, distribution(0.90)) == "run_full"
+    assert (
+        recommendation(
+            model,
+            distribution(0.50),
+            reject_probability=0.60,
+            full_test_probability=0.95,
+        )
+        == "stop"
+    )
+    with pytest.raises(RewardError, match="thresholds are not ordered"):
+        recommendation(
+            model,
+            distribution(0.50),
+            reject_probability=0.90,
+            full_test_probability=0.80,
+        )
 
 
 def test_feature_extraction_verifies_artifacts_and_captures_learning_curves(
