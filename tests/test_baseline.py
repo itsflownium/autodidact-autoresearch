@@ -43,6 +43,7 @@ def _run(seed: int, *, parameter_count: int = EXPECTED_PARAMETER_COUNT) -> dict[
         "process_seconds": 10.5,
         "resume_segments": 0,
         "seed": seed,
+        "steps": 2_500,
         "stories": 1_000,
         "target_tokens": FULL_TOKEN_BUDGET,
         "tokenizer_sha256": "tokenizer",
@@ -118,6 +119,9 @@ def test_full_report_requires_complete_matched_parent_runs() -> None:
     assert report["checks"]["data_orders_are_seed_specific"] is True
     markdown = render_markdown(report)
     assert "This is the unmodified parent baseline" in markdown
+    assert "establishes a full-budget reference" in markdown
+    assert "Diagnostic Limitations" not in markdown
+    assert report["interpretation"]["model_quality"] == "full_budget_reference"
     assert "`all_runs_used_expected_parameter_count`: pass" in markdown
 
 
@@ -155,6 +159,18 @@ def test_diagnostic_budget_cannot_be_labeled_full_baseline() -> None:
     assert report["all_checks_passed"] is True
     assert report["diagnostic_override"] is True
     assert report["complete_full_baseline"] is False
+    assert report["interpretation"] == {
+        "checkpoint_retention": "retained_for_integrity_and_resume",
+        "generated_samples": "generation_path_check_only",
+        "model_quality": "not_estimated",
+        "performance_metrics": "provisional_order_sensitive",
+    }
+    markdown = render_markdown(report)
+    assert "Diagnostic Limitations" in markdown
+    assert "not stable performance comparisons" in markdown
+    assert "not model-quality evidence" in markdown
+    assert "does not establish a full-budget reference" in markdown
+    assert "It establishes a full-budget reference" not in markdown
 
 
 def test_nullable_accelerator_memory_is_supported() -> None:
@@ -170,6 +186,31 @@ def test_nullable_accelerator_memory_is_supported() -> None:
     assert report["all_checks_passed"] is True
     assert report["statistics"]["peak_device_allocated_bytes"] is None
     assert report["statistics"]["peak_device_reserved_bytes"] is None
+
+
+def test_diagnostic_markdown_tolerates_legacy_runs_without_step_counts() -> None:
+    runs = [_run(11), _run(23)]
+    for run in runs:
+        run["target_tokens"] = 1_000
+        run["tokens_seen"] = 1_000
+        del run["steps"]
+    report = build_report(
+        runs,
+        seeds=[11, 23],
+        token_budget=1_000,
+        eval_tokens=500,
+        batch_size=2,
+        eval_batch_size=2,
+        prompt="Once",
+        generate_tokens=4,
+        trainer_sha256="trainer",
+        runner_sha256="runner",
+    )
+
+    markdown = render_markdown(report)
+
+    assert "Optimizer steps per seed: not recorded." in markdown
+    assert "| 11 | not recorded |" in markdown
 
 
 def test_statistics_reject_non_finite_input() -> None:

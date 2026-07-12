@@ -247,7 +247,9 @@ uv run autodidact-baseline \
   --output-root artifacts/baseline/smoke-v1
 ```
 
-Any token-budget or evaluation override sets `diagnostic_override` and forces `complete_full_baseline` to `false`, even when every integrity check passes. Baseline checkpoints and raw run artifacts remain outside Git history; only compact reviewed reports should be committed.
+Any token-budget or evaluation override sets `diagnostic_override` and forces `complete_full_baseline` to `false`, even when every integrity check passes. With the default batch size, the 8,192-token command performs only one optimizer step per seed. Its generated samples verify the generation path, while throughput and peak memory remain provisional because MPS compilation, caching, and run order can dominate such a short process. The report records these limitations explicitly.
+
+Baseline checkpoints and raw run artifacts remain outside Git history; only compact reviewed reports should be committed. Diagnostic checkpoints are retained for hash verification and resume testing (about 12 MiB per seed for the bundled model). The marked smoke output directory is self-contained and may be removed after its evidence is no longer needed.
 
 ### Completed parent baseline
 

@@ -414,6 +414,7 @@ def collect_run(output_root: Path, seed: int, token_budget: int) -> dict[str, An
         "process_seconds": sum(float(record["elapsed_seconds"]) for record in process_records),
         "resume_segments": len(configs) - 1,
         "seed": seed,
+        "steps": summary["steps"],
         "stories": evaluation["stories"],
         "target_tokens": config["target_tokens"],
         "tokenizer_sha256": config["tokenizer_sha256"],
@@ -520,6 +521,16 @@ def build_report(
         values = [float(run[key]) for run in runs if run.get(key) is not None]
         statistics_by_metric[key] = summarize_values(values) if values else None
     diagnostic_override = token_budget != FULL_TOKEN_BUDGET or eval_tokens is not None
+    interpretation = {
+        "checkpoint_retention": "retained_for_integrity_and_resume",
+        "generated_samples": (
+            "model_quality_evidence" if not diagnostic_override else "generation_path_check_only"
+        ),
+        "model_quality": "full_budget_reference" if not diagnostic_override else "not_estimated",
+        "performance_metrics": (
+            "full_budget_reference" if not diagnostic_override else "provisional_order_sensitive"
+        ),
+    }
     return {
         "all_checks_passed": all(checks.values()),
         "checks": checks,
@@ -549,6 +560,7 @@ def build_report(
             "python": platform.python_version(),
             "torch": torch.__version__,
         },
+        "interpretation": interpretation,
         "runs": runs,
         "schema_version": BASELINE_SCHEMA_VERSION,
         "statistics": statistics_by_metric,
@@ -587,12 +599,14 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"Training budget per seed: {contract['token_budget']:,} tokens. "
         f"Evaluation: {evaluation_budget}.",
         "",
-        "| Seed | Dev BPB | Train tok/s | Peak RSS MiB | Checkpoint MiB | Resume segments |",
-        "| ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Seed | Steps | Dev BPB | Train tok/s | Peak RSS MiB | "
+        "Checkpoint MiB | Resume segments |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for run in report["runs"]:
+        steps = run.get("steps", "not recorded")
         lines.append(
-            f"| {run['seed']} | {float(run['validation_bpb']):.9f} | "
+            f"| {run['seed']} | {steps} | {float(run['validation_bpb']):.9f} | "
             f"{float(run['training_tokens_per_second']):.1f} | "
             f"{float(run['peak_process_rss_bytes']) / (1024 * 1024):.1f} | "
             f"{float(run['checkpoint_bytes']) / (1024 * 1024):.1f} | "
@@ -631,10 +645,48 @@ def render_markdown(report: dict[str, Any]) -> str:
     for run in report["runs"]:
         sample = str(run["generated_text"]).replace("\n", " ").strip()
         lines.extend([f"Seed `{run['seed']}`:", "", f"> {sample}", ""])
-    lines.append(
-        "This is the unmodified parent baseline. It establishes a full-budget reference and "
-        "does not claim a patch improvement."
-    )
+    if report["diagnostic_override"]:
+        step_counts = sorted(
+            {int(run["steps"]) for run in report["runs"] if run.get("steps") is not None}
+        )
+        step_description = (
+            ", ".join(str(value) for value in step_counts) if step_counts else "not recorded"
+        )
+        checkpoint_mib = sum(int(run["checkpoint_bytes"]) for run in report["runs"]) / (1024 * 1024)
+        lines.extend(
+            [
+                "## Diagnostic Limitations",
+                "",
+                f"Optimizer steps per seed: {step_description}.",
+                "",
+                (
+                    "Short diagnostic timings and memory peaks can be dominated by device/compiler "
+                    "warm-up, caching, and run order. They are provisional plumbing measurements, "
+                    "not stable performance comparisons."
+                ),
+                "",
+                (
+                    "Generated samples confirm that checkpoint loading and generation execute. "
+                    "They are not model-quality evidence at a diagnostic training budget."
+                ),
+                "",
+                (
+                    f"Verified checkpoints are retained for integrity and resume testing "
+                    f"({checkpoint_mib:.1f} MiB total). The marked diagnostic output directory is "
+                    "self-contained and may be removed after its evidence is no longer needed."
+                ),
+                "",
+                (
+                    "This is an unmodified-parent diagnostic. It does not establish a full-budget "
+                    "reference or claim a patch improvement."
+                ),
+            ]
+        )
+    else:
+        lines.append(
+            "This is the unmodified parent baseline. It establishes a full-budget reference and "
+            "does not claim a patch improvement."
+        )
     lines.append("")
     return "\n".join(lines)
 
