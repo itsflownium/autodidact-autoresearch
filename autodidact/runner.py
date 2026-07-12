@@ -57,6 +57,12 @@ from autodidact.records import (
     build_paired_result,
     record_to_envelope,
 )
+from autodidact.target import TargetConfig, TargetError
+from autodidact.target_plugins import (
+    TargetPluginError,
+    TargetPluginSpec,
+    resolve_repository_path,
+)
 
 RUNNER_SCHEMA_VERSION = 1
 DEFAULT_OUTPUT_ROOT = Path("artifacts/experiments")
@@ -130,6 +136,7 @@ class ExperimentRequest:
     device: str
     limits: ResourceLimits
     estimated_accelerator_hour_usd: float | None = None
+    target_config_path: Path | None = None
 
     def __post_init__(self) -> None:
         if not self.seeds or len(set(self.seeds)) != len(self.seeds):
@@ -199,6 +206,8 @@ def validate_candidate_patch(
     *,
     parent_commit: str,
     candidate_commit: str,
+    allowed_paths: Sequence[str] = ("train.py",),
+    trainer_path: str = "train.py",
 ) -> CandidateValidation:
     repository_root = repository_root.resolve()
     for name, value in (("parent", parent_commit), ("candidate", candidate_commit)):
@@ -225,10 +234,18 @@ def validate_candidate_patch(
     changed_paths = tuple(item.decode("utf-8") for item in changed_raw.split(b"\0") if item)
     if not changed_paths:
         raise RunnerError("candidate commit does not contain a patch")
-    try:
-        assert_research_paths_allowed(list(changed_paths))
-    except (ProtectedPathError, ValueError) as error:
-        raise RunnerError(str(error)) from error
+    allowed = frozenset(allowed_paths)
+    if not allowed or trainer_path not in allowed:
+        raise RunnerError("target editable paths must include its trainer")
+    if allowed == {"train.py"}:
+        try:
+            assert_research_paths_allowed(list(changed_paths))
+        except (ProtectedPathError, ValueError) as error:
+            raise RunnerError(str(error)) from error
+    else:
+        rejected = sorted(set(changed_paths) - allowed)
+        if rejected:
+            raise RunnerError(f"research change touches protected path(s): {', '.join(rejected)}")
     diff_check = subprocess.run(
         ["git", "diff", "--check", parent_commit, candidate_commit],
         cwd=repository_root,
@@ -246,15 +263,15 @@ def validate_candidate_patch(
         parent_commit,
         candidate_commit,
         "--",
-        "train.py",
+        *sorted(allowed),
         text=False,
     )
     assert isinstance(patch, bytes)
     candidate_kind = str(
-        _git(repository_root, "cat-file", "-t", f"{candidate_commit}:train.py")
+        _git(repository_root, "cat-file", "-t", f"{candidate_commit}:{trainer_path}")
     ).strip()
     if candidate_kind != "blob":
-        raise RunnerError("candidate train.py must be a regular Git blob")
+        raise RunnerError(f"candidate {trainer_path} must be a regular Git blob")
     return CandidateValidation(
         parent_commit=parent_commit,
         candidate_commit=candidate_commit,
@@ -324,6 +341,7 @@ def isolated_worktrees(
     *,
     parent_commit: str,
     candidate_commit: str,
+    trainer_path: str = "train.py",
 ) -> Iterator[dict[RunArm, Path]]:
     worktree_parent.mkdir(parents=True, exist_ok=True)
     root = Path(tempfile.mkdtemp(prefix="paired-", dir=worktree_parent))
@@ -336,9 +354,9 @@ def isolated_worktrees(
         ):
             _git(repository_root, "worktree", "add", "--detach", str(paths[arm]), commit)
             added.append(paths[arm])
-            trainer = paths[arm] / "train.py"
+            trainer = paths[arm] / trainer_path
             if not trainer.is_file() or trainer.is_symlink():
-                raise RunnerError(f"{arm.value} worktree has an invalid train.py")
+                raise RunnerError(f"{arm.value} worktree has an invalid {trainer_path}")
         yield paths
     finally:
         for path in reversed(added):
@@ -637,6 +655,56 @@ class PairedExperimentRunner:
         self.evaluator_path = Path(__file__).resolve().with_name("evaluator.py")
         self.runner_path = Path(__file__).resolve()
         self.device = _resolve_device_name(request.device)
+        self.target_config: TargetConfig | None = None
+        self.plugin: TargetPluginSpec | None = None
+        if request.target_config_path is not None:
+            try:
+                self.target_config = TargetConfig.from_path(request.target_config_path)
+                self.plugin = self.target_config.load_plugin(self.repository_root)
+            except (TargetError, TargetPluginError) as error:
+                raise RunnerError(str(error)) from error
+        self.trainer_path = "train.py" if self.plugin is None else self.plugin.trainer_path
+        self.editable_paths = (
+            ("train.py",) if self.plugin is None else self.plugin.editable_paths
+        )
+        self.policy_contract_sha256 = (
+            policy_sha256()
+            if self.target_config is None
+            else _sha256_payload(
+                {
+                    "plugin": None if self.plugin is None else self.plugin.to_mapping(),
+                    "target": self.target_config.to_mapping(),
+                }
+            )
+        )
+        self.public_data_root = (
+            None
+            if self.target_config is None
+            else self.target_config.resolved_public_data_root(self.repository_root)
+        )
+        if self.target_config is not None:
+            if self.data_root != self.target_config.resolved_data_root(self.repository_root):
+                raise RunnerError("experiment data_root differs from the target contract")
+            if request.limits.max_parameter_count != self.target_config.max_parameter_count:
+                raise RunnerError("experiment parameter cap differs from the target contract")
+
+    def _worktree_root(self, trainer: Path) -> Path:
+        root = trainer
+        for _ in PurePosixPath(self.trainer_path).parts:
+            root = root.parent
+        return root
+
+    def _validate_plugin_evaluators(self, worktrees: dict[RunArm, Path]) -> None:
+        if self.plugin is None:
+            return
+        paths = [
+            resolve_repository_path(worktrees[arm], self.plugin.evaluator_path)
+            for arm in (RunArm.PARENT, RunArm.CANDIDATE)
+        ]
+        if any(not path.is_file() or path.is_symlink() for path in paths):
+            raise RunnerError("external target protected evaluator is missing or invalid")
+        if len({file_sha256(path) for path in paths}) != 1:
+            raise RunnerError("external target protected evaluator changed in the candidate")
 
     def _run_process(
         self,
@@ -665,8 +733,8 @@ class PairedExperimentRunner:
     ) -> dict[str, Any]:
         stdout_path = control_root / f"inspect-{arm.value}.jsonl"
         stderr_path = control_root / f"inspect-{arm.value}.stderr.log"
-        outcome = self._run_process(
-            [
+        if self.plugin is None:
+            command = [
                 sys.executable,
                 str(self.evaluator_path),
                 "inspect",
@@ -674,8 +742,15 @@ class PairedExperimentRunner:
                 str(trainer),
                 "--parameter-cap",
                 str(self.request.limits.max_parameter_count),
-            ],
-            cwd=trainer.parent,
+            ]
+        else:
+            command = self.plugin.render_command(
+                "inspect",
+                self._command_values(trainer=trainer),
+            )
+        outcome = self._run_process(
+            command,
+            cwd=self._worktree_root(trainer),
             seed=0,
             stdout_path=stdout_path,
             stderr_path=stderr_path,
@@ -683,11 +758,33 @@ class PairedExperimentRunner:
         if outcome.returncode != 0 or outcome.timed_out or outcome.cancelled:
             raise RunnerError(f"protected {arm.value} model inspection failed")
         payload = _last_json_object(stdout_path)
-        if payload.get("event") != "protected_inspection" or payload.get(
+        expected_event = "protected_inspection" if self.plugin is None else "target_inspection"
+        if payload.get("event") != expected_event or payload.get(
             "trainer_sha256"
         ) != file_sha256(trainer):
             raise RunnerError(f"protected {arm.value} inspection contract mismatch")
+        count = payload.get("parameter_count")
+        if (
+            type(count) is not int
+            or count <= 0
+            or count > self.request.limits.max_parameter_count
+        ):
+            raise RunnerError(f"protected {arm.value} parameter count is invalid")
         return payload
+
+    def _command_values(self, *, trainer: Path, **values: object) -> dict[str, object]:
+        if self.plugin is None:
+            raise RunnerError("built-in target does not use plugin command templates")
+        worktree = self._worktree_root(trainer)
+        evaluator = resolve_repository_path(worktree, self.plugin.evaluator_path)
+        return {
+            "evaluator": evaluator,
+            "parameter_cap": self.request.limits.max_parameter_count,
+            "python": sys.executable,
+            "repository_root": worktree,
+            "trainer": trainer,
+            **values,
+        }
 
     def _training_command(
         self,
@@ -697,6 +794,22 @@ class PairedExperimentRunner:
         public_data_root: Path,
     ) -> list[str]:
         defaults = STAGE_DEFAULTS[trial.stage]
+        if self.plugin is not None:
+            return self.plugin.render_command(
+                "train",
+                self._command_values(
+                    trainer=trainer,
+                    batch_size=trial.batch_size,
+                    checkpoint=paths["checkpoint"],
+                    device=trial.device,
+                    eval_batch_size=trial.eval_batch_size,
+                    metrics=paths["metrics"],
+                    public_data_root=public_data_root,
+                    seed=trial.seed,
+                    stage=trial.stage.value,
+                    token_budget=trial.token_budget,
+                ),
+            )
         log_interval = min(trial.token_budget, max(1, trial.token_budget // 4))
         return [
             sys.executable,
@@ -735,6 +848,21 @@ class PairedExperimentRunner:
         trial: TrialSpec,
         checkpoint_path: Path,
     ) -> list[str]:
+        if self.plugin is not None:
+            return self.plugin.render_command(
+                "evaluate",
+                self._command_values(
+                    trainer=trainer,
+                    batch_size=trial.eval_batch_size,
+                    checkpoint=checkpoint_path,
+                    data_root=self.data_root,
+                    device=trial.device,
+                    eval_tokens=0 if trial.eval_tokens is None else trial.eval_tokens,
+                    seed=trial.seed,
+                    split=STAGE_DEFAULTS[trial.stage].evaluator_split,
+                    stage=trial.stage.value,
+                ),
+            )
         command = [
             sys.executable,
             str(self.evaluator_path),
@@ -828,14 +956,19 @@ class PairedExperimentRunner:
         parameter_count: int,
         evaluation: ProcessOutcome | None = None,
     ) -> RunResult:
+        summary_event = "summary" if self.plugin is None else "target_training_summary"
         summary = next(
-            (record for record in reversed(records) if record.get("event") == "summary"),
+            (record for record in reversed(records) if record.get("event") == summary_event),
             {},
         )
-        train_events = [record for record in records if record.get("event") == "train"]
+        train_event = "train" if self.plugin is None else "target_training_progress"
+        train_events = [record for record in records if record.get("event") == train_event]
         latest_train = train_events[-1] if train_events else {}
         tokens_seen = _optional_nonnegative_int(
-            summary.get("tokens_seen", latest_train.get("tokens_seen", 0))
+            summary.get(
+                "tokens_seen",
+                summary.get("units_seen", latest_train.get("tokens_seen", 0)),
+            )
         )
         tokens_seen = min(tokens_seen or 0, trial.token_budget)
         data_order = _valid_sha256(
@@ -894,9 +1027,24 @@ class PairedExperimentRunner:
         parameter_count: int,
     ) -> RunResult:
         records = _read_json_lines(paths["metrics"])
-        config = _last_event(records, "config")
-        summary = _last_event(records, "summary")
+        config_event = "config" if self.plugin is None else "target_training_config"
+        summary_event = "summary" if self.plugin is None else "target_training_summary"
+        config = _last_event(records, config_event)
+        summary = _last_event(records, summary_event)
         protected = _last_json_object(paths["evaluation"])
+        if self.plugin is not None:
+            return self._successful_plugin_run(
+                trial,
+                arm,
+                trainer,
+                paths,
+                training,
+                evaluation,
+                config=config,
+                summary=summary,
+                protected=protected,
+                parameter_count=parameter_count,
+            )
         expected = {
             "seed": trial.seed,
             "target_tokens": trial.token_budget,
@@ -988,6 +1136,122 @@ class PairedExperimentRunner:
             data_order_sha256=data_order,
         )
 
+    def _successful_plugin_run(
+        self,
+        trial: TrialSpec,
+        arm: RunArm,
+        trainer: Path,
+        paths: dict[str, Path],
+        training: ProcessOutcome,
+        evaluation: ProcessOutcome,
+        *,
+        config: dict[str, Any],
+        summary: dict[str, Any],
+        protected: dict[str, Any],
+        parameter_count: int,
+    ) -> RunResult:
+        assert self.plugin is not None
+        expected = {
+            "seed": trial.seed,
+            "target_units": trial.token_budget,
+            "parameter_count": parameter_count,
+        }
+        for key, value in expected.items():
+            if config.get(key) != value or summary.get(key) != value:
+                raise RunnerError(f"target metrics changed the protected {key} contract")
+        if config.get("data_config_sha256") != trial.data_config_sha256:
+            raise RunnerError("target metrics changed the protected data contract")
+        if config.get("tokenizer_sha256") != trial.tokenizer_sha256:
+            raise RunnerError("target metrics changed the protected tokenizer contract")
+        if summary.get("units_seen") != trial.token_budget:
+            raise RunnerError("successful target training did not consume the exact budget")
+        data_order = _valid_sha256(summary.get("data_order_sha256"))
+        if data_order is None:
+            raise RunnerError("target training summary has no data-order commitment")
+        if protected.get("event") != "target_evaluation":
+            raise RunnerError("protected target evaluator emitted the wrong event")
+        if protected.get("checkpoint_sha256") != file_sha256(paths["checkpoint"]):
+            raise RunnerError("protected target evaluator used a different checkpoint")
+        if protected.get("trainer_sha256") != file_sha256(trainer):
+            raise RunnerError("protected target evaluator used a different trainer")
+        if protected.get("parameter_count") != parameter_count:
+            raise RunnerError("protected target evaluator parameter count changed")
+        if (
+            protected.get("metric_name") != self.plugin.metric.name
+            or protected.get("metric_direction") != self.plugin.metric.direction.value
+        ):
+            raise RunnerError("protected target evaluator changed the declared metric")
+        try:
+            objective = self.plugin.metric.canonical_objective(protected.get("metric_value"))
+        except TargetPluginError as error:
+            raise RunnerError(str(error)) from error
+        mean_train_loss = _optional_finite(summary.get("mean_train_loss"))
+        evaluation_seconds = _optional_finite(protected.get("evaluation_seconds"))
+        evaluation_rate = _optional_finite(protected.get("evaluation_units_per_second"))
+        evaluation_units = _optional_nonnegative_int(protected.get("evaluation_units"))
+        if (
+            mean_train_loss is None
+            or mean_train_loss < 0.0
+            or evaluation_seconds is None
+            or evaluation_seconds < 0.0
+            or evaluation_rate is None
+            or evaluation_rate < 0.0
+            or not evaluation_units
+        ):
+            raise RunnerError("successful target run is missing protected finite outcomes")
+        if trial.eval_tokens is not None and evaluation_units > trial.eval_tokens:
+            raise RunnerError("protected target evaluator exceeded its declared budget")
+        peak_values = [
+            value
+            for value in (
+                training.peak_process_rss_bytes,
+                evaluation.peak_process_rss_bytes,
+                _optional_nonnegative_int(summary.get("peak_process_rss_bytes")),
+                _optional_nonnegative_int(protected.get("peak_process_rss_bytes")),
+            )
+            if value is not None
+        ]
+        if not peak_values or training.wall_seconds <= 0.0:
+            raise RunnerError("protected target resource measurement is unavailable")
+        allocated = [
+            value
+            for value in (
+                _optional_nonnegative_int(summary.get("peak_device_allocated_bytes")),
+                _optional_nonnegative_int(protected.get("peak_device_allocated_bytes")),
+            )
+            if value is not None
+        ]
+        reserved = [
+            value
+            for value in (
+                _optional_nonnegative_int(summary.get("peak_device_reserved_bytes")),
+                _optional_nonnegative_int(protected.get("peak_device_reserved_bytes")),
+            )
+            if value is not None
+        ]
+        return RunResult(
+            run_id=_stable_id("run", trial.trial_id, arm.value),
+            trial_id=trial.trial_id,
+            arm=arm,
+            status=RunStatus.SUCCEEDED,
+            seed=trial.seed,
+            target_tokens=trial.token_budget,
+            tokens_seen=trial.token_budget,
+            evaluation_tokens=evaluation_units,
+            parameter_count=parameter_count,
+            validation_bpb=objective,
+            mean_train_loss=mean_train_loss,
+            training_tokens_per_second=trial.token_budget / training.wall_seconds,
+            evaluation_tokens_per_second=evaluation_rate,
+            peak_process_rss_bytes=max(peak_values),
+            peak_device_allocated_bytes=max(allocated) if allocated else None,
+            peak_device_reserved_bytes=max(reserved) if reserved else None,
+            training_seconds=training.wall_seconds,
+            evaluation_seconds=evaluation_seconds,
+            wall_seconds=training.wall_seconds + evaluation.wall_seconds,
+            data_order_sha256=data_order,
+        )
+
     def _compute_record(self, run: RunResult, trial: TrialSpec) -> ComputeRecord:
         accelerator_seconds = run.wall_seconds if trial.device != "cpu" else 0.0
         cost = None
@@ -1030,7 +1294,7 @@ class PairedExperimentRunner:
         paths["root"].mkdir(parents=True, exist_ok=True)
         training = self._run_process(
             self._training_command(trainer, trial, paths, public_data_root),
-            cwd=trainer.parent,
+            cwd=self._worktree_root(trainer),
             seed=trial.seed,
             stdout_path=paths["stdout"],
             stderr_path=paths["stderr"],
@@ -1046,14 +1310,14 @@ class PairedExperimentRunner:
                 else trial.candidate_trainer_sha256
             )
             if not _file_matches(trainer, expected_trainer_hash) or not _worktree_is_clean(
-                trainer.parent
+                self._worktree_root(trainer)
             ):
                 status = RunStatus.INTEGRITY_FAILURE
                 reason = "training modified its isolated Git worktree"
             elif paths["checkpoint"].is_file() and paths["metrics"].is_file():
                 evaluation = self._run_process(
                     self._evaluation_command(trainer, trial, paths["checkpoint"]),
-                    cwd=trainer.parent,
+                    cwd=self._worktree_root(trainer),
                     seed=trial.seed,
                     stdout_path=paths["evaluation"],
                     stderr_path=paths["evaluation_stderr"],
@@ -1075,7 +1339,7 @@ class PairedExperimentRunner:
                     _log_text(paths["evaluation"], paths["evaluation_stderr"]),
                     phase="protected evaluation",
                 )
-            elif not _worktree_is_clean(trainer.parent):
+            elif not _worktree_is_clean(self._worktree_root(trainer)):
                 status = RunStatus.INTEGRITY_FAILURE
                 reason = "protected evaluation modified its isolated Git worktree"
             else:
@@ -1136,7 +1400,8 @@ class PairedExperimentRunner:
         candidate: CandidateRecord,
         *,
         parent_trainer_sha256: str,
-        data_manifest: dict[str, Any],
+        data_manifest: dict[str, Any] | None,
+        evaluator_sha256: str | None = None,
     ) -> tuple[TrialSpec, ...]:
         orders = assign_execution_orders(
             self.request.seeds,
@@ -1152,7 +1417,17 @@ class PairedExperimentRunner:
         }
         assignment_hash = _sha256_payload(assignment)
         environment_hash = _environment_sha256(self.device)
-        evaluator_hash = file_sha256(self.evaluator_path)
+        if self.plugin is None:
+            evaluator_hash = file_sha256(self.evaluator_path)
+            assert data_manifest is not None
+            data_config_sha256 = data_manifest["pipeline"]["config_sha256"]
+            tokenizer_sha256 = data_manifest["tokenizer"]["artifact"]["sha256"]
+        else:
+            if evaluator_sha256 is None:
+                raise RunnerError("external target evaluator hash is missing")
+            evaluator_hash = evaluator_sha256
+            data_config_sha256 = self.plugin.data_config_sha256
+            tokenizer_sha256 = self.plugin.tokenizer_sha256
         runner_hash = file_sha256(self.runner_path)
         return tuple(
             TrialSpec(
@@ -1169,8 +1444,8 @@ class PairedExperimentRunner:
                 batch_size=self.request.batch_size,
                 eval_batch_size=self.request.eval_batch_size,
                 execution_order=order,
-                data_config_sha256=data_manifest["pipeline"]["config_sha256"],
-                tokenizer_sha256=data_manifest["tokenizer"]["artifact"]["sha256"],
+                data_config_sha256=data_config_sha256,
+                tokenizer_sha256=tokenizer_sha256,
                 parent_trainer_sha256=parent_trainer_sha256,
                 candidate_trainer_sha256=candidate.trainer_sha256,
                 evaluator_sha256=evaluator_hash,
@@ -1185,7 +1460,7 @@ class PairedExperimentRunner:
 
     def register_candidate(self) -> CandidateRecord:
         """Inspect and register a candidate before the controller schedules its trials."""
-        if not self.evaluator_path.is_file():
+        if self.plugin is None and not self.evaluator_path.is_file():
             raise RunnerError("protected evaluator is missing")
         ledger = ExperimentLedger.open(self.request.ledger_path, read_only=False)
         proposal_event = ledger.get(self.request.proposal_id)
@@ -1198,6 +1473,8 @@ class PairedExperimentRunner:
             self.repository_root,
             parent_commit=proposal.parent_commit,
             candidate_commit=self.request.candidate_commit,
+            allowed_paths=self.editable_paths,
+            trainer_path=self.trainer_path,
         )
         existing = [
             event.record
@@ -1212,7 +1489,7 @@ class PairedExperimentRunner:
             trainer_blob = _git(
                 self.repository_root,
                 "show",
-                f"{validation.candidate_commit}:train.py",
+                f"{validation.candidate_commit}:{self.trainer_path}",
                 text=False,
             )
             assert isinstance(trainer_blob, bytes)
@@ -1222,7 +1499,7 @@ class PairedExperimentRunner:
                 or candidate.changed_paths != validation.changed_paths
                 or candidate.diff_sha256 != validation.diff_sha256
                 or candidate.trainer_sha256 != hashlib.sha256(trainer_blob).hexdigest()
-                or candidate.policy_sha256 != policy_sha256()
+                or candidate.policy_sha256 != self.policy_contract_sha256
             ):
                 raise RunnerError("existing candidate record differs from its immutable commit")
             return candidate
@@ -1233,10 +1510,12 @@ class PairedExperimentRunner:
             control_root / "registration-worktrees",
             parent_commit=validation.parent_commit,
             candidate_commit=validation.candidate_commit,
+            trainer_path=self.trainer_path,
         ) as worktrees:
+            self._validate_plugin_evaluators(worktrees)
             inspections = {
                 arm: self._inspect_trainer(
-                    worktrees[arm] / "train.py",
+                    worktrees[arm] / self.trainer_path,
                     arm=arm,
                     control_root=control_root,
                 )
@@ -1253,8 +1532,10 @@ class PairedExperimentRunner:
                 candidate_commit=validation.candidate_commit,
                 diff_sha256=validation.diff_sha256,
                 changed_paths=validation.changed_paths,
-                trainer_sha256=file_sha256(worktrees[RunArm.CANDIDATE] / "train.py"),
-                policy_sha256=policy_sha256(),
+                trainer_sha256=file_sha256(
+                    worktrees[RunArm.CANDIDATE] / self.trainer_path
+                ),
+                policy_sha256=self.policy_contract_sha256,
                 parameter_count=int(inspections[RunArm.CANDIDATE]["parameter_count"]),
             )
         ledger.ensure(candidate, writer_role=WriterRole.CONTROLLER)
@@ -1273,21 +1554,41 @@ class PairedExperimentRunner:
             self.repository_root,
             parent_commit=proposal.parent_commit,
             candidate_commit=self.request.candidate_commit,
+            allowed_paths=self.editable_paths,
+            trainer_path=self.trainer_path,
         )
-        data_manifest = verify_dataset(self.data_root, scope="public")
+        if self.plugin is None:
+            data_manifest: dict[str, Any] | None = verify_dataset(
+                self.data_root, scope="public"
+            )
+        else:
+            data_manifest = None
+            if self.public_data_root is None or not self.public_data_root.is_dir():
+                raise RunnerError("external target public_data_root is missing")
+            if not self.data_root.is_dir():
+                raise RunnerError("external target protected data_root is missing")
+            if self.public_data_root == self.data_root:
+                raise RunnerError("external target public and protected data roots must differ")
         self.output_root.mkdir(parents=True, exist_ok=True)
         control_root = self.output_root / ".control"
-        public_data_root = prepare_public_data_view(self.data_root, control_root / "public-data")
+        public_data_root = (
+            prepare_public_data_view(self.data_root, control_root / "public-data")
+            if self.plugin is None
+            else self.public_data_root
+        )
+        assert public_data_root is not None
         worktree_parent = control_root / "worktrees"
         with isolated_worktrees(
             self.repository_root,
             worktree_parent,
             parent_commit=validation.parent_commit,
             candidate_commit=validation.candidate_commit,
+            trainer_path=self.trainer_path,
         ) as worktrees:
+            self._validate_plugin_evaluators(worktrees)
             inspections = {
                 arm: self._inspect_trainer(
-                    worktrees[arm] / "train.py",
+                    worktrees[arm] / self.trainer_path,
                     arm=arm,
                     control_root=control_root,
                 )
@@ -1296,15 +1597,28 @@ class PairedExperimentRunner:
             if (
                 candidate.parent_commit != validation.parent_commit
                 or candidate.candidate_commit != validation.candidate_commit
-                or candidate.trainer_sha256 != file_sha256(worktrees[RunArm.CANDIDATE] / "train.py")
+                or candidate.trainer_sha256
+                != file_sha256(worktrees[RunArm.CANDIDATE] / self.trainer_path)
                 or candidate.parameter_count
                 != int(inspections[RunArm.CANDIDATE]["parameter_count"])
+                or candidate.policy_sha256 != self.policy_contract_sha256
             ):
                 raise RunnerError("registered candidate differs from protected inspection")
             trials = self._trial_specs(
                 candidate,
-                parent_trainer_sha256=file_sha256(worktrees[RunArm.PARENT] / "train.py"),
+                parent_trainer_sha256=file_sha256(
+                    worktrees[RunArm.PARENT] / self.trainer_path
+                ),
                 data_manifest=data_manifest,
+                evaluator_sha256=(
+                    None
+                    if self.plugin is None
+                    else file_sha256(
+                        resolve_repository_path(
+                            worktrees[RunArm.PARENT], self.plugin.evaluator_path
+                        )
+                    )
+                ),
             )
             candidate_root = self.output_root / candidate.candidate_id
             contract = {
@@ -1317,6 +1631,7 @@ class PairedExperimentRunner:
                 "schema_version": RUNNER_SCHEMA_VERSION,
                 "seeds": list(self.request.seeds),
                 "stage": self.request.stage.value,
+                "target_contract_sha256": self.policy_contract_sha256,
                 "token_budget": self.request.token_budget,
                 "trial_contract_sha256": [
                     _sha256_payload(record_to_envelope(trial)) for trial in trials
@@ -1345,7 +1660,7 @@ class PairedExperimentRunner:
                         public_data_root,
                         trial,
                         arm,
-                        worktrees[arm] / "train.py",
+                        worktrees[arm] / self.trainer_path,
                         parameter_count=int(inspections[arm]["parameter_count"]),
                     )
                 parent = results[RunArm.PARENT]
@@ -1380,11 +1695,14 @@ class PairedExperimentRunner:
                     }
                 )
             if (
-                file_sha256(worktrees[RunArm.PARENT] / "train.py")
+                file_sha256(worktrees[RunArm.PARENT] / self.trainer_path)
                 != trials[0].parent_trainer_sha256
             ):
                 raise RunnerError("parent trainer changed during paired execution")
-            if file_sha256(worktrees[RunArm.CANDIDATE] / "train.py") != candidate.trainer_sha256:
+            if (
+                file_sha256(worktrees[RunArm.CANDIDATE] / self.trainer_path)
+                != candidate.trainer_sha256
+            ):
                 raise RunnerError("candidate trainer changed during paired execution")
         return {
             "candidate_id": candidate.candidate_id,
@@ -1403,6 +1721,7 @@ def _path(value: str) -> Path:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run protected paired patch experiments.")
     parser.add_argument("--repository-root", type=_path, default=Path.cwd())
+    parser.add_argument("--target-config", type=_path)
     parser.add_argument("--ledger-path", type=_path, default=DEFAULT_LEDGER_PATH)
     parser.add_argument("--data-root", type=_path, default=default_output_root())
     parser.add_argument("--output-root", type=_path, default=DEFAULT_OUTPUT_ROOT)
@@ -1437,9 +1756,14 @@ def request_from_args(args: argparse.Namespace) -> ExperimentRequest:
     defaults = STAGE_DEFAULTS[args.stage]
     token_budget = defaults.token_budget if args.token_budget is None else args.token_budget
     eval_tokens = defaults.eval_tokens if args.eval_tokens is None else args.eval_tokens
+    target = None if args.target_config is None else TargetConfig.from_path(args.target_config)
+    repository_root = args.repository_root.resolve()
+    parameter_cap = (
+        args.max_parameter_count if target is None else target.max_parameter_count
+    )
     limits = ResourceLimits(
         timeout_seconds=args.timeout_seconds,
-        max_parameter_count=args.max_parameter_count,
+        max_parameter_count=parameter_cap,
         max_peak_process_rss_bytes=args.max_peak_process_rss_bytes,
         max_peak_device_bytes=args.max_peak_device_bytes,
         min_training_tokens_per_second=args.min_training_tokens_per_second,
@@ -1450,7 +1774,9 @@ def request_from_args(args: argparse.Namespace) -> ExperimentRequest:
     return ExperimentRequest(
         repository_root=args.repository_root,
         ledger_path=args.ledger_path,
-        data_root=args.data_root,
+        data_root=(
+            args.data_root if target is None else target.resolved_data_root(repository_root)
+        ),
         output_root=args.output_root,
         proposal_id=args.proposal_id,
         candidate_commit=args.candidate_commit,
@@ -1462,9 +1788,14 @@ def request_from_args(args: argparse.Namespace) -> ExperimentRequest:
         batch_size=args.batch_size,
         eval_batch_size=args.eval_batch_size,
         timeout_seconds=args.timeout_seconds,
-        device=args.device,
+        device=args.device if target is None else target.device,
         limits=limits,
-        estimated_accelerator_hour_usd=args.estimated_accelerator_hour_usd,
+        estimated_accelerator_hour_usd=(
+            args.estimated_accelerator_hour_usd
+            if target is None
+            else target.estimated_accelerator_hour_usd
+        ),
+        target_config_path=args.target_config,
     )
 
 
@@ -1474,7 +1805,7 @@ def main(argv: list[str] | None = None) -> int:
         payload = PairedExperimentRunner(request_from_args(args)).run()
         print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
         return 0
-    except (LedgerError, RunnerError, ValueError) as error:
+    except (LedgerError, RunnerError, TargetError, TargetPluginError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
 

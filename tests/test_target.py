@@ -10,6 +10,24 @@ from autodidact.orchestrator import build_parser as build_orchestrator_parser
 from autodidact.target import ExecutionLocation, TargetConfig, TargetError, main
 
 
+def test_target_schema_version_one_remains_readable() -> None:
+    restored = TargetConfig.from_mapping(
+        {
+            "data_root": "data",
+            "device": "cpu",
+            "estimated_accelerator_hour_usd": None,
+            "execution_location": "local",
+            "max_parameter_count": 1_050_000,
+            "name": "legacy-target",
+            "schema_version": 1,
+            "trainer_path": "train.py",
+        }
+    )
+
+    assert restored.name == "legacy-target"
+    assert restored.plugin_spec_path is None
+
+
 def test_target_config_round_trip_and_relative_data_resolution(tmp_path: Path) -> None:
     config = TargetConfig(
         name="test-transformer",
@@ -72,7 +90,7 @@ def test_target_init_and_show_cli(
 
     assert main(["show", "--config", str(path)]) == 0
     shown = json.loads(capsys.readouterr().out)
-    assert shown["schema_version"] == 1
+    assert shown["schema_version"] == 2
     assert shown["trainer_path"] == "train.py"
 
 
@@ -127,6 +145,98 @@ def test_orchestrator_loads_target_device_data_and_parameter_cap(tmp_path: Path)
     assert config.data_root == repository / "prepared-data"
     assert config.device == "cuda"
     assert config.max_parameter_count == 1_040_000
+
+
+def test_orchestrator_loads_external_target_edit_scope_and_metric(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    plugin_path = tmp_path / "plugin.json"
+    plugin_path.write_text(
+        json.dumps(
+            {
+                "commands": {
+                    "evaluate": [
+                        "{python}",
+                        "{evaluator}",
+                        "--trainer",
+                        "{trainer}",
+                        "--checkpoint",
+                        "{checkpoint}",
+                        "--data-root",
+                        "{data_root}",
+                    ],
+                    "inspect": [
+                        "{python}",
+                        "{evaluator}",
+                        "--trainer",
+                        "{trainer}",
+                        "--parameter-cap",
+                        "{parameter_cap}",
+                    ],
+                    "train": [
+                        "{python}",
+                        "{trainer}",
+                        "--data-root",
+                        "{public_data_root}",
+                        "--seed",
+                        "{seed}",
+                        "--budget",
+                        "{token_budget}",
+                        "--checkpoint",
+                        "{checkpoint}",
+                        "--metrics",
+                        "{metrics}",
+                    ],
+                },
+                "data_config_sha256": "1" * 64,
+                "editable_paths": ["model/train.py", "model/layers.py"],
+                "evaluator_path": "control/evaluate.py",
+                "metric": {
+                    "direction": "higher",
+                    "name": "accuracy",
+                    "objective_offset": 1.0,
+                    "objective_scale": 1.0,
+                },
+                "plugin_id": "test.target",
+                "plugin_version": "1",
+                "schema_version": 1,
+                "tokenizer_sha256": "2" * 64,
+                "trainer_path": "model/train.py",
+            }
+        ),
+        encoding="utf-8",
+    )
+    target_path = tmp_path / "target.json"
+    target_path.write_text(
+        json.dumps(
+            TargetConfig(
+                name="external-target",
+                data_root=Path("protected"),
+                public_data_root=Path("public"),
+                plugin_spec_path=plugin_path,
+                trainer_path="model/train.py",
+                max_parameter_count=5_000_000,
+            ).to_mapping()
+        ),
+        encoding="utf-8",
+    )
+    args = build_orchestrator_parser().parse_args(
+        [
+            "--repository-root",
+            str(repository),
+            "--target-config",
+            str(target_path),
+            "status",
+        ]
+    )
+
+    config = _config_from_args(args)
+
+    assert config.allowed_paths == ("model/train.py", "model/layers.py")
+    assert config.trainer_path == "model/train.py"
+    assert config.target_plugin_id == "test.target"
+    assert config.target_metric_name == "accuracy"
+    assert config.max_parameter_count == 5_000_000
 
 
 def test_target_doctor_inspects_model_without_training(

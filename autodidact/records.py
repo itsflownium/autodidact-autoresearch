@@ -12,11 +12,7 @@ from enum import StrEnum
 from pathlib import PurePosixPath
 from typing import Any, ClassVar, TypeAlias
 
-from autodidact.data.integrity import (
-    ProtectedPathError,
-    assert_research_paths_allowed,
-    canonical_json_bytes,
-)
+from autodidact.data.integrity import canonical_json_bytes
 
 RECORD_SCHEMA_VERSION = 1
 MAX_PYTHON_SEED = 2**32 - 1
@@ -318,15 +314,14 @@ class CandidateRecord:
         _validate_unique("changed_paths", self.changed_paths)
         for path in self.changed_paths:
             _validate_text("changed path", path, maximum=1_000)
-        try:
-            assert_research_paths_allowed(list(self.changed_paths))
-        except (ProtectedPathError, ValueError) as error:
-            raise RecordValidationError(str(error)) from error
+        for value in self.changed_paths:
+            path = PurePosixPath(value.replace("\\", "/"))
+            if path.is_absolute() or ".." in path.parts or path.as_posix() in {"", "."}:
+                raise RecordValidationError("changed paths must be safe repository-relative paths")
         _validate_integer(
             "parameter_count",
             self.parameter_count,
             minimum=1,
-            maximum=DEFAULT_PARAMETER_CAP,
         )
 
 
