@@ -12,23 +12,19 @@ same declared seed, token budget, data contract, and device.
 
 ## Target model
 
-Target schema version 1 accepts any architecture at or below the current 1,050,000-parameter cap
-implemented behind Autodidact's protected `train.py` protocol. The included repository starts with
-the 1,016,960-parameter TinyStories transformer, but that is a benchmark parent, not a hidden model
-dependency.
+The included 1,016,960-parameter TinyStories transformer is the cheap default target and benchmark
+parent. It is not preloaded into the loop and it is not a requirement for other campaigns. Every
+paired arm constructs and trains the selected target from its declared parent commit.
 
-Before starting a new campaign, put the target architecture and training recipe in `train.py` and
-retain these commands:
+There are two target modes:
 
-```text
-python train.py inspect
-python train.py train ... --checkpoint-out PATH --metrics-file PATH
-python train.py generate ...
-```
+- **Built-in:** `train.py`, TinyStories BPB, and a 1,050,000-parameter cap. Existing schema-version-1
+  target files remain readable.
+- **Plugin:** user-selected trainer files, dataset contract, metric, evaluator, and parameter cap.
+  The 1,050,000 limit does not apply to a plugin target.
 
-The module must expose `build_model`, `model_config`, and checkpoint loading in the form expected by
-the protected evaluator. `autodidact-target doctor` checks model construction and the parameter cap
-without training the model.
+`autodidact-target doctor` constructs and counts the selected model without training it. The paired
+runner receives the same target file, hashes its control contract, and refuses incompatible drift.
 
 Create the ignored local target configuration for a laptop:
 
@@ -67,10 +63,25 @@ The user configures the GPU runtime, drivers, storage mount, and credentials. Au
 store cloud credentials or upload checkpoints. Running the orchestrator on the GPU host keeps the
 protected evaluator, immutable data, parent arm, and candidate arm in one auditable environment.
 
-Schema version 1 intentionally keeps `trainer_path` fixed to `train.py` and uses the protected
-TinyStories BPB evaluator. Supporting arbitrary trainer paths, datasets, metrics, or distributed
-launchers requires a future evaluator-plugin contract; merely accepting arbitrary shell commands
-would weaken PatchRCT's evidence boundary.
+For another model or task, create a target plugin and point the target configuration at it:
+
+```bash
+uv run autodidact-target init \
+  --name my-classifier \
+  --trainer-path model/train.py \
+  --plugin-spec control/target-plugin.json \
+  --public-data-root /datasets/my-task/public \
+  --data-root /datasets/my-task/evaluator-only \
+  --device auto \
+  --max-parameter-count 50000000
+
+uv run autodidact-target doctor --repository-root .
+```
+
+Training sees only `public_data_root`; only the protected evaluator command receives `data_root`.
+Commands are structured argument arrays executed without shell interpolation. The plugin declares
+the exact research-editable paths, while its evaluator and contract remain protected. See
+[`target-plugins.md`](target-plugins.md) for the complete schema, event protocol, and metric mapping.
 
 ## Researcher model
 

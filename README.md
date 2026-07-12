@@ -8,7 +8,7 @@ Autodidact starts with a **1,016,960-parameter transformer** that can run locall
 
 Autodidact builds on the compact workflow introduced by [Karpathy's autoresearch](https://github.com/karpathy/autoresearch), then adds **PatchRCT**, paired experiments, hidden evaluation, and Bayesian downstream-reward estimation.
 
-> **Status:** the immutable data system, 1,016,960-parameter baseline, local noise calibration, protected paired runner, PatchRCT controller, downstream-reward estimator and allocation policy, generic researcher adapter, durable recovery state, autonomous orchestration loop, and isolated three-arm study harness are implemented. The three-seed, 20M-token parent baseline is complete. The real patch campaign, 40-label reward calibration, three-arm pilot, and sealed evaluation have not run, and no candidate-patch improvement is claimed.
+> **Status:** the immutable data system, 1,016,960-parameter baseline, local noise calibration, protected paired runner, PatchRCT controller, downstream-reward estimator and allocation policy, generic researcher adapter, durable recovery state, autonomous orchestration loop, general target-plugin contract, isolated three-arm study harness, and frozen sealed-evaluation/reporting workflow are implemented. The three-seed, 20M-token parent baseline is complete. The real patch campaign, 40-label reward calibration, three-arm pilot, and sealed evaluation have not run, and no candidate-patch improvement is claimed.
 
 ## How it works
 
@@ -38,7 +38,7 @@ The research agent proposes changes, while the protected experiment runner and P
 The initial implementation keeps the same useful boundary as autoresearch:
 
 - **`prepare.py`** — fixed data preparation and integrity verification. The agent cannot modify it.
-- **`train.py`** — the transformer, optimizer, and training loop. This is the only file the agent may modify.
+- **`train.py`** — the bundled 1M-parameter target, optimizer, and training loop. Target plugins may declare a different protected edit scope.
 - **`program.md`** — instructions and research context supplied to the agent.
 - **`autodidact/`** — the protected PatchRCT harness, downstream-reward estimator, experiment ledger, and promotion rules.
 
@@ -265,13 +265,13 @@ The reviewed report is in [`docs/baseline/m4-full.md`](docs/baseline/m4-full.md)
 
 ## Research-agent instructions
 
-[`program.md`](program.md) is the executable research contract supplied to the proposal agent. It permits edits only to `train.py`, preserves the training and generation CLI, enforces the 1.05M parameter cap and protected-data boundary, requires one falsifiable causal claim per patch, and defines the proposal and completion records.
+[`program.md`](program.md) is the default executable research contract supplied to the proposal agent. The orchestrator appends the protected target contract, including exact editable paths, trainer, metric, and parameter cap. The bundled target permits only `train.py` and enforces its 1.05M cap; external [target plugins](docs/target-plugins.md) can declare another model and cap while preserving the protected-data boundary.
 
 Seeds come from the protected scheduler. The agent may reason about a code change, but it may not select, search, retry, discard, or report seeds according to favorable outcomes. It submits a patch for protected measurement; it does not grade or promote itself.
 
 ## Researcher adapter
 
-`autodidact-researcher` runs the configured proposal agent in a clean candidate workspace. It sends `program.md`, the accepted parent, prior experiment summaries, the token ceiling, and the exact editable paths as one structured prompt. The agent may edit `train.py` and must return exactly one structured proposal response containing its hypothesis, mechanism, expected BPB effect, minimum useful gain, and risks.
+`autodidact-researcher` runs the configured proposal agent in a clean candidate workspace. It sends `program.md`, the protected target contract, the accepted parent, prior experiment summaries, the token ceiling, and the exact editable paths as one structured prompt. The agent may edit only those paths and must return exactly one structured proposal response containing its hypothesis, mechanism, expected canonical-objective effect, minimum useful gain, and risks.
 
 The adapter has no ledger or promotion interface. It rejects unknown response fields, protected-file changes, Git-history changes, oversized output, oversized diffs, timeouts, token-budget overruns, and proposals without a code change. Each invocation writes an ignored compact transcript containing the prompt, raw provider output, normalized response, CLI version, resolved model, verified usage, code diff, hashes, claim, and failure reason. An existing transcript blocks another invocation with the same request ID so recovery can inspect prior evidence instead of paying for a duplicate call.
 
@@ -386,18 +386,18 @@ A patch is promoted only when the probability of exceeding the predeclared minim
 
 ## Protected paired runner
 
-`autodidact.runner` executes a candidate without restricting its intended research surface: the candidate may change model and training behavior inside `train.py`. The runner instead protects the comparison around that code.
+`autodidact.runner` executes a candidate without restricting its intended research surface inside the selected target's declared editable paths. The bundled target uses `train.py`; a plugin may expose several model or training files. The runner protects the comparison around that code.
 
 Before any training starts, the runner:
 
 - requires the candidate to be one non-merge commit directly on the ledger's current parent;
-- verifies that the commit changes `train.py` and no protected repository path;
-- independently imports both trainers, constructs their models, and counts parameters;
-- verifies the public dataset and creates a public-only hardlinked view with no protected split directory;
+- verifies that the commit changes only the target contract's editable repository paths;
+- independently invokes protected inspection for both trainers, constructs their models, and counts parameters;
+- gives training only the declared public data root and reserves the protected root for evaluation;
 - commits every selected seed, balanced randomized execution order, budget, hash, evaluator, environment, and resource limit to trial records;
 - creates detached parent and candidate Git worktrees that are removed after the experiment.
 
-For each seed, parent and candidate run sequentially in the precommitted order. Training receives no evaluation or generation task. A protected evaluator then loads each checkpoint and computes cross-entropy and BPB itself; candidate-defined evaluation functions and printed scores are not used as outcomes. The controller measures subprocess wall time and process RSS, collects device-memory diagnostics, classifies crashes, timeouts, OOMs, non-finite failures, cancellations, and integrity failures, and hashes every retained artifact.
+For each seed, parent and candidate run sequentially in the precommitted order. Training receives no protected evaluation task. A protected evaluator then loads each checkpoint and emits the plugin's declared raw metric; the runner verifies and maps it to a canonical lower-is-better objective. Candidate-defined printed scores are not used as outcomes. The controller measures subprocess wall time and process RSS, collects device-memory diagnostics, classifies crashes, timeouts, OOMs, non-finite failures, cancellations, and integrity failures, and hashes every retained artifact.
 
 Run a predeclared cheap experiment after its proposal is in the ledger:
 
@@ -760,6 +760,15 @@ The baseline is small enough to train locally on an Apple Silicon laptop using P
 A single H100 can later be used for more seeds, longer runs, repeated research lineages, and cross-hardware confirmation. No multi-GPU setup is required.
 
 Fixed-token results provide the cleanest comparison across hardware. Fixed-time results are platform-specific, so the laptop and H100 receive separate baseline timing calibrations.
+
+## Sealed evaluation
+
+`autodidact-sealed` freezes every accepted lineage and ledger hash before opening the protected
+`sealed_final` split. It then trains each unique accepted commit on predetermined seeds, measures
+paired sealed gains across generations, classifies useful confirmations and false promotions, and
+produces hashed JSON, Markdown, CSV, and SVG reports. The sealed workflow never promotes or changes
+a research parent. See [`docs/sealed-evaluation.md`](docs/sealed-evaluation.md) for the freeze/run
+boundary, recovery behavior, and report definitions.
 
 ## Design choices
 

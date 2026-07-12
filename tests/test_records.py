@@ -114,14 +114,15 @@ def test_records_reject_mutable_or_wrongly_typed_fields() -> None:
         replace(records["decision"], constraints_passed=1)
 
 
-def test_candidate_scope_and_parameter_limit_are_part_of_the_record_contract() -> None:
+def test_candidate_records_keep_portable_paths_and_positive_parameter_counts() -> None:
     records = evidence_records()
     candidate = records["candidate"]
     assert isinstance(candidate, CandidateRecord)
-    with pytest.raises(RecordValidationError, match="protected path"):
-        replace(candidate, changed_paths=("autodidact/ledger.py",))
-    with pytest.raises(RecordValidationError, match="at most 1050000"):
-        replace(candidate, parameter_count=1_050_001)
+    with pytest.raises(RecordValidationError, match="safe repository-relative"):
+        replace(candidate, changed_paths=("../autodidact/ledger.py",))
+    with pytest.raises(RecordValidationError, match="at least 1"):
+        replace(candidate, parameter_count=0)
+    assert replace(candidate, parameter_count=1_050_001).parameter_count == 1_050_001
 
 
 def test_artifacts_must_use_portable_relative_paths() -> None:
