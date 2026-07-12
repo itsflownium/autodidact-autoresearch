@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from autodidact.checkpoints import file_sha256
+from autodidact.controller import PatchRCTController
 from autodidact.data.integrity import verify_dataset
 from autodidact.ledger import ExperimentLedger, WriterRole
 from autodidact.records import (
@@ -23,6 +24,7 @@ from autodidact.records import (
     RunArm,
     RunResult,
     RunStatus,
+    TrialSchedule,
     TrialSpec,
 )
 from autodidact.runner import (
@@ -104,6 +106,7 @@ class FakeProcesses:
         self.ledger_path = ledger_path
         self.expected_trial_count = expected_trial_count
         self.fail_candidate = fail_candidate
+        self.inspection_calls = 0
         self.training_calls = 0
         self.evaluation_calls = 0
 
@@ -126,6 +129,7 @@ class FakeProcesses:
         assert "PYTHONHASHSEED" in environment
 
         if len(command) > 2 and command[2] == "inspect":
+            self.inspection_calls += 1
             trainer = Path(_argument(command, "--trainer"))
             stdout_path.write_text(
                 json.dumps(
@@ -393,6 +397,43 @@ def test_end_to_end_runner_records_matched_evidence_and_resumes_idempotently(
     assert repeated == result
     assert processes.training_calls == training_calls
     assert processes.evaluation_calls == evaluation_calls
+
+
+def test_candidate_preflight_is_recorded_before_controller_schedule(
+    prepared_dataset: Path,
+    tmp_path: Path,
+) -> None:
+    repository, parent, candidate_commit = _repository(tmp_path)
+    ledger_path = tmp_path / "ledger.sqlite3"
+    ledger = ExperimentLedger.create(ledger_path, initial_parent_commit=parent)
+    ledger.append(_proposal(parent), writer_role=WriterRole.RESEARCH_AGENT)
+    request = _request(
+        tmp_path,
+        prepared_dataset,
+        repository,
+        ledger_path,
+        candidate_commit,
+        seeds=(11,),
+    )
+    processes = FakeProcesses(ledger_path=ledger_path, expected_trial_count=0)
+    runner = PairedExperimentRunner(request, process_runner=processes)
+
+    candidate = runner.register_candidate()
+    inspection_calls = processes.inspection_calls
+    assert runner.register_candidate() == candidate
+    assert processes.inspection_calls == inspection_calls
+    schedule = PatchRCTController(ledger).initialize(candidate.candidate_id)
+
+    events = ledger.events()
+    candidate_sequence = next(
+        event.sequence for event in events if isinstance(event.record, CandidateRecord)
+    )
+    schedule_sequence = next(
+        event.sequence for event in events if isinstance(event.record, TrialSchedule)
+    )
+    assert candidate_sequence < schedule_sequence
+    assert schedule["action"] == "schedule"
+    assert not any(isinstance(event.record, TrialSpec) for event in events)
 
 
 def test_runner_records_candidate_oom_and_still_completes_parent_arm(
