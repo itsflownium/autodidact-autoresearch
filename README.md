@@ -495,6 +495,33 @@ uv run autodidact-ledger \
 
 Ledger databases, WAL files, and shared-memory files remain local and ignored by Git. The compact JSON or JSONL export is the portable review surface. Schema migration is explicit through `autodidact-ledger migrate` and must preserve the event head. The ledger is tamper-evident under the repository's file-access boundary; it is not a cryptographically signed remote transparency log.
 
+## Campaign state and recovery
+
+`autodidact-state` maintains the mutable control state that must survive a controller restart without weakening the immutable evidence ledger. Its transactional SQLite store tracks the accepted parent, generation, active proposal and candidate, current phase, pause or cancellation request, replay-safe operation keys, and separate used and reserved budgets.
+
+Before an external researcher call or paired run starts, the controller records a deterministic operation key and reserves its worst-case proposal, researcher-token, training-token, and compute allowance. A completed key replays its stored result. A key left running by a process crash becomes `interrupted` and must be reconciled against its transcript, Git commit, or ledger evidence before it can be completed or explicitly restarted. Settling records actual usage and releases the unused reservation; exceeding the reservation or campaign maximum fails before new work starts.
+
+A nonblocking lock in the Git common directory is shared by every worktree, preventing two controller processes from advancing the same accepted parent. Pause and cancellation requests become terminal control states only at orchestrator checkpoints, after the active operation has retained its evidence.
+
+```bash
+uv run autodidact-state create \
+  --campaign-id campaign-local-001 \
+  --initial-parent "$(git rev-parse HEAD)" \
+  --max-proposals 50 \
+  --max-wall-seconds 86400 \
+  --max-researcher-tokens 1000000 \
+  --max-training-tokens 1000000000 \
+  --max-compute-seconds 86400
+
+uv run autodidact-state status
+uv run autodidact-state pause --reason "finish after the active operation"
+uv run autodidact-state resume
+uv run autodidact-state cancel --reason "retain evidence and stop"
+uv run autodidact-state recover
+```
+
+Campaign databases and lock metadata remain ignored runtime state. Store verification checks schema identity, operation evidence, canonical results, reservation lifecycle, and exact agreement between budget rows and campaign counters.
+
 ## PatchRCT decision controller
 
 `autodidact.controller` is the protected sequential state machine above the evidence ledger. It never chooses a seed because that seed performed well. Each stage receives a prefix of the fixed policy seed pool, and uncertainty can request only the next unused seed in that predetermined order.
