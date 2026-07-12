@@ -271,11 +271,42 @@ Seeds come from the protected scheduler. The agent may reason about a code chang
 
 ## Researcher adapter
 
-`autodidact-researcher` runs the configured proposal command in a clean candidate workspace. It sends `program.md`, the accepted parent, prior experiment summaries, and the exact editable paths as one structured prompt. The command may edit `train.py` and must return exactly one structured proposal response containing its hypothesis, mechanism, expected BPB effect, minimum useful gain, risks, and reported token usage.
+`autodidact-researcher` runs the configured proposal agent in a clean candidate workspace. It sends `program.md`, the accepted parent, prior experiment summaries, the token ceiling, and the exact editable paths as one structured prompt. The agent may edit `train.py` and must return exactly one structured proposal response containing its hypothesis, mechanism, expected BPB effect, minimum useful gain, and risks.
 
-The adapter has no ledger or promotion interface. It rejects unknown response fields, protected-file changes, Git-history changes, oversized output, oversized diffs, timeouts, and proposals without a code change. Each invocation writes an ignored compact transcript containing the prompt, response, stderr, code diff, hashes, claim, usage, and failure reason. An existing transcript blocks another invocation with the same request ID so recovery can inspect prior evidence instead of paying for a duplicate call.
+The adapter has no ledger or promotion interface. It rejects unknown response fields, protected-file changes, Git-history changes, oversized output, oversized diffs, timeouts, token-budget overruns, and proposals without a code change. Each invocation writes an ignored compact transcript containing the prompt, raw provider output, normalized response, CLI version, resolved model, verified usage, code diff, hashes, claim, and failure reason. An existing transcript blocks another invocation with the same request ID so recovery can inspect prior evidence instead of paying for a duplicate call.
 
-The runtime command is supplied in ignored `artifacts/control/researcher.json`; model choice and credentials therefore remain outside source control. Tests use local fake commands and never invoke the configured external researcher.
+Native adapters are provided for Codex, Claude Code, and Hermes Agent. They use each CLI's non-interactive interface while normalizing structured output and trusted token accounting into the same proposal contract. Codex runs ephemerally with workspace-write sandboxing and a final-output schema. Claude Code runs without session persistence, with a JSON Schema and a restricted tool set. Hermes Agent uses its script-oriented one-shot mode, terminal-only tools, a temporary request file, and its per-run usage report. The post-run Git and path checks apply identically to every provider.
+
+Create the ignored local configuration with one of:
+
+```bash
+uv run autodidact-agent setup \
+  --provider codex \
+  --model MODEL_ID \
+  --reasoning-effort high
+
+uv run autodidact-agent setup \
+  --provider claude-code \
+  --model MODEL_ID \
+  --reasoning-effort high \
+  --max-turns 40 \
+  --max-budget-usd 5
+
+uv run autodidact-agent setup \
+  --provider hermes-agent \
+  --backend-provider PROVIDER_ID \
+  --model MODEL_ID
+```
+
+Omit both Hermes model flags to use its existing configured default. Codex also accepts `--profile` for a locally defined profile. Setup performs a no-inference `--version` probe before atomically writing `artifacts/control/researcher.json` with mode `0600`; it never copies credentials into the project. Diagnose the selected executable later with:
+
+```bash
+uv run autodidact-agent doctor
+```
+
+Hermes one-shot mode automatically approves tool calls, so its terminal sandbox must be configured before a real campaign. Autodidact still uses a detached candidate worktree and rejects every change outside the allowed research paths, but that repository check is not an operating-system sandbox.
+
+The generic command provider remains available for other agents through the same ignored configuration. Tests use local fake executables and never invoke a configured external researcher or inference API.
 
 ## Continuous integration
 
