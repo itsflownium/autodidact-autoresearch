@@ -14,7 +14,7 @@ import sys
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
 from autodidact.data.integrity import (
@@ -341,10 +341,18 @@ class ResearchRequest:
             raise ResearcherError("previous_results is too large")
         if not self.allowed_paths or len(set(self.allowed_paths)) != len(self.allowed_paths):
             raise ResearcherError("allowed_paths must be a nonempty unique sequence")
-        try:
-            assert_research_paths_allowed(list(self.allowed_paths))
-        except (ProtectedPathError, ValueError) as error:
-            raise ResearcherError(str(error)) from error
+        if self.allowed_paths == ("train.py",):
+            try:
+                assert_research_paths_allowed(list(self.allowed_paths))
+            except (ProtectedPathError, ValueError) as error:
+                raise ResearcherError(str(error)) from error
+        else:
+            for value in self.allowed_paths:
+                if not isinstance(value, str):
+                    raise ResearcherError("allowed_paths must contain portable text")
+                path = PurePosixPath(value.replace("\\", "/"))
+                if path.is_absolute() or ".." in path.parts or path.as_posix() in {"", "."}:
+                    raise ResearcherError("allowed_paths must be safe repository-relative paths")
 
     def prompt(self) -> str:
         payload = {

@@ -84,6 +84,7 @@ from autodidact.runstate import (
     RunStateError,
 )
 from autodidact.target import TargetConfig, TargetError
+from autodidact.target_plugins import TargetPluginError
 
 ORCHESTRATOR_SCHEMA_VERSION = 1
 DEFAULT_PROGRAM_PATH = Path("program.md")
@@ -216,6 +217,12 @@ class OrchestratorConfig:
     max_parameter_count: int = 1_050_000
     target_name: str = "Autodidact TinyStories transformer"
     target_execution_location: str = "local"
+    target_config_path: Path | None = None
+    trainer_path: str = "train.py"
+    allowed_paths: tuple[str, ...] = ("train.py",)
+    target_plugin_id: str | None = None
+    target_metric_name: str = "validation_bpb"
+    target_metric_direction: str = "lower"
 
     def __post_init__(self) -> None:
         if type(self.researcher_token_allowance) is not int or self.researcher_token_allowance <= 0:
@@ -235,6 +242,8 @@ class OrchestratorConfig:
             raise OrchestratorError("target_name must be nonempty")
         if self.target_execution_location not in {"local", "gpu_host"}:
             raise OrchestratorError("target_execution_location is invalid")
+        if not self.allowed_paths or self.trainer_path not in self.allowed_paths:
+            raise OrchestratorError("target editable paths must include its trainer")
 
     @property
     def features_path(self) -> Path:
@@ -255,7 +264,11 @@ class OrchestratorConfig:
             "max_parameter_count": self.max_parameter_count,
             "name": self.target_name,
             "execution_location": self.target_execution_location,
-            "trainer_path": "train.py",
+            "trainer_path": self.trainer_path,
+            "editable_paths": list(self.allowed_paths),
+            "metric_direction": self.target_metric_direction,
+            "metric_name": self.target_metric_name,
+            "plugin_id": self.target_plugin_id,
         }
 
 
@@ -485,6 +498,8 @@ class AutonomousResearchOrchestrator:
                         self.repository_root,
                         parent_commit=parent_commit,
                         candidate_commit=head,
+                        allowed_paths=self.config.allowed_paths,
+                        trainer_path=self.config.trainer_path,
                     )
                 except RunnerError as error:
                     raise OrchestratorError(
@@ -542,6 +557,13 @@ class AutonomousResearchOrchestrator:
             program_text = self.config.program_path.read_text(encoding="utf-8")
         except OSError as error:
             raise OrchestratorError(f"cannot read research program: {error}") from error
+        program_text += (
+            "\n\n## Protected target contract\n\n"
+            "The controller-supplied target contract below overrides generic examples in this "
+            "program. Do not edit or reinterpret it.\n\n```json\n"
+            + json.dumps(self.config.target_summary(), indent=2, sort_keys=True)
+            + "\n```\n"
+        )
         request = ResearchRequest(
             request_id=request_id,
             parent_commit=snapshot.accepted_parent_commit,
@@ -549,6 +571,7 @@ class AutonomousResearchOrchestrator:
             program_text=program_text,
             previous_results=self._previous_results(),
             maximum_total_tokens=self.config.researcher_token_allowance,
+            allowed_paths=self.config.allowed_paths,
         )
         prompt_hash = hashlib.sha256(request.prompt().encode("utf-8")).hexdigest()
         ledger_before = self.ledger.verify()
@@ -712,6 +735,8 @@ class AutonomousResearchOrchestrator:
                 self.repository_root,
                 parent_commit=proposal.parent_commit,
                 candidate_commit=candidate_commit,
+                allowed_paths=self.config.allowed_paths,
+                trainer_path=self.config.trainer_path,
             )
             self.state.complete_operation(
                 operation_key,
@@ -727,12 +752,14 @@ class AutonomousResearchOrchestrator:
                     self.repository_root,
                     parent_commit=proposal.parent_commit,
                     candidate_commit=candidate_commit,
+                    allowed_paths=self.config.allowed_paths,
+                    trainer_path=self.config.trainer_path,
                 )
             else:
                 if claim.disposition is ClaimDisposition.RECOVER:
                     self.state.restart_interrupted(operation_key)
                 _git(workspace, "diff", "--check")
-                _git(workspace, "add", "--", "train.py")
+                _git(workspace, "add", "--", *self.config.allowed_paths)
                 if not _git(workspace, "diff", "--cached", "--name-only"):
                     raise OrchestratorError("research proposal has no staged candidate change")
                 title = " ".join(proposal.title.split())[:72]
@@ -742,6 +769,8 @@ class AutonomousResearchOrchestrator:
                     self.repository_root,
                     parent_commit=proposal.parent_commit,
                     candidate_commit=candidate_commit,
+                    allowed_paths=self.config.allowed_paths,
+                    trainer_path=self.config.trainer_path,
                 )
             _git(
                 self.repository_root,
@@ -759,6 +788,8 @@ class AutonomousResearchOrchestrator:
             self.repository_root,
             parent_commit=proposal.parent_commit,
             candidate_commit=candidate_commit,
+            allowed_paths=self.config.allowed_paths,
+            trainer_path=self.config.trainer_path,
         )
         if not existing_ref:
             _git(
@@ -793,6 +824,7 @@ class AutonomousResearchOrchestrator:
             device=self.config.device,
             limits=self.policy.resource_limits(),
             estimated_accelerator_hour_usd=self.config.estimated_accelerator_hour_usd,
+            target_config_path=self.config.target_config_path,
         )
 
     def _register_candidate(
@@ -912,6 +944,7 @@ class AutonomousResearchOrchestrator:
             device=self.config.device,
             limits=schedule.limits,
             estimated_accelerator_hour_usd=self.config.estimated_accelerator_hour_usd,
+            target_config_path=self.config.target_config_path,
         )
 
     def _schedule_usage(self, schedule: TrialSchedule) -> BudgetAmount:
@@ -1371,6 +1404,7 @@ def build_parser() -> argparse.ArgumentParser:
 def _config_from_args(args: argparse.Namespace) -> OrchestratorConfig:
     target = None if args.target_config is None else TargetConfig.from_path(args.target_config)
     repository_root = args.repository_root.resolve()
+    plugin = None if target is None else target.load_plugin(repository_root)
     return OrchestratorConfig(
         repository_root=args.repository_root,
         ledger_path=args.ledger_path,
@@ -1389,6 +1423,14 @@ def _config_from_args(args: argparse.Namespace) -> OrchestratorConfig:
         max_parameter_count=(1_050_000 if target is None else target.max_parameter_count),
         target_name=("Autodidact TinyStories transformer" if target is None else target.name),
         target_execution_location=("local" if target is None else target.execution_location.value),
+        target_config_path=(
+            None if args.target_config is None else args.target_config.expanduser().resolve()
+        ),
+        trainer_path=("train.py" if plugin is None else plugin.trainer_path),
+        allowed_paths=(("train.py",) if plugin is None else plugin.editable_paths),
+        target_plugin_id=(None if plugin is None else plugin.plugin_id),
+        target_metric_name=("validation_bpb" if plugin is None else plugin.metric.name),
+        target_metric_direction=("lower" if plugin is None else plugin.metric.direction.value),
         researcher_token_allowance=getattr(
             args,
             "researcher_token_allowance",
@@ -1500,6 +1542,7 @@ def main(argv: list[str] | None = None) -> int:
         RunnerError,
         RunStateError,
         TargetError,
+        TargetPluginError,
         ValueError,
     ) as error:
         print(f"error: {error}", file=sys.stderr)
