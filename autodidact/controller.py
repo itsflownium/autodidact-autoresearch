@@ -10,6 +10,7 @@ import statistics
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +59,11 @@ class ControllerError(RuntimeError):
     """Raised when PatchRCT cannot make a valid state transition."""
 
 
+class DecisionMode(StrEnum):
+    GREEDY = "greedy"
+    PATCH_RCT = "patch_rct"
+
+
 @dataclass(frozen=True, slots=True)
 class PosteriorEstimate:
     mean_gain_bpb: float
@@ -68,6 +74,7 @@ class PosteriorEstimate:
 
 @dataclass(frozen=True, slots=True)
 class PatchRCTPolicy:
+    decision_mode: DecisionMode = DecisionMode.PATCH_RCT
     seed_pool: tuple[int, ...] = (11, 23, 37, 53, 71)
     cheap_initial_pairs: int = 1
     intermediate_initial_pairs: int = 2
@@ -102,6 +109,11 @@ class PatchRCTPolicy:
     minimum_downstream_labels: int = 40
 
     def __post_init__(self) -> None:
+        try:
+            mode = DecisionMode(self.decision_mode)
+        except (TypeError, ValueError) as error:
+            raise ControllerError("decision_mode is invalid") from error
+        object.__setattr__(self, "decision_mode", mode)
         if not self.seed_pool or len(set(self.seed_pool)) != len(self.seed_pool):
             raise ControllerError("seed_pool must be a nonempty unique sequence")
         if any(type(seed) is not int or seed < 0 or seed > 2**32 - 1 for seed in self.seed_pool):
@@ -157,6 +169,14 @@ class PatchRCTPolicy:
         for name in ("force_full_evaluation", "use_downstream_allocation"):
             if type(getattr(self, name)) is not bool:
                 raise ControllerError(f"{name} must be boolean")
+        if mode is DecisionMode.GREEDY and (
+            self.force_full_evaluation
+            or self.use_downstream_allocation
+            or self.cheap_initial_pairs != 1
+        ):
+            raise ControllerError(
+                "greedy mode requires one cheap pair and cannot force calibration or allocation"
+            )
         for name in (
             "allocation_rejection_probability",
             "allocation_full_test_probability",
@@ -565,12 +585,15 @@ class PatchRCTController:
         effect: EffectEstimate | None,
         constraints_passed: bool,
         reasons: tuple[str, ...],
+        probability_threshold: float | None = None,
     ) -> dict[str, Any]:
-        threshold = (
-            self.policy.promotion_probability
-            if stage is ExperimentStage.FULL
-            else self.policy.continuation_probability
-        )
+        threshold = probability_threshold
+        if threshold is None:
+            threshold = (
+                self.policy.promotion_probability
+                if stage is ExperimentStage.FULL
+                else self.policy.continuation_probability
+            )
         decision = self._decision(
             candidate,
             proposal,
@@ -654,16 +677,25 @@ class PatchRCTController:
         candidate: CandidateRecord,
         proposal: PatchProposal,
         effect: EffectEstimate,
+        *,
+        stage: ExperimentStage = ExperimentStage.FULL,
+        probability_threshold: float | None = None,
+        reason: str = "full-stage useful-gain probability satisfies the promotion threshold",
     ) -> dict[str, Any]:
+        threshold = (
+            self.policy.promotion_probability
+            if probability_threshold is None
+            else probability_threshold
+        )
         decision = self._decision(
             candidate,
             proposal,
-            ExperimentStage.FULL,
+            stage,
             DecisionVerdict.PROMOTE,
             effect=effect,
-            probability_threshold=self.policy.promotion_probability,
+            probability_threshold=threshold,
             constraints_passed=True,
-            reasons=("full-stage useful-gain probability satisfies the promotion threshold",),
+            reasons=(reason,),
         )
         lineages = [
             event.record
@@ -693,7 +725,7 @@ class PatchRCTController:
             "decision_id": decision.decision_id,
             "lineage_id": lineage.lineage_id,
             "new_parent_commit": candidate.candidate_commit,
-            "stage": ExperimentStage.FULL.value,
+            "stage": stage.value,
         }
 
     def _allocation_prediction(self, candidate_id: str) -> DownstreamPrediction:
@@ -1001,6 +1033,27 @@ class PatchRCTController:
                 constraints_passed=False,
                 reasons=("one or more paired resource constraints failed",),
             )
+        if self.policy.decision_mode is DecisionMode.GREEDY:
+            if stage is not ExperimentStage.CHEAP or len(pairs) != 1:
+                raise ControllerError("greedy mode requires exactly one completed cheap pair")
+            if effect.mean_gain_bpb > 0.0:
+                return self._promote(
+                    candidate,
+                    proposal,
+                    effect,
+                    stage=stage,
+                    probability_threshold=0.0,
+                    reason="greedy keep/discard retained a positive observed BPB gain",
+                )
+            return self._reject(
+                candidate,
+                proposal,
+                stage,
+                effect=effect,
+                constraints_passed=True,
+                reasons=("greedy keep/discard did not observe a positive BPB gain",),
+                probability_threshold=0.0,
+            )
         probability = effect.probability_exceeds_minimum
         forced_for_calibration = self.policy.force_full_evaluation and stage in _NEXT_STAGE
         allocation_active = (
@@ -1096,6 +1149,7 @@ class PatchRCTController:
             "action": "status",
             "candidate_id": candidate.candidate_id,
             "current_parent_commit": self.ledger.current_parent(),
+            "decision_mode": self.policy.decision_mode.value,
             "latest_effect": (
                 None
                 if not effects

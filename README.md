@@ -8,7 +8,7 @@ Autodidact starts with a **1,016,960-parameter transformer** that can run locall
 
 Autodidact builds on the compact workflow introduced by [Karpathy's autoresearch](https://github.com/karpathy/autoresearch), then adds **PatchRCT**, paired experiments, hidden evaluation, and Bayesian downstream-reward estimation.
 
-> **Status:** the immutable data system, 1,016,960-parameter baseline, local noise calibration, protected paired runner, PatchRCT controller, downstream-reward estimator and allocation policy, generic researcher adapter, durable recovery state, autonomous orchestration loop, and frozen sealed-evaluation/reporting workflow are implemented. The three-seed, 20M-token parent baseline is complete. The real patch campaign, 40-label reward calibration, and sealed evaluation have not run, and no candidate-patch improvement is claimed.
+> **Status:** the immutable data system, 1,016,960-parameter baseline, local noise calibration, protected paired runner, PatchRCT controller, downstream-reward estimator and allocation policy, generic researcher adapter, durable recovery state, autonomous orchestration loop, general target-plugin contract, isolated three-arm study harness, and frozen sealed-evaluation/reporting workflow are implemented. The three-seed, 20M-token parent baseline is complete. The real patch campaign, 40-label reward calibration, three-arm pilot, and sealed evaluation have not run, and no candidate-patch improvement is claimed.
 
 ## How it works
 
@@ -745,6 +745,13 @@ The first study will compare three systems under matched research budgets:
 3. PatchRCT with Bayesian downstream-reward estimation.
 
 This separates the benefit of paired patch validation from the additional compute savings of learning-curve prediction.
+
+`autodidact-study` implements this comparison as three isolated, resumable campaigns with the same
+initial parent and hard proposal, token, wall-time, and compute ceilings. The greedy arm retains the
+Karpathy-style immediate keep/discard rule while using Autodidact's protected evaluator and ledger;
+the other arms use direct PatchRCT and PatchRCT with Bayesian allocation. See
+[`docs/three-arm-study.md`](docs/three-arm-study.md) for initialization, isolation, execution, and
+recovery details.
 
 ## Local first, one H100 later
 
