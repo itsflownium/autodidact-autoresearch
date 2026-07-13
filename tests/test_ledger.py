@@ -78,6 +78,54 @@ def test_complete_lifecycle_is_reconstructable_from_immutable_events(tmp_path: P
     ]
 
 
+def test_verified_snapshot_is_reused_and_invalidated_by_external_append(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = create_ledger(tmp_path)
+    proposal = evidence_records()["proposal"]
+    ledger.append(proposal, writer_role=WriterRole.RESEARCH_AGENT)
+
+    original_verify = ExperimentLedger._verify_connection.__func__
+    verification_calls = 0
+
+    def counting_verify(
+        cls: type[ExperimentLedger],
+        connection: sqlite3.Connection,
+        *,
+        verify_semantics: bool = True,
+    ):
+        nonlocal verification_calls
+        verification_calls += 1
+        return original_verify(cls, connection, verify_semantics=verify_semantics)
+
+    monkeypatch.setattr(
+        ExperimentLedger,
+        "_verify_connection",
+        classmethod(counting_verify),
+    )
+
+    assert len(ledger.events()) == 1
+    assert ledger.get(proposal.proposal_id).record == proposal
+    assert ledger.current_parent() == PARENT_COMMIT
+    assert verification_calls == 0
+
+    external = ExperimentLedger.open(ledger.path)
+    external.append(
+        replace(proposal, proposal_id="proposal-002", title="Second proposal"),
+        writer_role=WriterRole.RESEARCH_AGENT,
+    )
+    verification_calls = 0
+
+    assert len(ledger.events()) == 2
+    assert ledger.summary()["event_count"] == 2
+    assert ledger.current_parent() == PARENT_COMMIT
+    assert verification_calls == 1
+
+    assert ledger.verify().event_count == 2
+    assert verification_calls == 2
+
+
 def test_writer_roles_and_read_only_mode_are_enforced(tmp_path: Path) -> None:
     ledger = create_ledger(tmp_path)
     records = evidence_records()
@@ -270,6 +318,8 @@ def test_sqlite_triggers_block_mutation_and_hash_verification_detects_tampering(
     finally:
         connection.close()
 
+    with pytest.raises(LedgerIntegrityError, match="payload hash mismatch"):
+        ledger.events()
     with pytest.raises(LedgerIntegrityError, match="payload hash mismatch"):
         ledger.verify()
 

@@ -263,6 +263,14 @@ class LedgerVerification:
     record_schema_version: int
 
 
+@dataclass(frozen=True, slots=True)
+class _VerifiedSnapshot:
+    revision: tuple[int, str | None]
+    storage_fingerprint: tuple[tuple[str, int, int, int, int, int] | tuple[str], ...]
+    verification: LedgerVerification
+    events: tuple[LedgerEvent, ...]
+
+
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -357,6 +365,7 @@ class ExperimentLedger:
     def __init__(self, path: Path, *, read_only: bool) -> None:
         self.path = path.resolve()
         self.read_only = read_only
+        self._verified_snapshot: _VerifiedSnapshot | None = None
 
     @classmethod
     def create(
@@ -455,6 +464,94 @@ class ExperimentLedger:
         except sqlite3.OperationalError:
             return None
         return None if row is None else str(row[0])
+
+    @staticmethod
+    def _raw_revision(connection: sqlite3.Connection) -> tuple[int, str | None]:
+        row = connection.execute(
+            """
+            SELECT COUNT(*),
+                (SELECT event_sha256 FROM events ORDER BY sequence DESC LIMIT 1)
+            FROM events
+            """
+        ).fetchone()
+        return int(row[0]), None if row[1] is None else str(row[1])
+
+    def _storage_fingerprint(
+        self,
+    ) -> tuple[tuple[str, int, int, int, int, int] | tuple[str], ...]:
+        # SQLite may create and remove an empty WAL around read-only connections.
+        result: list[tuple[str, int, int, int, int, int] | tuple[str]] = []
+        for suffix in ("", "-wal"):
+            candidate = Path(str(self.path) + suffix)
+            try:
+                stat = candidate.stat()
+            except FileNotFoundError:
+                result.append((suffix,))
+                continue
+            if suffix == "-wal" and stat.st_size == 0:
+                result.append((suffix,))
+                continue
+            result.append(
+                (
+                    suffix,
+                    stat.st_dev,
+                    stat.st_ino,
+                    stat.st_size,
+                    stat.st_mtime_ns,
+                    stat.st_ctime_ns,
+                )
+            )
+        return tuple(result)
+
+    def _remember_verified_snapshot(
+        self,
+        connection: sqlite3.Connection,
+        verification: LedgerVerification,
+        events: Sequence[LedgerEvent],
+    ) -> None:
+        before = self._storage_fingerprint()
+        revision = self._raw_revision(connection)
+        after = self._storage_fingerprint()
+        expected_revision = (
+            verification.event_count,
+            None if verification.event_count == 0 else verification.head_event_sha256,
+        )
+        if before != after or revision != expected_revision:
+            self._verified_snapshot = None
+            return
+        self._verified_snapshot = _VerifiedSnapshot(
+            revision=revision,
+            storage_fingerprint=after,
+            verification=verification,
+            events=tuple(events),
+        )
+
+    def _refresh_snapshot_fingerprint(self) -> None:
+        cached = self._verified_snapshot
+        if cached is None:
+            return
+        self._verified_snapshot = _VerifiedSnapshot(
+            revision=cached.revision,
+            storage_fingerprint=self._storage_fingerprint(),
+            verification=cached.verification,
+            events=cached.events,
+        )
+
+    def _verified_connection(
+        self,
+        connection: sqlite3.Connection,
+    ) -> tuple[LedgerVerification, list[LedgerEvent]]:
+        # Reuse only an unchanged, fully verified immutable ledger prefix.
+        cached = self._verified_snapshot
+        if cached is not None:
+            before = self._storage_fingerprint()
+            revision = self._raw_revision(connection)
+            after = self._storage_fingerprint()
+            if before == after == cached.storage_fingerprint and revision == cached.revision:
+                return cached.verification, list(cached.events)
+        verification, events = self._verify_connection(connection)
+        self._remember_verified_snapshot(connection, verification, events)
+        return verification, events
 
     def _connect(self, *, write: bool = False) -> sqlite3.Connection:
         if write and self.read_only:
@@ -663,18 +760,21 @@ class ExperimentLedger:
     def verify(self) -> LedgerVerification:
         connection = self._connect()
         try:
-            verification, _events = self._verify_connection(connection)
+            verification, events = self._verify_connection(connection)
+            self._remember_verified_snapshot(connection, verification, events)
             return verification
         finally:
             connection.close()
+            self._refresh_snapshot_fingerprint()
 
     def events(self) -> tuple[LedgerEvent, ...]:
         connection = self._connect()
         try:
-            _verification, events = self._verify_connection(connection)
+            _verification, events = self._verified_connection(connection)
             return tuple(events)
         finally:
             connection.close()
+            self._refresh_snapshot_fingerprint()
 
     def append(
         self,
@@ -710,10 +810,11 @@ class ExperimentLedger:
         connection = self._connect(write=True)
         try:
             connection.execute("BEGIN IMMEDIATE")
-            verification, _events = self._verify_connection(connection)
+            verification, existing_events = self._verified_connection(connection)
             previous = verification.head_event_sha256
             next_sequence = verification.event_count + 1
             appended: list[LedgerEvent] = []
+            newly_appended: list[LedgerEvent] = []
             for record, role in entries:
                 self._assert_writer(role, record)
                 envelope = record_to_envelope(record)
@@ -768,16 +869,32 @@ class ExperimentLedger:
                     event_sha256=event_hash,
                 )
                 appended.append(event)
+                newly_appended.append(event)
                 previous = event_hash
                 next_sequence += 1
             self._validate_allocation_links(connection)
             connection.commit()
+            updated_verification = LedgerVerification(
+                ledger_id=verification.ledger_id,
+                initial_parent_commit=verification.initial_parent_commit,
+                event_count=verification.event_count + len(newly_appended),
+                head_event_sha256=previous,
+                schema_version=verification.schema_version,
+                record_schema_version=verification.record_schema_version,
+            )
+            self._remember_verified_snapshot(
+                connection,
+                updated_verification,
+                (*existing_events, *newly_appended),
+            )
             return tuple(appended)
         except Exception:
             connection.rollback()
+            self._verified_snapshot = None
             raise
         finally:
             connection.close()
+            self._refresh_snapshot_fingerprint()
 
     @classmethod
     def _event_by_record_id(
@@ -1547,30 +1664,33 @@ class ExperimentLedger:
     def get(self, requested_id: str) -> LedgerEvent:
         connection = self._connect()
         try:
-            self._verify_connection(connection)
+            self._verified_connection(connection)
             event = self._event_by_record_id(connection, requested_id)
             if event is None:
                 raise LedgerError(f"record does not exist: {requested_id}")
             return event
         finally:
             connection.close()
+            self._refresh_snapshot_fingerprint()
 
     def current_parent(self) -> str:
         connection = self._connect()
         try:
-            self._verify_connection(connection)
+            self._verified_connection(connection)
             parent, _lineage = self._current_lineage(connection)
             return parent
         finally:
             connection.close()
+            self._refresh_snapshot_fingerprint()
 
     def running_trials(self) -> tuple[str, ...]:
         connection = self._connect()
         try:
-            self._verify_connection(connection)
+            self._verified_connection(connection)
             return self._running_trial_ids(connection)
         finally:
             connection.close()
+            self._refresh_snapshot_fingerprint()
 
     @classmethod
     def _running_trial_ids(cls, connection: sqlite3.Connection) -> tuple[str, ...]:
@@ -1590,7 +1710,7 @@ class ExperimentLedger:
     def summary(self) -> dict[str, Any]:
         connection = self._connect()
         try:
-            verification, events = self._verify_connection(connection)
+            verification, events = self._verified_connection(connection)
             counts = Counter(event.record.RECORD_TYPE for event in events)
             decisions = self._records_of_type(connection, DecisionRecord)
             compute = self._records_of_type(connection, ComputeRecord)
@@ -1622,11 +1742,12 @@ class ExperimentLedger:
             }
         finally:
             connection.close()
+            self._refresh_snapshot_fingerprint()
 
     def progress_points(self) -> list[dict[str, Any]]:
         connection = self._connect()
         try:
-            self._verify_connection(connection)
+            self._verified_connection(connection)
             candidate_events = [
                 event
                 for event in self._events_without_verification(connection)
@@ -1686,6 +1807,7 @@ class ExperimentLedger:
             return points
         finally:
             connection.close()
+            self._refresh_snapshot_fingerprint()
 
     @classmethod
     def _events_without_verification(
@@ -1708,10 +1830,11 @@ class ExperimentLedger:
             raise ValueError("output_format must be snapshot or jsonl")
         connection = self._connect()
         try:
-            verification, events = self._verify_connection(connection)
+            verification, events = self._verified_connection(connection)
             metadata = self._metadata(connection)
         finally:
             connection.close()
+            self._refresh_snapshot_fingerprint()
         default_redactions = (str(Path.home()), tempfile.gettempdir())
         active_redactions = tuple(
             sorted(
