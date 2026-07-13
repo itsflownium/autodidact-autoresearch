@@ -173,6 +173,11 @@ print(RESPONSE)
     assert prompt["previous_results"][0]["verdict"] == "rejected"
     assert prompt["maximum_total_tokens"] == 1_000_000
     assert prompt["contract"]["evaluation"].startswith("Do not grade")
+    proposal_work = prompt["contract"]["proposal_work"]
+    assert "at most 12" in proposal_work["commands"]
+    assert "Git history" in proposal_work["inspection"]
+    assert "Do not run training" in proposal_work["validation"]
+    assert "controller owns comprehensive validation" in proposal_work["validation"]
     assert transcript["response"]["proposal"]["hypothesis"] == (
         "A smaller step should reduce optimization noise."
     )

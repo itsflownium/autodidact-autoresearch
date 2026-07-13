@@ -39,6 +39,7 @@ _COMPATIBILITY_SCHEMA_VERSION = 1
 _CAPABILITY_CONTRACTS: dict[ResearcherProvider, tuple[tuple[str, tuple[str, ...]], ...]] = {
     ResearcherProvider.CODEX: (
         ("ephemeral execution", ("--ephemeral",)),
+        ("isolated user configuration", ("--ignore-user-config",)),
         ("workspace sandbox", ("--sandbox",)),
         ("JSON event output", ("--json",)),
         ("response schema", ("--output-schema",)),
@@ -352,6 +353,7 @@ class CodexResearcherAdapter(NativeResearcherAdapter):
                 self.executable,
                 "exec",
                 "--ephemeral",
+                "--ignore-user-config",
                 "--sandbox",
                 "workspace-write",
                 "--json",

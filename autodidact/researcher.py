@@ -364,6 +364,22 @@ class ResearchRequest:
                 "output": (
                     "Write exactly one response object matching the supplied schema to stdout."
                 ),
+                "proposal_work": {
+                    "commands": (
+                        "Use at most 12 shell or tool calls, including inspection, editing, and "
+                        "focused validation."
+                    ),
+                    "inspection": (
+                        "Inspect only the allowed files and supplied previous results. Do not "
+                        "inspect Git history, tests, documentation, artifacts, or unrelated files."
+                    ),
+                    "validation": (
+                        "Do not run training, evaluation, generation, pytest, or repository-wide "
+                        "checks. The controller owns comprehensive validation and experiments. "
+                        "You may run focused formatting, lint, and inspect checks for changed "
+                        "allowed files only."
+                    ),
+                },
             },
             "output_schema": {
                 "failure_reason": "string or null",

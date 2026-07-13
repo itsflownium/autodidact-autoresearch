@@ -112,10 +112,11 @@ if "--version" in sys.argv:
     print("codex-cli test-1")
     raise SystemExit(0)
 if sys.argv[1:] == ["exec", "--help"]:
-    print("--ephemeral --sandbox --json --output-schema --output-last-message")
+    print("--ephemeral --ignore-user-config --sandbox --json --output-schema --output-last-message")
     raise SystemExit(0)
 assert sys.argv[1] == "exec"
 assert "--ephemeral" in sys.argv
+assert "--ignore-user-config" in sys.argv
 sandbox_index = sys.argv.index("--sandbox")
 assert ["--sandbox", "workspace-write"] == sys.argv[sandbox_index:sandbox_index + 2]
 schema = pathlib.Path(sys.argv[sys.argv.index("--output-schema") + 1])
@@ -589,7 +590,7 @@ if "--version" in sys.argv:
     print("codex-cli old")
     raise SystemExit(0)
 if "--help" in sys.argv:
-    print("--ephemeral --sandbox --json --output-last-message")
+    print("--ephemeral --ignore-user-config --sandbox --json --output-last-message")
     raise SystemExit(0)
 raise RuntimeError("inference must not run")
 """,
@@ -660,7 +661,8 @@ def test_bootstrap_fix_reinstalls_broken_codex_with_fake_npm(
         "import sys\n"
         "if '--version' in sys.argv: print('codex-cli repaired')\n"
         "elif '--help' in sys.argv: "
-        "print('--ephemeral --sandbox --json --output-schema --output-last-message')\n"
+        "print('--ephemeral --ignore-user-config --sandbox --json --output-schema "
+        "--output-last-message')\n"
     )
     npm = _executable(
         bin_root,
@@ -741,7 +743,7 @@ import sys
 if "--version" in sys.argv:
     print("codex-cli discovered")
 elif "--help" in sys.argv:
-    print("--ephemeral --sandbox --json --output-schema --output-last-message")
+    print("--ephemeral --ignore-user-config --sandbox --json --output-schema --output-last-message")
 """,
     )
     monkeypatch.setenv("PATH", os.pathsep.join((str(bin_root), str(Path(sys.executable).parent))))
@@ -800,7 +802,7 @@ import sys
 if "--version" in sys.argv:
     print("codex-cli compatible")
 elif "--help" in sys.argv:
-    print("--ephemeral --sandbox --json --output-schema --output-last-message")
+    print("--ephemeral --ignore-user-config --sandbox --json --output-schema --output-last-message")
 """,
     )
     monkeypatch.setenv(
