@@ -78,7 +78,7 @@ def test_complete_lifecycle_is_reconstructable_from_immutable_events(tmp_path: P
     ]
 
 
-def test_verified_snapshot_is_reused_and_invalidated_by_external_append(
+def test_verified_snapshot_is_reused_and_shared_after_external_append(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -111,19 +111,21 @@ def test_verified_snapshot_is_reused_and_invalidated_by_external_append(
     assert verification_calls == 0
 
     external = ExperimentLedger.open(ledger.path)
+    assert verification_calls == 0
     external.append(
         replace(proposal, proposal_id="proposal-002", title="Second proposal"),
         writer_role=WriterRole.RESEARCH_AGENT,
     )
+    assert verification_calls == 0
     verification_calls = 0
 
     assert len(ledger.events()) == 2
     assert ledger.summary()["event_count"] == 2
     assert ledger.current_parent() == PARENT_COMMIT
-    assert verification_calls == 1
+    assert verification_calls == 0
 
     assert ledger.verify().event_count == 2
-    assert verification_calls == 2
+    assert verification_calls == 1
 
 
 def test_writer_roles_and_read_only_mode_are_enforced(tmp_path: Path) -> None:
