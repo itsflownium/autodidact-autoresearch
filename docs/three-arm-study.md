@@ -52,7 +52,7 @@ uv run autodidact-study \
   --target-config artifacts/control/target.json \
   --max-proposals 50 \
   --max-wall-seconds 604800 \
-  --max-researcher-tokens 2500000 \
+  --max-researcher-tokens 50000000 \
   --max-training-tokens 3000000000 \
   --max-compute-seconds 604800 \
   --reward-calibration-labels 40

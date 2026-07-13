@@ -10,6 +10,7 @@ import pytest
 
 from autodidact.agent_cli import main as agent_main
 from autodidact.researcher import (
+    DEFAULT_RESEARCHER_TOKEN_ALLOWANCE,
     ResearcherConfig,
     ResearcherError,
     ResearcherProvider,
@@ -90,7 +91,14 @@ def _executable(tmp_path: Path, name: str, source: str) -> Path:
     return path
 
 
-def _codex_executable(tmp_path: Path, *, usage: bool = True) -> Path:
+def _codex_executable(
+    tmp_path: Path,
+    *,
+    usage: bool = True,
+    input_tokens: int = 410,
+    output_tokens: int = 90,
+    expected_budget: int = 10_000,
+) -> Path:
     return _executable(
         tmp_path,
         "fake-codex",
@@ -113,15 +121,15 @@ assert ["--sandbox", "workspace-write"] == sys.argv[sandbox_index:sandbox_index 
 schema = pathlib.Path(sys.argv[sys.argv.index("--output-schema") + 1])
 assert json.loads(schema.read_text())["additionalProperties"] is False
 request = json.load(sys.stdin)
-assert request["maximum_total_tokens"] == 10000
-assert os.environ["AUTODIDACT_RESEARCHER_TOKEN_BUDGET"] == "10000"
+assert request["maximum_total_tokens"] == {expected_budget}
+assert os.environ["AUTODIDACT_RESEARCHER_TOKEN_BUDGET"] == {str(expected_budget)!r}
 path = pathlib.Path("train.py")
 path.write_text(path.read_text() + "LEARNING_RATE = 0.008\\n")
 response = pathlib.Path(sys.argv[sys.argv.index("--output-last-message") + 1])
 response.write_text(json.dumps({repr(_response())}))
 event = {{"type": "turn.completed", "model": "test-codex-model"}}
 if {usage!r}:
-    event["usage"] = {{"input_tokens": 410, "output_tokens": 90}}
+    event["usage"] = {{"input_tokens": {input_tokens}, "output_tokens": {output_tokens}}}
 print(json.dumps(event))
 """,
     )
@@ -330,6 +338,32 @@ def test_native_provider_fails_closed_without_trusted_usage(tmp_path: Path) -> N
     assert "trusted token-usage record" in transcript["stderr"]
 
 
+def test_default_allowance_accepts_observed_long_horizon_codex_usage(tmp_path: Path) -> None:
+    repository, parent = _repository(tmp_path)
+    adapter = CodexResearcherAdapter(
+        ResearcherConfig(
+            provider=ResearcherProvider.CODEX,
+            executable=str(
+                _codex_executable(
+                    tmp_path,
+                    input_tokens=891_636,
+                    output_tokens=12_593,
+                    expected_budget=DEFAULT_RESEARCHER_TOKEN_ALLOWANCE,
+                )
+            ),
+        )
+    )
+
+    attempt = adapter.run(
+        _request(parent, maximum_total_tokens=DEFAULT_RESEARCHER_TOKEN_ALLOWANCE),
+        workspace=repository,
+        artifact_root=tmp_path / "artifacts",
+    )
+
+    assert attempt.status is ResearchStatus.PROPOSED
+    assert attempt.usage.total_tokens == 904_229
+
+
 def test_trusted_native_usage_enforces_request_budget(tmp_path: Path) -> None:
     repository, parent = _repository(tmp_path)
     adapter = ClaudeCodeResearcherAdapter(
@@ -346,7 +380,10 @@ def test_trusted_native_usage_enforces_request_budget(tmp_path: Path) -> None:
     )
 
     assert attempt.status is ResearchStatus.FAILED
-    assert attempt.failure_reason == "researcher usage exceeded its assigned token budget"
+    assert attempt.failure_reason == (
+        "researcher usage 600 tokens exceeded assigned token budget 599; increase the "
+        "per-proposal and campaign researcher-token limits"
+    )
 
 
 def test_response_json_schema_is_closed_and_requires_every_field() -> None:
@@ -605,7 +642,7 @@ print(json.dumps({repr(_response())}))
     assert attempt.usage.total_tokens == 15
 
 
-def test_bootstrap_fix_installs_missing_codex_with_fake_npm(
+def test_bootstrap_fix_reinstalls_broken_codex_with_fake_npm(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -613,6 +650,11 @@ def test_bootstrap_fix_installs_missing_codex_with_fake_npm(
     bin_root = tmp_path / "bin"
     bin_root.mkdir()
     codex_path = bin_root / "codex"
+    _executable(
+        bin_root,
+        "codex",
+        "import sys\nprint('broken shim', file=sys.stderr)\nraise SystemExit(1)\n",
+    )
     installed_source = (
         "#!/usr/bin/env python3\n"
         "import sys\n"
@@ -634,6 +676,10 @@ path.chmod(0o755)
     )
     assert npm.is_file()
     monkeypatch.setenv("PATH", os.pathsep.join((str(bin_root), str(Path(sys.executable).parent))))
+    monkeypatch.setattr(
+        "autodidact.agent_compat._candidate_executables",
+        lambda config: [config.executable],
+    )
     config_path = tmp_path / "researcher.json"
 
     exit_code = agent_main(
@@ -730,3 +776,54 @@ elif "--help" in sys.argv:
     payload = json.loads(capsys.readouterr().out)
     assert payload["repair_actions"][0]["code"] == "select_compatible_executable"
     assert ResearcherConfig.from_path(config_path).executable == str(executable)
+
+
+def test_bootstrap_fix_skips_broken_first_path_executable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    broken_root = tmp_path / "broken-bin"
+    working_root = tmp_path / "working-bin"
+    broken_root.mkdir()
+    working_root.mkdir()
+    _executable(
+        broken_root,
+        "codex",
+        "import sys\nprint('broken shim', file=sys.stderr)\nraise SystemExit(1)\n",
+    )
+    working = _executable(
+        working_root,
+        "codex",
+        """
+import sys
+if "--version" in sys.argv:
+    print("codex-cli compatible")
+elif "--help" in sys.argv:
+    print("--ephemeral --sandbox --json --output-schema --output-last-message")
+""",
+    )
+    monkeypatch.setenv(
+        "PATH",
+        os.pathsep.join((str(broken_root), str(working_root), str(Path(sys.executable).parent))),
+    )
+    config_path = tmp_path / "researcher.json"
+
+    assert (
+        agent_main(
+            [
+                "bootstrap",
+                "--provider",
+                "codex",
+                "--config",
+                str(config_path),
+                "--fix",
+            ]
+        )
+        == 0
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is True
+    assert payload["repair_actions"][0]["code"] == "select_compatible_executable"
+    assert ResearcherConfig.from_path(config_path).executable == str(working.resolve())

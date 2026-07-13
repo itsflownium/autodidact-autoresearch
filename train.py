@@ -604,13 +604,31 @@ def _capture_rng_state(device: torch.device) -> dict[str, Any]:
 
 
 def _restore_rng_state(state: dict[str, Any], device: torch.device) -> None:
+    def cpu_byte_tensor(value: Any, name: str) -> torch.Tensor:
+        if not isinstance(value, torch.Tensor) or value.dtype != torch.uint8:
+            raise TrainingError(f"checkpoint {name} RNG state is not a byte tensor")
+        return value.detach().to(device="cpu").contiguous()
+
+    torch_cpu = cpu_byte_tensor(state["torch_cpu"], "CPU")
+    torch_cuda = None
+    if device.type == "cuda" and "torch_cuda" in state:
+        raw_cuda = state["torch_cuda"]
+        if not isinstance(raw_cuda, (list, tuple)):
+            raise TrainingError("checkpoint CUDA RNG state is not a sequence")
+        torch_cuda = [
+            cpu_byte_tensor(value, f"CUDA device {index}") for index, value in enumerate(raw_cuda)
+        ]
+    torch_mps = None
+    if device.type == "mps" and "torch_mps" in state:
+        torch_mps = cpu_byte_tensor(state["torch_mps"], "MPS")
+
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
-    torch.set_rng_state(state["torch_cpu"])
-    if device.type == "cuda" and "torch_cuda" in state:
-        torch.cuda.set_rng_state_all(state["torch_cuda"])
-    elif device.type == "mps" and "torch_mps" in state and hasattr(torch.mps, "set_rng_state"):
-        torch.mps.set_rng_state(state["torch_mps"])
+    torch.set_rng_state(torch_cpu)
+    if torch_cuda is not None:
+        torch.cuda.set_rng_state_all(torch_cuda)
+    elif torch_mps is not None and hasattr(torch.mps, "set_rng_state"):
+        torch.mps.set_rng_state(torch_mps)
 
 
 def save_checkpoint(
@@ -659,7 +677,9 @@ def save_checkpoint(
 def load_checkpoint_payload(path: Path, device: torch.device) -> dict[str, Any]:
     if not path.is_file():
         raise TrainingError(f"checkpoint does not exist: {path}")
-    payload = torch.load(path, map_location=device, weights_only=False)
+    # RNG APIs require CPU byte tensors. Model and optimizer restoration copy
+    # their CPU-loaded state onto the destination parameters as needed.
+    payload = torch.load(path, map_location="cpu", weights_only=False)
     if payload.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
         raise TrainingError("unsupported checkpoint schema")
     return payload

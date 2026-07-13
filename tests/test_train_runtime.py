@@ -103,6 +103,8 @@ def test_checkpoint_restores_model_optimizer_rng_and_sampler(
     assert fingerprints["checkpoint_state_sha256"] == checkpoint_state_sha256(payload)
     assert len(fingerprints["checkpoint_sha256"]) == 64
     assert len(fingerprints["checkpoint_state_sha256"]) == 64
+    accelerator_payload = load_checkpoint_payload(checkpoint, torch.device("mps"))
+    assert accelerator_payload["rng_state"]["torch_cpu"].device.type == "cpu"
     expected_random = torch.rand(5)
     expected_inputs, expected_targets = batcher.next_batch(2, 16, device=device)
 

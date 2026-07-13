@@ -563,7 +563,7 @@ uv run autodidact-state create \
   --initial-parent "$(git rev-parse HEAD)" \
   --max-proposals 50 \
   --max-wall-seconds 86400 \
-  --max-researcher-tokens 1000000 \
+  --max-researcher-tokens 50000000 \
   --max-training-tokens 1000000000 \
   --max-compute-seconds 86400 \
   --reward-calibration-labels 40 \
@@ -609,7 +609,7 @@ uv run autodidact-orchestrator initialize \
   --campaign-id campaign-local-001 \
   --max-proposals 50 \
   --max-wall-seconds 86400 \
-  --max-researcher-tokens 1000000 \
+  --max-researcher-tokens 50000000 \
   --max-training-tokens 1000000000 \
   --max-compute-seconds 86400 \
   --reward-calibration-labels 40 \
@@ -622,6 +622,12 @@ uv run autodidact-orchestrator pause --reason "finish the active operation"
 uv run autodidact-orchestrator resume
 uv run autodidact-orchestrator cancel --reason "retain evidence and stop"
 ```
+
+The default per-proposal researcher allowance is 1,000,000 tokens. The campaign-level
+`--max-researcher-tokens` limit is shared by every proposal, so size it for the requested proposal
+count or pass a lower `run --researcher-token-allowance` after verifying that the selected agent and
+reasoning effort can complete within that bound. Provider-reported usage above the reserved
+per-proposal allowance is rejected and reported with both counts.
 
 The test suite substitutes a deterministic local proposal command and synthetic paired measurements. It exercises the real worktree, commit, ledger, PatchRCT, reward, state, recovery, and parent-advancement paths without invoking the configured external researcher or performing full model training.
 

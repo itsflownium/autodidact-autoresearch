@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -37,9 +36,20 @@ def _candidate_executables(config: ResearcherConfig) -> list[str]:
     assert config.executable is not None
     name = default_researcher_executable(config.provider)
     candidates = [config.executable]
-    discovered = shutil.which(name)
-    if discovered is not None:
-        candidates.append(discovered)
+    executable_names = [name]
+    if os.name == "nt":
+        executable_names.extend(
+            name + suffix.lower()
+            for suffix in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(os.pathsep)
+            if suffix
+        )
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        root = Path(directory or os.curdir).expanduser()
+        candidates.extend(
+            str(path.resolve())
+            for executable_name in executable_names
+            if (path := root / executable_name).is_file()
+        )
     home = Path.home()
     common = [
         home / ".local" / "bin" / name,
@@ -47,6 +57,15 @@ def _candidate_executables(config: ResearcherConfig) -> list[str]:
         Path("/usr/local/bin") / name,
         Path("/opt/homebrew/bin") / name,
     ]
+    if config.provider is ResearcherProvider.CODEX:
+        common.extend(
+            (
+                home / "Applications" / "ChatGPT.app" / "Contents" / "Resources" / name,
+                home / "Applications" / "Codex.app" / "Contents" / "Resources" / name,
+                Path("/Applications/ChatGPT.app/Contents/Resources") / name,
+                Path("/Applications/Codex.app/Contents/Resources") / name,
+            )
+        )
     if os.name == "nt":
         suffixes = (".exe", ".cmd", ".bat", "")
         roots = [
@@ -59,11 +78,9 @@ def _candidate_executables(config: ResearcherConfig) -> list[str]:
 
 
 def _repair_command(config: ResearcherConfig, probe: dict[str, Any]) -> list[str] | None:
-    installed = probe["resolved_executable"] is not None
     if config.provider is ResearcherProvider.CODEX:
-        if installed:
-            return [str(probe["resolved_executable"]), "--upgrade"]
         return ["npm", "install", "-g", "@openai/codex"]
+    installed = probe["resolved_executable"] is not None
     if config.provider is ResearcherProvider.CLAUDE_CODE:
         if installed:
             return [str(probe["resolved_executable"]), "update"]
