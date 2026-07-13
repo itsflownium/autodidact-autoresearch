@@ -64,7 +64,7 @@ from autodidact.target_plugins import (
     resolve_repository_path,
 )
 
-RUNNER_SCHEMA_VERSION = 1
+RUNNER_SCHEMA_VERSION = 3
 DEFAULT_OUTPUT_ROOT = Path("artifacts/experiments")
 DEFAULT_LEDGER_PATH = Path("artifacts/ledger/experiments.sqlite3")
 MAX_SEED = 2**32 - 1
@@ -1626,7 +1626,10 @@ class PairedExperimentRunner:
                 ],
                 "trial_ids": [trial.trial_id for trial in trials],
             }
-            contract_path = candidate_root / "contract.json"
+            contract_sha256 = _sha256_payload(contract)
+            contract_path = (
+                candidate_root / self.request.stage.value / f"contract-{contract_sha256}.json"
+            )
             if contract_path.is_file():
                 if json.loads(contract_path.read_text(encoding="utf-8")) != contract:
                     raise RunnerError("existing candidate output contract differs")

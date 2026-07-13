@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -397,6 +398,74 @@ def test_end_to_end_runner_records_matched_evidence_and_resumes_idempotently(
     assert repeated == result
     assert processes.training_calls == training_calls
     assert processes.evaluation_calls == evaluation_calls
+
+
+def test_runner_keeps_output_contracts_separate_across_stages_and_seed_batches(
+    prepared_dataset: Path,
+    tmp_path: Path,
+) -> None:
+    repository, parent, candidate_commit = _repository(tmp_path)
+    ledger_path = tmp_path / "ledger.sqlite3"
+    ledger = ExperimentLedger.create(ledger_path, initial_parent_commit=parent)
+    ledger.append(_proposal(parent), writer_role=WriterRole.RESEARCH_AGENT)
+
+    cheap_request = _request(
+        tmp_path,
+        prepared_dataset,
+        repository,
+        ledger_path,
+        candidate_commit,
+        seeds=(11,),
+    )
+    PairedExperimentRunner(
+        cheap_request,
+        process_runner=FakeProcesses(ledger_path=ledger_path, expected_trial_count=1),
+    ).run()
+    candidate = next(
+        event.record for event in ledger.events() if isinstance(event.record, CandidateRecord)
+    )
+    candidate_root = cheap_request.output_root / candidate.candidate_id
+    [cheap_contract_path] = list((candidate_root / "cheap").glob("contract-*.json"))
+    assert json.loads(cheap_contract_path.read_text(encoding="utf-8"))["stage"] == "cheap"
+
+    # Legacy candidates retained one contract at their root. It must not block another stage.
+    legacy_contract_path = candidate_root / "contract.json"
+    cheap_contract_path.replace(legacy_contract_path)
+    intermediate_request = replace(
+        cheap_request,
+        stage=ExperimentStage.INTERMEDIATE,
+        seeds=(11, 23),
+        token_budget=256,
+        eval_tokens=256,
+    )
+
+    result = PairedExperimentRunner(
+        intermediate_request,
+        process_runner=FakeProcesses(ledger_path=ledger_path, expected_trial_count=3),
+    ).run()
+
+    assert len(result["pair_ids"]) == 2
+    assert json.loads(legacy_contract_path.read_text(encoding="utf-8"))["stage"] == "cheap"
+    [intermediate_contract_path] = list((candidate_root / "intermediate").glob("contract-*.json"))
+    intermediate_contract = json.loads(intermediate_contract_path.read_text(encoding="utf-8"))
+    assert intermediate_contract["stage"] == "intermediate"
+    assert intermediate_contract["seeds"] == [11, 23]
+
+    next_seed_request = replace(intermediate_request, seeds=(37,))
+    next_seed_result = PairedExperimentRunner(
+        next_seed_request,
+        process_runner=FakeProcesses(ledger_path=ledger_path, expected_trial_count=4),
+    ).run()
+
+    assert len(next_seed_result["pair_ids"]) == 1
+    intermediate_contracts = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted((candidate_root / "intermediate").glob("contract-*.json"))
+    ]
+    assert sorted(contract["seeds"] for contract in intermediate_contracts) == [
+        [11, 23],
+        [37],
+    ]
 
 
 def test_candidate_preflight_is_recorded_before_controller_schedule(

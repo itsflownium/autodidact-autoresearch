@@ -468,6 +468,15 @@ def test_campaign_resumes_across_calls_promotes_and_starts_from_new_parent(
     assert snapshot.used.researcher_tokens == 40
     assert snapshot.used.training_tokens == 5_600
     assert snapshot.reserved.training_tokens == 0
+    with state._connect() as connection:
+        paired_operation_keys = [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT operation_key FROM operations WHERE kind = 'paired-run'"
+            )
+        ]
+    assert paired_operation_keys
+    assert all(key.startswith("run-v3-") for key in paired_operation_keys)
     assert (tmp_path / "reward" / "model.json").is_file()
     model = json.loads((tmp_path / "reward" / "model.json").read_text(encoding="utf-8"))
     assert model["label_count"] == 2
