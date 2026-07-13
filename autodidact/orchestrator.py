@@ -39,6 +39,7 @@ from autodidact.records import (
     record_to_envelope,
 )
 from autodidact.researcher import (
+    DEFAULT_RESEARCHER_TOKEN_ALLOWANCE,
     ProposalDraft,
     ResearchAttempt,
     ResearcherAdapter,
@@ -93,7 +94,6 @@ DEFAULT_RESEARCHER_CONFIG_PATH = Path("artifacts/control/researcher.json")
 DEFAULT_RESEARCHER_ARTIFACT_ROOT = Path("artifacts/researcher")
 DEFAULT_REWARD_ROOT = Path("artifacts/reward")
 DEFAULT_WORKSPACE_ROOT = Path("artifacts/control/workspaces")
-DEFAULT_RESEARCHER_TOKEN_ALLOWANCE = 50_000
 DEFAULT_PREVIOUS_RESULT_LIMIT = 20
 MAX_CONTROL_TRANSITIONS = 100
 

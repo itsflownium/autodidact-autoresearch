@@ -171,7 +171,7 @@ print(RESPONSE)
     prompt = json.loads(transcript["prompt"])
     assert prompt["program_md"].startswith("# Research contract")
     assert prompt["previous_results"][0]["verdict"] == "rejected"
-    assert prompt["maximum_total_tokens"] == 50_000
+    assert prompt["maximum_total_tokens"] == 1_000_000
     assert prompt["contract"]["evaluation"].startswith("Do not grade")
     assert transcript["response"]["proposal"]["hypothesis"] == (
         "A smaller step should reduce optimization noise."
@@ -294,7 +294,10 @@ print(RESPONSE)
 
     assert attempt.status is ResearchStatus.FAILED
     assert attempt.proposal is None
-    assert attempt.failure_reason == "researcher usage exceeded its assigned token budget"
+    assert attempt.failure_reason == (
+        "researcher usage 110 tokens exceeded assigned token budget 100; increase the "
+        "per-proposal and campaign researcher-token limits"
+    )
 
 
 def test_no_change_response_requires_clean_workspace(tmp_path: Path) -> None:

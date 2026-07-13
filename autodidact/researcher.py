@@ -26,6 +26,7 @@ from autodidact.records import PatchProposal
 
 RESEARCHER_SCHEMA_VERSION = 1
 RESEARCHER_CONFIG_SCHEMA_VERSION = 1
+DEFAULT_RESEARCHER_TOKEN_ALLOWANCE = 1_000_000
 DEFAULT_CONFIG_PATH = Path("artifacts/control/researcher.json")
 DEFAULT_ARTIFACT_ROOT = Path("artifacts/researcher")
 _ID_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
@@ -318,7 +319,7 @@ class ResearchRequest:
     proposal_number: int
     program_text: str
     previous_results: tuple[dict[str, Any], ...]
-    maximum_total_tokens: int = 50_000
+    maximum_total_tokens: int = DEFAULT_RESEARCHER_TOKEN_ALLOWANCE
     allowed_paths: tuple[str, ...] = ("train.py",)
 
     def __post_init__(self) -> None:
@@ -944,7 +945,11 @@ class CommandResearcherAdapter:
 
         if response is not None:
             if response.usage.total_tokens > request.maximum_total_tokens:
-                failure_reason = "researcher usage exceeded its assigned token budget"
+                failure_reason = (
+                    f"researcher usage {response.usage.total_tokens} tokens exceeded assigned "
+                    f"token budget {request.maximum_total_tokens}; increase the per-proposal "
+                    "and campaign researcher-token limits"
+                )
                 response = None
             elif response.status is ResearchStatus.PROPOSED and not changed_paths:
                 failure_reason = "researcher proposed a patch without changing an allowed file"
@@ -1048,7 +1053,10 @@ def _load_request(path: Path) -> ResearchRequest:
         proposal_number=value["proposal_number"],
         program_text=program_text,
         previous_results=tuple(previous),
-        maximum_total_tokens=value.get("maximum_total_tokens", 50_000),
+        maximum_total_tokens=value.get(
+            "maximum_total_tokens",
+            DEFAULT_RESEARCHER_TOKEN_ALLOWANCE,
+        ),
         allowed_paths=tuple(allowed),
     )
 
