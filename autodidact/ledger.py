@@ -12,13 +12,14 @@ import sqlite3
 import statistics
 import sys
 import tempfile
-from collections import Counter
+from collections import Counter, OrderedDict
 from collections.abc import Iterable, Sequence
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from autodidact.data.integrity import canonical_json_bytes
@@ -274,6 +275,11 @@ class _VerifiedSnapshot:
     events: tuple[LedgerEvent, ...]
 
 
+_SHARED_SNAPSHOT_LIMIT = 8
+_SHARED_SNAPSHOTS: OrderedDict[Path, _VerifiedSnapshot] = OrderedDict()
+_SHARED_SNAPSHOTS_LOCK = RLock()
+
+
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -435,7 +441,7 @@ class ExperimentLedger:
         if not resolved.is_file():
             raise LedgerError(f"ledger does not exist: {resolved}")
         ledger = cls(resolved, read_only=read_only)
-        ledger.verify()
+        ledger._verify_for_open()
         return ledger
 
     @classmethod
@@ -527,37 +533,82 @@ class ExperimentLedger:
             None if verification.event_count == 0 else verification.head_event_sha256,
         )
         if before != after or revision != expected_revision:
-            self._verified_snapshot = None
+            self._forget_verified_snapshot()
             return
-        self._verified_snapshot = _VerifiedSnapshot(
-            revision=revision,
-            storage_fingerprint=after,
-            verification=verification,
-            events=tuple(events),
+        self._share_verified_snapshot(
+            _VerifiedSnapshot(
+                revision=revision,
+                storage_fingerprint=after,
+                verification=verification,
+                events=tuple(events),
+            )
         )
+
+    def _share_verified_snapshot(self, snapshot: _VerifiedSnapshot) -> None:
+        self._verified_snapshot = snapshot
+        with _SHARED_SNAPSHOTS_LOCK:
+            _SHARED_SNAPSHOTS[self.path] = snapshot
+            _SHARED_SNAPSHOTS.move_to_end(self.path)
+            while len(_SHARED_SNAPSHOTS) > _SHARED_SNAPSHOT_LIMIT:
+                _SHARED_SNAPSHOTS.popitem(last=False)
+
+    def _forget_verified_snapshot(self) -> None:
+        self._verified_snapshot = None
+        with _SHARED_SNAPSHOTS_LOCK:
+            _SHARED_SNAPSHOTS.pop(self.path, None)
+
+    def _snapshot_candidates(self) -> tuple[_VerifiedSnapshot, ...]:
+        with _SHARED_SNAPSHOTS_LOCK:
+            shared = _SHARED_SNAPSHOTS.get(self.path)
+            if shared is not None:
+                _SHARED_SNAPSHOTS.move_to_end(self.path)
+        candidates = {
+            (snapshot.revision, snapshot.storage_fingerprint): snapshot
+            for snapshot in (self._verified_snapshot, shared)
+            if snapshot is not None
+        }
+        return tuple(
+            sorted(
+                candidates.values(),
+                key=lambda snapshot: snapshot.revision[0],
+                reverse=True,
+            )
+        )
+
+    def _verify_for_open(self) -> LedgerVerification:
+        connection = self._connect()
+        try:
+            verification, _events = self._verified_connection(connection)
+            return verification
+        finally:
+            connection.close()
+            self._refresh_snapshot_fingerprint()
 
     def _refresh_snapshot_fingerprint(self) -> None:
         cached = self._verified_snapshot
         if cached is None:
             return
-        self._verified_snapshot = _VerifiedSnapshot(
-            revision=cached.revision,
-            storage_fingerprint=self._storage_fingerprint(),
-            verification=cached.verification,
-            events=cached.events,
+        self._share_verified_snapshot(
+            _VerifiedSnapshot(
+                revision=cached.revision,
+                storage_fingerprint=self._storage_fingerprint(),
+                verification=cached.verification,
+                events=cached.events,
+            )
         )
 
     def _verified_connection(
         self,
         connection: sqlite3.Connection,
     ) -> tuple[LedgerVerification, list[LedgerEvent]]:
-        # Reuse only an unchanged, fully verified immutable ledger prefix.
-        cached = self._verified_snapshot
-        if cached is not None:
+        # Share fully verified snapshots across short-lived protected runner
+        # instances, but only while both storage and immutable revision match.
+        for cached in self._snapshot_candidates():
             before = self._storage_fingerprint()
             revision = self._raw_revision(connection)
             after = self._storage_fingerprint()
             if before == after == cached.storage_fingerprint and revision == cached.revision:
+                self._verified_snapshot = cached
                 return cached.verification, list(cached.events)
         verification, events = self._verify_connection(connection)
         self._remember_verified_snapshot(connection, verification, events)
@@ -900,7 +951,7 @@ class ExperimentLedger:
             return tuple(appended)
         except Exception:
             connection.rollback()
-            self._verified_snapshot = None
+            self._forget_verified_snapshot()
             raise
         finally:
             connection.close()
