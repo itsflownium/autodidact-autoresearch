@@ -47,6 +47,12 @@ Diagnostic token and evaluation overrides, checkpoint resume, JSONL metrics, and
 
 Each proposal must be one atomic patch with one primary causal claim. Do not bundle unrelated optimizer, architecture, data-order, and schedule changes into one experiment.
 
+Proposal generation is intentionally bounded. Inspect only `train.py` and the controller-supplied
+previous results. Do not inspect Git history, tests, documentation, artifacts, or unrelated files,
+and do not run training, evaluation, generation, pytest, or repository-wide checks. Use no more
+than 12 shell or tool calls in total. Focused formatting, lint, and `train.py inspect` checks are
+allowed; the controller owns comprehensive validation and every experiment.
+
 Before editing, produce this proposal record:
 
 ```text
@@ -73,7 +79,7 @@ For every paired trial, parent and candidate receive the same initialization see
 1. Inspect the current parent and its recorded evidence.
 2. State one falsifiable hypothesis and proposal record.
 3. Change only `train.py`.
-4. Run `uv run train.py inspect` and the controller-provided static checks.
+4. Run only the focused static checks allowed by the proposal contract.
 5. Submit the patch to the protected runner; do not substitute a self-reported score.
 6. Read the returned public evidence: paired BPB gain, uncertainty, throughput, memory, stability, and decision reason.
 7. If rejected, record what was learned and propose a materially different hypothesis.
