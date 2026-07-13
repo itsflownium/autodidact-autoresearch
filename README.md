@@ -1,5 +1,7 @@
 # autodidact
 
+website to test out autodidact: https://researchautodidact.vercel.app/
+
 The idea: give an AI research agent a small but real language-model training setup and let it improve the model autonomously. The agent proposes a focused change, trains it against the current parent under matched conditions, and receives a decision: reject it, gather more evidence, or promote it.
 
 Autodidact starts with a **1,016,960-parameter transformer** that can run locally on Apple Silicon. Larger studies can move to a single H100 without changing the research protocol. The target is not a frontier language model. It is a controlled laboratory for asking a more basic question:
