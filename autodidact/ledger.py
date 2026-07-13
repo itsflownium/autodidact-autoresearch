@@ -65,6 +65,9 @@ _GIT_COMMIT_PATTERN = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _HOME_PATH_PATTERN = re.compile(r"(?<![A-Za-z0-9])/(?:Users|home)/[^/\s\"']+")
 _WINDOWS_HOME_PATTERN = re.compile(r"[A-Za-z]:\\Users\\[^\\\s\"']+")
 
+_FileFingerprint = tuple[str] | tuple[str, int, int, int, int, int, str]
+_StorageFingerprint = tuple[_FileFingerprint, ...]
+
 _STAGE_ORDER = {
     ExperimentStage.CHEAP: 0,
     ExperimentStage.INTERMEDIATE: 1,
@@ -266,13 +269,21 @@ class LedgerVerification:
 @dataclass(frozen=True, slots=True)
 class _VerifiedSnapshot:
     revision: tuple[int, str | None]
-    storage_fingerprint: tuple[tuple[str, int, int, int, int, int] | tuple[str], ...]
+    storage_fingerprint: _StorageFingerprint
     verification: LedgerVerification
     events: tuple[LedgerEvent, ...]
 
 
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _validate_timestamp(value: str) -> None:
@@ -476,11 +487,9 @@ class ExperimentLedger:
         ).fetchone()
         return int(row[0]), None if row[1] is None else str(row[1])
 
-    def _storage_fingerprint(
-        self,
-    ) -> tuple[tuple[str, int, int, int, int, int] | tuple[str], ...]:
+    def _storage_fingerprint(self) -> _StorageFingerprint:
         # SQLite may create and remove an empty WAL around read-only connections.
-        result: list[tuple[str, int, int, int, int, int] | tuple[str]] = []
+        result: list[_FileFingerprint] = []
         for suffix in ("", "-wal"):
             candidate = Path(str(self.path) + suffix)
             try:
@@ -499,6 +508,7 @@ class ExperimentLedger:
                     stat.st_size,
                     stat.st_mtime_ns,
                     stat.st_ctime_ns,
+                    _file_sha256(candidate),
                 )
             )
         return tuple(result)
