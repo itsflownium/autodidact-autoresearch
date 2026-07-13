@@ -66,6 +66,7 @@ from autodidact.reward import (
 from autodidact.runner import (
     DEFAULT_LEDGER_PATH,
     DEFAULT_OUTPUT_ROOT,
+    RUNNER_SCHEMA_VERSION,
     ExperimentRequest,
     PairedExperimentRunner,
     RunnerError,
@@ -984,7 +985,7 @@ class AutonomousResearchOrchestrator:
         candidate: CandidateRecord,
         schedule: TrialSchedule,
     ) -> dict[str, Any]:
-        operation_key = f"run-{schedule.schedule_id}"
+        operation_key = f"run-v{RUNNER_SCHEMA_VERSION}-{schedule.schedule_id}"
         claim = self.state.begin_operation(
             operation_key,
             "paired-run",
