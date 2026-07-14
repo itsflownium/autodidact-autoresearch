@@ -1,0 +1,69 @@
+diff --git a/train.py b/train.py
+index a3838f6..f9850bf 100644
+--- a/train.py
++++ b/train.py
+@@ -50,8 +50,9 @@ class ModelConfig:
+     context_length: int = 256
+     num_layers: int = 4
+     model_width: int = 128
++    embedding_width: int = 96
+     num_heads: int = 4
+-    mlp_width: int = 512
++    mlp_width: int = 544
+     rope_base: float = 10_000.0
+     layer_norm_epsilon: float = 1e-5
+     dropout: float = 0.0
+@@ -69,6 +70,8 @@ class ModelConfig:
+             raise ValueError("context_length must be positive")
+         if self.vocab_size <= 0:
+             raise ValueError("vocab_size must be positive")
++        if self.embedding_width <= 0:
++            raise ValueError("embedding_width must be positive")
+         if not 0.0 <= self.dropout < 1.0:
+             raise ValueError("dropout must be in [0, 1)")
+ 
+@@ -227,16 +230,29 @@ class TransformerLM(nn.Module):
+         config = config or ModelConfig()
+         config.validate()
+         self.config = config
+-        self.token_embedding = nn.Embedding(config.vocab_size, config.model_width)
++        self.token_embedding = nn.Embedding(config.vocab_size, config.embedding_width)
++        self.input_projection = nn.Linear(
++            config.embedding_width,
++            config.model_width,
++            bias=False,
++        )
+         self.blocks = nn.ModuleList(TransformerBlock(config) for _ in range(config.num_layers))
+         self.final_norm = WeightOnlyLayerNorm(
+             config.model_width,
+             config.layer_norm_epsilon,
+         )
+-        self.output = nn.Linear(config.model_width, config.vocab_size, bias=False)
++        self.output_projection = nn.Linear(
++            config.model_width,
++            config.embedding_width,
++            bias=False,
++        )
++        self.output = nn.Linear(config.embedding_width, config.vocab_size, bias=False)
+ 
+         self.apply(self._initialize_weights)
+         self.output.weight = self.token_embedding.weight
++        projection_gain = math.sqrt(config.model_width / config.embedding_width)
++        nn.init.orthogonal_(self.input_projection.weight, gain=projection_gain)
++        nn.init.orthogonal_(self.output_projection.weight, gain=projection_gain)
+         residual_std = 0.02 / math.sqrt(2 * config.num_layers)
+         for block in self.blocks:
+             nn.init.normal_(block.attention.output.weight, mean=0.0, std=residual_std)
+@@ -259,10 +275,10 @@ class TransformerLM(nn.Module):
+                 f"sequence length {token_ids.size(1)} exceeds "
+                 f"context length {self.config.context_length}"
+             )
+-        hidden = self.token_embedding(token_ids)
++        hidden = self.input_projection(self.token_embedding(token_ids))
+         for block in self.blocks:
+             hidden = block(hidden)
+-        logits = self.output(self.final_norm(hidden))
++        logits = self.output(self.output_projection(self.final_norm(hidden)))
+         loss = None
+         if targets is not None:
+             if targets.shape != token_ids.shape:

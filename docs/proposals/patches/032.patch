@@ -1,0 +1,34 @@
+diff --git a/train.py b/train.py
+index a3838f6..4caba98 100644
+--- a/train.py
++++ b/train.py
+@@ -32,7 +32,7 @@ from autodidact.data.config import END_OF_TEXT_TOKEN, default_output_root
+ from autodidact.data.integrity import verify_dataset
+ from autodidact.data.reader import PreparedSplit
+ 
+-EXPECTED_PARAMETER_COUNT = 1_016_960
++EXPECTED_PARAMETER_COUNT = 1_017_088
+ MAX_PARAMETER_COUNT = 1_050_000
+ CHECKPOINT_SCHEMA_VERSION = 2
+ METRICS_SCHEMA_VERSION = 1
+@@ -228,6 +228,7 @@ class TransformerLM(nn.Module):
+         config.validate()
+         self.config = config
+         self.token_embedding = nn.Embedding(config.vocab_size, config.model_width)
++        self.prefix_embedding = nn.Embedding(1, config.model_width)
+         self.blocks = nn.ModuleList(TransformerBlock(config) for _ in range(config.num_layers))
+         self.final_norm = WeightOnlyLayerNorm(
+             config.model_width,
+@@ -260,9 +261,11 @@ class TransformerLM(nn.Module):
+                 f"context length {self.config.context_length}"
+             )
+         hidden = self.token_embedding(token_ids)
++        prefix = self.prefix_embedding.weight.expand(token_ids.size(0), -1, -1)
++        hidden = torch.cat((prefix, hidden), dim=1)
+         for block in self.blocks:
+             hidden = block(hidden)
+-        logits = self.output(self.final_norm(hidden))
++        logits = self.output(self.final_norm(hidden[:, 1:]))
+         loss = None
+         if targets is not None:
+             if targets.shape != token_ids.shape:

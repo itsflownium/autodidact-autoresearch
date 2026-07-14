@@ -1,0 +1,13 @@
+diff --git a/train.py b/train.py
+index a3838f6..0dc17ca 100644
+--- a/train.py
++++ b/train.py
+@@ -498,7 +498,7 @@ def build_optimizer(
+             {"params": no_decay, "weight_decay": 0.0},
+         ],
+         lr=learning_rate,
+-        betas=(0.9, 0.95),
++        betas=(0.9, 0.98),
+         eps=1e-8,
+     )
+ 

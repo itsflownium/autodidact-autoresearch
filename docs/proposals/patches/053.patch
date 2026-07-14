@@ -1,0 +1,61 @@
+diff --git a/train.py b/train.py
+index a3838f6..8811fa7 100644
+--- a/train.py
++++ b/train.py
+@@ -55,6 +55,8 @@ class ModelConfig:
+     rope_base: float = 10_000.0
+     layer_norm_epsilon: float = 1e-5
+     dropout: float = 0.0
++    auxiliary_loss_weight: float = 0.1
++    auxiliary_loss_stride: int = 4
+ 
+     @property
+     def head_dim(self) -> int:
+@@ -71,6 +73,10 @@ class ModelConfig:
+             raise ValueError("vocab_size must be positive")
+         if not 0.0 <= self.dropout < 1.0:
+             raise ValueError("dropout must be in [0, 1)")
++        if self.auxiliary_loss_weight < 0.0:
++            raise ValueError("auxiliary_loss_weight must be non-negative")
++        if self.auxiliary_loss_stride <= 0:
++            raise ValueError("auxiliary_loss_stride must be positive")
+ 
+ 
+ @dataclass(frozen=True)
+@@ -260,8 +266,12 @@ class TransformerLM(nn.Module):
+                 f"context length {self.config.context_length}"
+             )
+         hidden = self.token_embedding(token_ids)
+-        for block in self.blocks:
++        auxiliary_hidden = None
++        auxiliary_layer = len(self.blocks) // 2 - 1
++        for layer, block in enumerate(self.blocks):
+             hidden = block(hidden)
++            if targets is not None and layer == auxiliary_layer:
++                auxiliary_hidden = hidden
+         logits = self.output(self.final_norm(hidden))
+         loss = None
+         if targets is not None:
+@@ -272,6 +282,22 @@ class TransformerLM(nn.Module):
+                 targets.reshape(-1),
+                 ignore_index=-100,
+             )
++            if (
++                self.config.auxiliary_loss_weight
++                and auxiliary_hidden is not None
++                and auxiliary_hidden.size(1) >= self.config.auxiliary_loss_stride
++            ):
++                stride = self.config.auxiliary_loss_stride
++                auxiliary_logits = self.output(
++                    self.final_norm(auxiliary_hidden[:, stride - 1 :: stride])
++                )
++                auxiliary_targets = targets[:, stride - 1 :: stride]
++                auxiliary_loss = F.cross_entropy(
++                    auxiliary_logits.reshape(-1, auxiliary_logits.size(-1)),
++                    auxiliary_targets.reshape(-1),
++                    ignore_index=-100,
++                )
++                loss = loss + self.config.auxiliary_loss_weight * auxiliary_loss
+         return logits, loss
+ 
+ 
