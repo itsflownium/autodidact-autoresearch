@@ -1,0 +1,13 @@
+diff --git a/train.py b/train.py
+index a3838f6..fde91ba 100644
+--- a/train.py
++++ b/train.py
+@@ -1301,7 +1301,7 @@ def build_parser() -> argparse.ArgumentParser:
+     train.add_argument("--minimum-learning-rate", type=float, default=1e-4)
+     train.add_argument("--warmup-ratio", type=float, default=0.05)
+     train.add_argument("--weight-decay", type=float, default=0.1)
+-    train.add_argument("--grad-clip", type=float, default=1.0)
++    train.add_argument("--grad-clip", type=float, default=2.0)
+     train.add_argument("--log-every-tokens", type=int)
+     train.add_argument("--checkpoint-every-tokens", type=int)
+     train.add_argument("--checkpoint-out", type=_path)
