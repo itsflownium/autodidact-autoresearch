@@ -354,9 +354,8 @@ class AutonomousResearchOrchestrator:
             self.state.snapshot().limits,
             repository_root=self.repository_root,
         )
-        if (
-            self.execution_queue is not None
-            and self.state.snapshot().limits.max_proposals > len(self.execution_queue.items)
+        if self.execution_queue is not None and self.state.snapshot().limits.max_proposals > len(
+            self.execution_queue.items
         ):
             raise OrchestratorError(
                 "campaign max_proposals exceeds the configured execution queue length"
@@ -1525,9 +1524,7 @@ def _config_from_args(args: argparse.Namespace) -> OrchestratorConfig:
         target_metric_name=("validation_bpb" if plugin is None else plugin.metric.name),
         target_metric_direction=("lower" if plugin is None else plugin.metric.direction.value),
         execution_queue_path=(
-            None
-            if args.execution_queue is None
-            else args.execution_queue.expanduser().resolve()
+            None if args.execution_queue is None else args.execution_queue.expanduser().resolve()
         ),
         researcher_token_allowance=getattr(
             args,

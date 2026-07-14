@@ -419,13 +419,7 @@ def _queued_repository(tmp_path: Path) -> tuple[Path, str, Path]:
     _git(repository, "init", "-b", "main")
     _git(repository, "config", "user.name", "Test User")
     _git(repository, "config", "user.email", "test@example.com")
-    baseline = (
-        "SLOT_ONE = False\n"
-        "FILLER_A = 0\n"
-        "FILLER_B = 0\n"
-        "FILLER_C = 0\n"
-        "SLOT_TWO = False\n"
-    )
+    baseline = "SLOT_ONE = False\nFILLER_A = 0\nFILLER_B = 0\nFILLER_C = 0\nSLOT_TWO = False\n"
     train_path = repository / "train.py"
     train_path.write_text(baseline, encoding="utf-8")
     (repository / "program.md").write_text(
@@ -539,7 +533,7 @@ def _queued_repository(tmp_path: Path) -> tuple[Path, str, Path]:
 def _queued_researcher(tmp_path: Path) -> CommandResearcherAdapter:
     script = tmp_path / "queued_researcher.py"
     script.write_text(
-        f'''
+        f"""
 import json
 import subprocess
 import sys
@@ -563,7 +557,7 @@ print(json.dumps({{
     "status": "proposed",
     "usage": {{"input_tokens": 2, "output_tokens": 2}},
 }}, sort_keys=True))
-''',
+""",
         encoding="utf-8",
     )
     return CommandResearcherAdapter(
@@ -718,9 +712,7 @@ def test_campaign_resumes_across_calls_promotes_and_starts_from_new_parent(
 def test_execution_queue_adapts_to_promoted_parent_and_replays_after_reopen(
     tmp_path: Path,
 ) -> None:
-    orchestrator, state, ledger, factory, repository, queue_path = _queued_campaign(
-        tmp_path
-    )
+    orchestrator, state, ledger, factory, repository, queue_path = _queued_campaign(tmp_path)
     initial_parent = ledger.current_parent()
 
     first = orchestrator.run(max_new_proposals=1)
@@ -766,11 +758,9 @@ def test_execution_queue_adapts_to_promoted_parent_and_replays_after_reopen(
     assert "SLOT_TWO = True" in final_train
 
     transcript = json.loads(
-        (
-            tmp_path
-            / "queued-researcher-artifacts"
-            / "research-campaign-queue-001-2.json"
-        ).read_text(encoding="utf-8")
+        (tmp_path / "queued-researcher-artifacts" / "research-campaign-queue-001-2.json").read_text(
+            encoding="utf-8"
+        )
     )
     prompt = json.loads(transcript["prompt"])
     program = prompt["program_md"]
