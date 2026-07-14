@@ -11,6 +11,7 @@ import pytest
 from autodidact.checkpoints import file_sha256
 from autodidact.controller import PatchRCTPolicy
 from autodidact.data.integrity import policy_sha256
+from autodidact.execution_queue import QUEUE_ASSIGNMENT_MARKER, ExecutionQueue
 from autodidact.ledger import ExperimentLedger, WriterRole
 from autodidact.orchestrator import (
     AutonomousResearchOrchestrator,
@@ -412,6 +413,213 @@ def _campaign(
     return orchestrator, state, ledger, factory, repository
 
 
+def _queued_repository(tmp_path: Path) -> tuple[Path, str, Path]:
+    repository = tmp_path / "queued-repository"
+    repository.mkdir()
+    _git(repository, "init", "-b", "main")
+    _git(repository, "config", "user.name", "Test User")
+    _git(repository, "config", "user.email", "test@example.com")
+    baseline = "SLOT_ONE = False\nFILLER_A = 0\nFILLER_B = 0\nFILLER_C = 0\nSLOT_TWO = False\n"
+    train_path = repository / "train.py"
+    train_path.write_text(baseline, encoding="utf-8")
+    (repository / "program.md").write_text(
+        "Apply the assigned execution-queue hypothesis.\n",
+        encoding="utf-8",
+    )
+    _git(repository, "add", "train.py", "program.md")
+    _git(repository, "commit", "-m", "Add queued research parent")
+    parent = _git(repository, "rev-parse", "HEAD")
+
+    proposal_root = repository / "docs" / "proposals"
+    patch_root = proposal_root / "test-patches"
+    patch_root.mkdir(parents=True)
+    proposals = []
+    patch_metadata = []
+    for number, slot in ((1, "SLOT_ONE"), (2, "SLOT_TWO")):
+        train_path.write_text(
+            baseline.replace(f"{slot} = False", f"{slot} = True"),
+            encoding="utf-8",
+        )
+        patch = _git(repository, "diff", "--binary", "HEAD", "--", "train.py") + "\n"
+        train_path.write_text(baseline, encoding="utf-8")
+        relative_patch = f"docs/proposals/test-patches/proposal-{number:02d}.diff"
+        patch_path = repository / relative_patch
+        patch_path.write_text(patch, encoding="utf-8")
+        patch_sha256 = file_sha256(patch_path)
+        proposal = {
+            "change": f"Set {slot} to true.",
+            "diff_sha256": patch_sha256,
+            "expected_effect_bpb": -0.01,
+            "experimental_status": "queued_unmeasured",
+            "failure_signal": "Synthetic paired BPB does not improve.",
+            "hypothesis": f"Enabling {slot} should improve synthetic BPB.",
+            "interaction_risk": "The other independent test slot may already be enabled.",
+            "mechanism": "Exercise fixed-parent patch adaptation.",
+            "minimum_useful_gain_bpb": 0.001,
+            "parent_commit": parent,
+            "patch_path": relative_patch,
+            "proposal_number": number,
+            "resource_risk": "No synthetic resource change.",
+            "title": f"Enable test slot {number}",
+            "training_performed": False,
+        }
+        proposals.append(proposal)
+        patch_metadata.append((relative_patch, patch_sha256))
+
+    manifest_relative = "docs/proposals/test-bank.json"
+    (repository / manifest_relative).write_text(
+        json.dumps(
+            {
+                "experimental_status": "queued_unmeasured",
+                "frozen_parent_commit": parent,
+                "proposal_count": 2,
+                "proposals": proposals,
+                "training_performed": False,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    queue_path = proposal_root / "execution-queue.json"
+    queue_path.write_text(
+        json.dumps(
+            {
+                "conflict_groups": [
+                    {
+                        "group_id": "test-slots",
+                        "label": "Synthetic independent slots",
+                        "members": [1, 2],
+                        "rationale": "Both patches exercise ordered adaptation to a new parent.",
+                        "severity": "interaction",
+                    }
+                ],
+                "evidence_status": "queued_unmeasured",
+                "frozen_parent_commit": parent,
+                "items": [
+                    {
+                        "adaptation_risk": "low",
+                        "conflict_groups": ["test-slots"],
+                        "patch_path": patch_metadata[number - 1][0],
+                        "patch_sha256": patch_metadata[number - 1][1],
+                        "priority_reason": f"Synthetic queue rank {number}.",
+                        "proposal_number": number,
+                        "rank": number,
+                        "resource_risk": "low",
+                        "source_manifest": manifest_relative,
+                        "tier": "screen",
+                    }
+                    for number in (1, 2)
+                ],
+                "objective": "Exercise ordered patch adaptation and recovery.",
+                "queue_id": "test-execution-queue-v1",
+                "ranking_policy": {
+                    "principles": ["Use deterministic proposal-number order."],
+                    "tie_breaker": "Lower proposal number first.",
+                },
+                "schema_version": 1,
+                "source_banks": [manifest_relative],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return repository, parent, queue_path
+
+
+def _queued_researcher(tmp_path: Path) -> CommandResearcherAdapter:
+    script = tmp_path / "queued_researcher.py"
+    script.write_text(
+        f"""
+import json
+import subprocess
+import sys
+
+request = json.load(sys.stdin)
+program = request["program_md"]
+start = "<!-- {QUEUE_ASSIGNMENT_MARKER}:START -->"
+end = "<!-- {QUEUE_ASSIGNMENT_MARKER}:END -->"
+block = program.split(start, 1)[1].split(end, 1)[0]
+assignment = json.loads(block.split("```json", 1)[1].split("```", 1)[0])
+subprocess.run(
+    ["git", "apply", "--3way", "-"],
+    input=assignment["patch"],
+    text=True,
+    capture_output=True,
+    check=True,
+)
+print(json.dumps({{
+    "failure_reason": None,
+    "proposal": assignment["proposal"],
+    "status": "proposed",
+    "usage": {{"input_tokens": 2, "output_tokens": 2}},
+}}, sort_keys=True))
+""",
+        encoding="utf-8",
+    )
+    return CommandResearcherAdapter(
+        ResearcherConfig(command=(sys.executable, str(script)), timeout_seconds=5)
+    )
+
+
+def _queued_campaign(
+    tmp_path: Path,
+) -> tuple[
+    AutonomousResearchOrchestrator,
+    CampaignStore,
+    ExperimentLedger,
+    SyntheticRunnerFactory,
+    Path,
+    Path,
+]:
+    repository, parent, queue_path = _queued_repository(tmp_path)
+    queue = ExecutionQueue.from_path(queue_path, repository_root=repository)
+    ledger_path = tmp_path / "queued-ledger.sqlite3"
+    state_path = tmp_path / "queued-campaign.sqlite3"
+    ledger = ExperimentLedger.create(ledger_path, initial_parent_commit=parent)
+    state = CampaignStore.create(
+        state_path,
+        campaign_id="campaign-queue-001",
+        initial_parent_commit=parent,
+        limits=CampaignLimits(
+            max_proposals=2,
+            max_wall_seconds=3_600,
+            max_researcher_tokens=1_000,
+            max_training_tokens=100_000,
+            max_compute_seconds=10_000,
+            execution_queue_id=queue.queue_id,
+            execution_queue_path=queue_path.relative_to(repository).as_posix(),
+            execution_queue_sha256=queue.summary()["queue_sha256"],
+        ),
+    )
+    factory = SyntheticRunnerFactory(0.05)
+    orchestrator = AutonomousResearchOrchestrator(
+        OrchestratorConfig(
+            repository_root=repository,
+            ledger_path=ledger_path,
+            data_root=tmp_path / "unused-data",
+            output_root=tmp_path / "queued-experiment-artifacts",
+            workspace_root=tmp_path / "queued-workspaces",
+            researcher_artifact_root=tmp_path / "queued-researcher-artifacts",
+            reward_root=tmp_path / "queued-reward",
+            program_path=repository / "program.md",
+            execution_queue_path=queue_path,
+            accepted_ref="refs/autodidact/test-queue-accepted",
+            device="cpu",
+            researcher_token_allowance=100,
+        ),
+        state=state,
+        ledger=ledger,
+        researcher=_queued_researcher(tmp_path),
+        policy=_policy(),
+        runner_factory=factory,
+    )
+    return orchestrator, state, ledger, factory, repository, queue_path
+
+
 def test_campaign_resumes_across_calls_promotes_and_starts_from_new_parent(
     tmp_path: Path,
 ) -> None:
@@ -499,6 +707,91 @@ def test_campaign_resumes_across_calls_promotes_and_starts_from_new_parent(
     assert replay["status"] == "completed"
     assert replay["outcomes"] == []
     assert factory.run_calls == calls_before_replay
+
+
+def test_execution_queue_adapts_to_promoted_parent_and_replays_after_reopen(
+    tmp_path: Path,
+) -> None:
+    orchestrator, state, ledger, factory, repository, queue_path = _queued_campaign(tmp_path)
+    initial_parent = ledger.current_parent()
+
+    first = orchestrator.run(max_new_proposals=1)
+    first_parent = ledger.current_parent()
+
+    assert first["status"] == "running"
+    assert first["execution_queue"]["item_count"] == 2
+    assert first_parent != initial_parent
+    assert state.snapshot().generation == 1
+
+    reopened_state = CampaignStore.open(state.path)
+    reopened_ledger = ExperimentLedger.open(ledger.path, read_only=False)
+    reopened = AutonomousResearchOrchestrator(
+        OrchestratorConfig(
+            repository_root=repository,
+            ledger_path=ledger.path,
+            data_root=tmp_path / "unused-data",
+            output_root=tmp_path / "queued-experiment-artifacts",
+            workspace_root=tmp_path / "queued-workspaces",
+            researcher_artifact_root=tmp_path / "queued-researcher-artifacts",
+            reward_root=tmp_path / "queued-reward",
+            program_path=repository / "program.md",
+            execution_queue_path=queue_path,
+            accepted_ref="refs/autodidact/test-queue-accepted",
+            device="cpu",
+            researcher_token_allowance=100,
+        ),
+        state=reopened_state,
+        ledger=reopened_ledger,
+        researcher=_queued_researcher(tmp_path),
+        policy=_policy(),
+        runner_factory=factory,
+    )
+
+    second = reopened.run()
+
+    assert second["status"] == "completed"
+    assert second["generation"] == 2
+    final_parent = reopened_ledger.current_parent()
+    assert _git(repository, "rev-parse", "refs/autodidact/test-queue-accepted") == final_parent
+    final_train = _git(repository, "show", f"{final_parent}:train.py")
+    assert "SLOT_ONE = True" in final_train
+    assert "SLOT_TWO = True" in final_train
+
+    transcript = json.loads(
+        (tmp_path / "queued-researcher-artifacts" / "research-campaign-queue-001-2.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    prompt = json.loads(transcript["prompt"])
+    program = prompt["program_md"]
+    start = f"<!-- {QUEUE_ASSIGNMENT_MARKER}:START -->"
+    end = f"<!-- {QUEUE_ASSIGNMENT_MARKER}:END -->"
+    block = program.split(start, 1)[1].split(end, 1)[0]
+    assignment = json.loads(block.split("```json", 1)[1].split("```", 1)[0])
+    assert assignment["proposal_number"] == 2
+    assert assignment["source_parent_commit"] == initial_parent
+    assert assignment["current_parent_commit"] == first_parent
+    assert assignment["adaptation_required"] is True
+
+    manifests = [
+        event.record
+        for event in reopened_ledger.events()
+        if isinstance(event.record, ArtifactManifest)
+    ]
+    assert manifests
+    assert all(
+        (tmp_path / "queued-experiment-artifacts" / artifact.relative_path).is_file()
+        for manifest in manifests
+        for artifact in manifest.artifacts
+    )
+
+    calls_before_replay = list(factory.run_calls)
+    event_head_before_replay = reopened_ledger.verify().head_event_sha256
+    replay = reopened.run()
+    assert replay["status"] == "completed"
+    assert replay["outcomes"] == []
+    assert factory.run_calls == calls_before_replay
+    assert reopened_ledger.verify().head_event_sha256 == event_head_before_replay
 
 
 def test_bad_patch_is_rejected_without_advancing_parent(tmp_path: Path) -> None:

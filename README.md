@@ -10,7 +10,7 @@ Autodidact starts with a **1,016,960-parameter transformer** that can run locall
 
 Autodidact builds on the compact workflow introduced by [Karpathy's autoresearch](https://github.com/karpathy/autoresearch), then adds **PatchRCT**, paired experiments, hidden evaluation, and Bayesian downstream-reward estimation.
 
-> **Status:** the immutable data system, 1,016,960-parameter baseline, local noise calibration, protected paired runner, PatchRCT controller, downstream-reward estimator and allocation policy, generic researcher adapter, durable recovery state, autonomous orchestration loop, general target-plugin contract, isolated three-arm study harness, and frozen sealed-evaluation/reporting workflow are implemented. The three-seed, 20M-token parent baseline is complete. The real patch campaign, 40-label reward calibration, three-arm pilot, and sealed evaluation have not run, and no candidate-patch improvement is claimed.
+> **Status:** the immutable data system, 1,016,960-parameter baseline, local noise calibration, protected paired runner, PatchRCT controller, downstream-reward estimator and allocation policy, generic researcher adapter, durable recovery state, autonomous orchestration loop, validated 60-patch execution queue, general target-plugin contract, isolated three-arm study harness, and frozen sealed-evaluation/reporting workflow are implemented. The three-seed, 20M-token parent baseline and a tiny queue-orchestration smoke test are complete. The real patch campaign, 40-label reward calibration, three-arm pilot, and sealed evaluation have not run, and no candidate-patch improvement is claimed.
 
 ## How it works
 
@@ -588,7 +588,7 @@ For each proposal, the orchestrator:
 
 1. reserves proposal and researcher-token budget;
 2. creates a detached workspace at the accepted parent;
-3. supplies `program.md`, prior terminal results, and the `train.py`-only edit scope;
+3. supplies `program.md`, prior terminal results, the `train.py`-only edit scope, and any protected execution-queue assignment;
 4. validates the structured hypothesis and minimum useful BPB gain;
 5. creates one direct candidate commit and a retained candidate Git ref;
 6. appends the proposal, performs protected model inspection, and registers the candidate;
@@ -604,10 +604,30 @@ With `--use-downstream-allocation`, reaching the calibration target switches lat
 
 Every external invocation and paired schedule has a deterministic operation key. Completed operations replay their retained result. After a process restart, interrupted researcher calls are recovered from verified transcripts and interrupted experiments are reconciled against ledger evidence before the idempotent runner may resume. A campaign-wide Git lock prevents concurrent lineage advancement, while pause and cancellation are honored between retained operations.
 
+## Fixed proposal execution queue
+
+[`docs/proposals/execution-queue.json`](docs/proposals/execution-queue.json) gives the 60 frozen, unmeasured proposals one deterministic execution order. It groups patches that replace or edit the same mechanism, labels whether later members are exclusive, require rebasing, require a parameter-budget check, or have an interaction risk, and assigns 20 screening, 25 exploration, and 15 deferred positions. These are planning labels only. Rank, expected BPB, and risk do not constitute experimental evidence.
+
+Verify the source manifests, exact patch hashes, complete proposal coverage, ranks, tiers, and conflict memberships before starting a campaign:
+
+```bash
+uv run autodidact-queue \
+  --queue docs/proposals/execution-queue.json \
+  verify
+
+uv run autodidact-queue \
+  --queue docs/proposals/execution-queue.json \
+  show --rank 1 --current-parent "$(git rev-parse HEAD)"
+```
+
+When configured, the orchestrator sends exactly one queue assignment to the researcher. The assignment includes the frozen source patch and current accepted parent. The researcher must apply it directly when it still fits, adapt only the same atomic mechanism when the parent has evolved, or return `no_change`; it cannot substitute a more favorable idea. Initialization persists the queue ID, repository-relative path, and SHA-256 in campaign state. Recovery automatically reloads that queue and refuses a missing, moved, or edited queue.
+
 Initialize a bounded local campaign, then run it continuously or one proposal at a time:
 
 ```bash
-uv run autodidact-orchestrator initialize \
+uv run autodidact-orchestrator \
+  --execution-queue docs/proposals/execution-queue.json \
+  initialize \
   --campaign-id campaign-local-001 \
   --max-proposals 50 \
   --max-wall-seconds 86400 \
@@ -631,7 +651,7 @@ count or pass a lower `run --researcher-token-allowance` after verifying that th
 reasoning effort can complete within that bound. Provider-reported usage above the reserved
 per-proposal allowance is rejected and reported with both counts.
 
-The test suite substitutes a deterministic local proposal command and synthetic paired measurements. It exercises the real worktree, commit, ledger, PatchRCT, reward, state, recovery, and parent-advancement paths without invoking the configured external researcher or performing full model training.
+The test suite substitutes a deterministic local proposal command and synthetic paired measurements. It exercises the real queue assignment, fixed-parent patch adaptation, worktree, commit, ledger, PatchRCT, artifact, state, recovery, replay, and parent-advancement paths without invoking the configured external researcher or performing full model training. The bounded real-MPS diagnostic and its claim limits are recorded in [`docs/smoke/execution-queue-local.md`](docs/smoke/execution-queue-local.md).
 
 ## PatchRCT decision controller
 
@@ -814,6 +834,7 @@ assets/                  final figures
 - [x] Implement PatchRCT promotion, rejection, and escalation gates.
 - [x] Connect the researcher, recovery state, runner, reward estimator, and controller.
 - [x] Add forced reward-calibration campaigns and protected downstream compute allocation.
+- [x] Freeze the 60-patch execution queue and complete a tiny local recovery smoke test.
 - [ ] Collect 40 full-budget patch labels and calibrate downstream prediction.
 - [ ] Run the three-arm, 50-proposal local pilot.
 - [ ] Expand to repeated 100-proposal studies.

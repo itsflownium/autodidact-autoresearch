@@ -1,0 +1,1177 @@
+{
+  "conflict_groups": [
+    {
+      "group_id": "activation-choice",
+      "label": "Transformer MLP activation choice",
+      "members": [
+        1,
+        6,
+        59
+      ],
+      "rationale": "These patches replace the same baseline GELU path with incompatible activation or gated-MLP choices; after one promotion, the others must be reformulated as direct alternatives.",
+      "severity": "exclusive"
+    },
+    {
+      "group_id": "position-replacement",
+      "label": "Positional representation replacement",
+      "members": [
+        3,
+        39
+      ],
+      "rationale": "Learned absolute positions and fixed ALiBi each remove baseline RoPE in different ways and cannot be applied together as written.",
+      "severity": "exclusive"
+    },
+    {
+      "group_id": "rope-variants",
+      "label": "RoPE geometry variants",
+      "members": [
+        2,
+        13,
+        26,
+        35,
+        60
+      ],
+      "rationale": "These proposals alter overlapping RoPE or relative-position code. A promoted member changes the baseline for every later member even when a combination remains conceptually possible.",
+      "severity": "rebase_required"
+    },
+    {
+      "group_id": "core-normalization",
+      "label": "Core normalization formulation",
+      "members": [
+        5,
+        30,
+        37
+      ],
+      "rationale": "RMSNorm, fully affine LayerNorm, and a LayerNorm epsilon change target the same core normalization sites; later alternatives may become obsolete or require a new claim.",
+      "severity": "exclusive"
+    },
+    {
+      "group_id": "optimizer-schedule",
+      "label": "Optimizer and training schedule",
+      "members": [
+        7,
+        11,
+        14,
+        17,
+        19,
+        22,
+        27,
+        31,
+        38,
+        44
+      ],
+      "rationale": "Batch size, optimizer moments, clipping, regularization, warmup, learning rate, decay, and context curriculum jointly determine optimization; each result is conditional on earlier accepted recipe changes.",
+      "severity": "interaction"
+    },
+    {
+      "group_id": "learning-rate-curve",
+      "label": "Learning-rate curve",
+      "members": [
+        14,
+        17,
+        19,
+        22
+      ],
+      "rationale": "These patches edit overlapping learning-rate defaults or schedule logic and must be adapted to any previously accepted curve change.",
+      "severity": "rebase_required"
+    },
+    {
+      "group_id": "output-objective",
+      "label": "Output parameterization and training objective",
+      "members": [
+        8,
+        15,
+        20,
+        28,
+        36,
+        48,
+        52,
+        53
+      ],
+      "rationale": "Logit biases, scales, residual heads, and auxiliary losses alter the same output geometry or gradients, so later effect estimates depend on earlier accepted members.",
+      "severity": "interaction"
+    },
+    {
+      "group_id": "attention-topology",
+      "label": "Attention topology and logits",
+      "members": [
+        4,
+        12,
+        23,
+        24,
+        29,
+        32,
+        33,
+        35,
+        39,
+        46,
+        51,
+        57,
+        60
+      ],
+      "rationale": "These patches share attention projections, masks, head layout, initialization, or positional logits. Accepted changes require code adaptation and a fresh interaction assessment.",
+      "severity": "rebase_required"
+    },
+    {
+      "group_id": "mlp-structure",
+      "label": "MLP structure and capacity",
+      "members": [
+        1,
+        6,
+        9,
+        16,
+        21,
+        24,
+        34,
+        41,
+        45,
+        47,
+        54,
+        59
+      ],
+      "rationale": "These proposals alter MLP activation, width, placement, local mixing, or the architecture budget assigned to MLPs; they cannot be replayed blindly after a promotion.",
+      "severity": "rebase_required"
+    },
+    {
+      "group_id": "residual-layout-init",
+      "label": "Residual layout and initialization",
+      "members": [
+        10,
+        25,
+        30,
+        42,
+        43,
+        49,
+        54,
+        55,
+        56,
+        58
+      ],
+      "rationale": "These proposals modify residual branches, normalization, scale, initialization, or readout mixing and therefore share both code surfaces and optimization assumptions.",
+      "severity": "rebase_required"
+    },
+    {
+      "group_id": "residual-output-init",
+      "label": "Residual output initialization",
+      "members": [
+        10,
+        43,
+        56
+      ],
+      "rationale": "Projection biases, unscaled random initialization, and zero residual initialization are competing initialization formulations for the same output projections.",
+      "severity": "exclusive"
+    },
+    {
+      "group_id": "block-layout",
+      "label": "Transformer block layout",
+      "members": [
+        16,
+        42,
+        54
+      ],
+      "rationale": "Depth-for-width, parallel branches, and sandwich MLPs change the block graph in ways that invalidate the other patches as direct fixed-parent alternatives.",
+      "severity": "exclusive"
+    },
+    {
+      "group_id": "data-locality",
+      "label": "Document boundaries and local token mixing",
+      "members": [
+        18,
+        21,
+        29,
+        33,
+        40,
+        44,
+        46,
+        47
+      ],
+      "rationale": "These proposals change which local or cross-story token relationships are modeled, so their gains may overlap and must be re-estimated after a related promotion.",
+      "severity": "interaction"
+    },
+    {
+      "group_id": "auxiliary-objective",
+      "label": "Auxiliary and masked training objectives",
+      "members": [
+        15,
+        18,
+        48,
+        53
+      ],
+      "rationale": "Target masking, z-loss, two-token prediction, and midpoint supervision alter training gradients and must use mutually consistent ignored-token semantics.",
+      "severity": "interaction"
+    },
+    {
+      "group_id": "embedding-parameterization",
+      "label": "Embedding and tied-output parameterization",
+      "members": [
+        3,
+        7,
+        8,
+        20,
+        36,
+        40,
+        45,
+        49,
+        50,
+        52,
+        58
+      ],
+      "rationale": "These patches alter embedding scale, regularization, dimensionality, tied-output behavior, or embedding reinjection and require adaptation after any accepted member.",
+      "severity": "rebase_required"
+    },
+    {
+      "group_id": "parameter-budget",
+      "label": "One-million-parameter budget contention",
+      "members": [
+        3,
+        8,
+        9,
+        10,
+        16,
+        20,
+        21,
+        23,
+        25,
+        26,
+        28,
+        29,
+        30,
+        32,
+        34,
+        35,
+        36,
+        40,
+        41,
+        48,
+        49,
+        52,
+        55
+      ],
+      "rationale": "Each member consumes baseline parameter headroom. After one promotion, every later member must be re-budgeted against the 1,050,000-parameter cap.",
+      "severity": "budget_recheck"
+    }
+  ],
+  "evidence_status": "queued_unmeasured",
+  "frozen_parent_commit": "e150af023855c5bc3b0e9c8745c1126e8509258a",
+  "items": [
+    {
+      "adaptation_risk": "low",
+      "conflict_groups": [
+        "data-locality",
+        "auxiliary-objective"
+      ],
+      "patch_path": "docs/proposals/patches/018.patch",
+      "patch_sha256": "5cd66984cadf269ff7c7aa772bdfa113f4479c9fb0354c5f5a39e2daab2f1e35",
+      "priority_reason": "Early screen for high information value with limited expected adaptation or resource disruption. The declared 0.006 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 18,
+      "rank": 1,
+      "resource_risk": "low",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "screen"
+    },
+    {
+      "adaptation_risk": "low",
+      "conflict_groups": [
+        "optimizer-schedule",
+        "embedding-parameterization"
+      ],
+      "patch_path": "docs/proposals/patches/007.patch",
+      "patch_sha256": "30767fc677d92d6593ce8253d8e223035549813480172b92151bf1b896224546",
+      "priority_reason": "Early screen for high information value with limited expected adaptation or resource disruption. The declared 0.008 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 7,
+      "rank": 2,
+      "resource_risk": "low",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "screen"
+    },
+    {
+      "adaptation_risk": "low",
+      "conflict_groups": [
+        "optimizer-schedule"
+      ],
+      "patch_path": "docs/proposals/patches/027.patch",
+      "patch_sha256": "52f270c732a2863b80ec782dcd1c0e9f31b92e1390a803288b97fb77320d4e63",
+      "priority_reason": "Early screen for high information value with limited expected adaptation or resource disruption. The declared 0.006 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 27,
+      "rank": 3,
+      "resource_risk": "low",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "screen"
+    },
+    {
+      "adaptation_risk": "low",
+      "conflict_groups": [
+        "optimizer-schedule"
+      ],
+      "patch_path": "docs/proposals/patches/038.patch",
+      "patch_sha256": "688291ad7441ed0d091fe205766c6f7273268f30843a5c78f67e3bf02dbfa492",
+      "priority_reason": "Early screen for high information value with limited expected adaptation or resource disruption. The declared 0.006 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 38,
+      "rank": 4,
+      "resource_risk": "low",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "screen"
+    },
+    {
+      "adaptation_risk": "low",
+      "conflict_groups": [
+        "optimizer-schedule",
+        "learning-rate-curve"
+      ],
+      "patch_path": "docs/proposals/patches/017.patch",
+      "patch_sha256": "5f1caad6b0e7b287766d3d0ad394eafbe75504d0bcd162a7414d401845be094e",
+      "priority_reason": "Early screen for high information value with limited expected adaptation or resource disruption. The declared 0.006 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 17,
+      "rank": 5,
+      "resource_risk": "low",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "screen"
+    },
+    {
+      "adaptation_risk": "low",
+      "conflict_groups": [
+        "optimizer-schedule",
+        "learning-rate-curve"
+      ],
+      "patch_path": "docs/proposals/patches/014.patch",
+      "patch_sha256": "8bb9bb6128fa167514f0bf78fcc5ac7a108b159a63d444ddcd5972548bd5cd25",
+      "priority_reason": "Early screen for high information value with limited expected adaptation or resource disruption. The declared 0.008 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 14,
+      "rank": 6,
+      "resource_risk": "low",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "screen"
+    },
+    {
+      "adaptation_risk": "low",
+      "conflict_groups": [
+        "optimizer-schedule",
+        "learning-rate-curve"
+      ],
+      "patch_path": "docs/proposals/patches/019.patch",
+      "patch_sha256": "b6dd0993172af1a31e7ac14939dce066673d6b3627a339f313229870793b25dd",
+      "priority_reason": "Early screen for high information value with limited expected adaptation or resource disruption. The declared 0.015 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 19,
+      "rank": 7,
+      "resource_risk": "low",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "screen"
+    },
+    {
+      "adaptation_risk": "low",
+      "conflict_groups": [
+        "optimizer-schedule",
+        "learning-rate-curve"
+      ],
+      "patch_path": "docs/proposals/patches/022.patch",
+      "patch_sha256": "285c88cb024b14bca25dc9f28f042597aa128d982a2caf6445b75146bf9fa12d",
+      "priority_reason": "Early screen for high information value with limited expected adaptation or resource disruption. The declared 0.015 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 22,
+      "rank": 8,
+      "resource_risk": "low",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "screen"
+    },
+    {
+      "adaptation_risk": "low",
+      "conflict_groups": [
+        "optimizer-schedule"
+      ],
+      "patch_path": "docs/proposals/patches/011.patch",
+      "patch_sha256": "5f10b49abd9f1b1dc4d9da4f67bdf34109789b8b20f00d3a8dd0a85572f9b031",
+      "priority_reason": "Early screen for high information value with limited expected adaptation or resource disruption. The declared 0.015 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 11,
+      "rank": 9,
+      "resource_risk": "low",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "screen"
+    },
+    {
+      "adaptation_risk": "low",
+      "conflict_groups": [
+        "optimizer-schedule"
+      ],
+      "patch_path": "docs/proposals/patches/031.patch",
+      "patch_sha256": "2efc7eaf1e8b96cf04b5b16949294925dd88d255fee8a3ff19309c16a683958d",
+      "priority_reason": "Early screen for high information value with limited expected adaptation or resource disruption. The declared 0.004 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 31,
+      "rank": 10,
+      "resource_risk": "low",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "screen"
+    },
+    {
+      "adaptation_risk": "medium",
+      "conflict_groups": [
+        "activation-choice",
+        "mlp-structure"
+      ],
+      "patch_path": "docs/proposals/patches/006.patch",
+      "patch_sha256": "f51d7e735308ece8ca009ace4a7639ec59a87901cac634b480b974c9ad26cdf2",
+      "priority_reason": "Early screen for high information value with limited expected adaptation or resource disruption. The declared 0.012 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 6,
+      "rank": 11,
+      "resource_risk": "medium",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "screen"
+    },
+    {
+      "adaptation_risk": "medium",
+      "conflict_groups": [
+        "attention-topology"
+      ],
+      "patch_path": "docs/proposals/patches/004.patch",
+      "patch_sha256": "643ca6e1962404ea581b848533ffc242ea1551b9ef5ac2d8d382ac8f04650924",
+      "priority_reason": "Early screen for high information value with limited expected adaptation or resource disruption. The declared 0.012 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 4,
+      "rank": 12,
+      "resource_risk": "medium",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "screen"
+    },
+    {
+      "adaptation_risk": "medium",
+      "conflict_groups": [
+        "core-normalization"
+      ],
+      "patch_path": "docs/proposals/patches/005.patch",
+      "patch_sha256": "19c72d28b8ff41e92efcea48e85ee1a63ebdf20aba88e908716580e630cd93e1",
+      "priority_reason": "Early screen for high information value with limited expected adaptation or resource disruption. The declared 0.008 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 5,
+      "rank": 13,
+      "resource_risk": "medium",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "screen"
+    },
+    {
+      "adaptation_risk": "low",
+      "conflict_groups": [
+        "rope-variants"
+      ],
+      "patch_path": "docs/proposals/patches/002.patch",
+      "patch_sha256": "dc6d8d8aab2311f9c2bd29df48c8be8fa8de223dd35eceecd8d50eee91636336",
+      "priority_reason": "Early screen for high information value with limited expected adaptation or resource disruption. The declared 0.008 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 2,
+      "rank": 14,
+      "resource_risk": "low",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "screen"
+    },
+    {
+      "adaptation_risk": "medium",
+      "conflict_groups": [
+        "attention-topology",
+        "data-locality"
+      ],
+      "patch_path": "docs/proposals/patches/046.patch",
+      "patch_sha256": "a0aba250b62d90c28979b7f2fcd2e311e981ab8307207271608f9942d29ff3c1",
+      "priority_reason": "Early screen for high information value with limited expected adaptation or resource disruption. The declared 0.008 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 46,
+      "rank": 15,
+      "resource_risk": "medium",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "screen"
+    },
+    {
+      "adaptation_risk": "low",
+      "conflict_groups": [
+        "embedding-parameterization"
+      ],
+      "patch_path": "docs/proposals/patches/050.patch",
+      "patch_sha256": "8c5689074ee87f48f5e2393e112bb25d743a65f42d3bee2cc7f4bc8c51a40122",
+      "priority_reason": "Early screen for high information value with limited expected adaptation or resource disruption. The declared 0.006 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 50,
+      "rank": 16,
+      "resource_risk": "medium",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "screen"
+    },
+    {
+      "adaptation_risk": "low",
+      "conflict_groups": [
+        "residual-layout-init",
+        "embedding-parameterization"
+      ],
+      "patch_path": "docs/proposals/patches/058.patch",
+      "patch_sha256": "43d0214506fa7a29d57f61608d9295adcbf372ca025b46772fb32e23bf32b286",
+      "priority_reason": "Early screen for high information value with limited expected adaptation or resource disruption. The declared 0.008 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 58,
+      "rank": 17,
+      "resource_risk": "low",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "screen"
+    },
+    {
+      "adaptation_risk": "high",
+      "conflict_groups": [
+        "attention-topology",
+        "data-locality"
+      ],
+      "patch_path": "docs/proposals/patches/033.patch",
+      "patch_sha256": "14c791da791b20bc01ba7257d30086680fbd12bdb3d3b52ecb014e39f6b56ff6",
+      "priority_reason": "Early screen for high information value with limited expected adaptation or resource disruption. The declared 0.012 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 33,
+      "rank": 18,
+      "resource_risk": "high",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "screen"
+    },
+    {
+      "adaptation_risk": "medium",
+      "conflict_groups": [
+        "optimizer-schedule",
+        "data-locality"
+      ],
+      "patch_path": "docs/proposals/patches/044.patch",
+      "patch_sha256": "ee3f251ff7d743fa4764afe7972a9e4d0f28cca4f6aa41e47d0bf14dce032a52",
+      "priority_reason": "Early screen for high information value with limited expected adaptation or resource disruption. The declared 0.008 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 44,
+      "rank": 19,
+      "resource_risk": "medium",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "screen"
+    },
+    {
+      "adaptation_risk": "high",
+      "conflict_groups": [
+        "output-objective",
+        "auxiliary-objective"
+      ],
+      "patch_path": "docs/proposals/patches/053.patch",
+      "patch_sha256": "b18f65d3a832ae69c0c436911eee694f83e8cc5a9601299af3c3291f660cb431",
+      "priority_reason": "Early screen for high information value with limited expected adaptation or resource disruption. The declared 0.010 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 53,
+      "rank": 20,
+      "resource_risk": "high",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "screen"
+    },
+    {
+      "adaptation_risk": "high",
+      "conflict_groups": [
+        "attention-topology",
+        "mlp-structure"
+      ],
+      "patch_path": "docs/proposals/patches/024.patch",
+      "patch_sha256": "c61d3df50e374fd993f0e44719ac457a69638d844a4a0e157d316df3074ed08c",
+      "priority_reason": "Structural exploration after the low-risk recipe screens; revalidate against accepted group members. The declared 0.008 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 24,
+      "rank": 21,
+      "resource_risk": "high",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "explore"
+    },
+    {
+      "adaptation_risk": "high",
+      "conflict_groups": [
+        "mlp-structure",
+        "parameter-budget"
+      ],
+      "patch_path": "docs/proposals/patches/041.patch",
+      "patch_sha256": "80affb043e09dc755d450aa9bd555cf27a4f5a0ff0c8f04a8245593ada45a355",
+      "priority_reason": "Structural exploration after the low-risk recipe screens; revalidate against accepted group members. The declared 0.012 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 41,
+      "rank": 22,
+      "resource_risk": "high",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "explore"
+    },
+    {
+      "adaptation_risk": "high",
+      "conflict_groups": [
+        "mlp-structure",
+        "embedding-parameterization"
+      ],
+      "patch_path": "docs/proposals/patches/045.patch",
+      "patch_sha256": "bd4765b468c188f7453850623ce3abb9258c99ae819f2f57837be73ef892d321",
+      "priority_reason": "Structural exploration after the low-risk recipe screens; revalidate against accepted group members. The declared 0.008 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 45,
+      "rank": 23,
+      "resource_risk": "high",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "explore"
+    },
+    {
+      "adaptation_risk": "high",
+      "conflict_groups": [
+        "mlp-structure",
+        "block-layout",
+        "parameter-budget"
+      ],
+      "patch_path": "docs/proposals/patches/016.patch",
+      "patch_sha256": "581a0ecd88253ab4c036da164f9f23dd27bc1587e31f3268680020a0509ee06d",
+      "priority_reason": "Structural exploration after the low-risk recipe screens; revalidate against accepted group members. The declared 0.008 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 16,
+      "rank": 24,
+      "resource_risk": "high",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "explore"
+    },
+    {
+      "adaptation_risk": "high",
+      "conflict_groups": [
+        "mlp-structure",
+        "residual-layout-init",
+        "block-layout"
+      ],
+      "patch_path": "docs/proposals/patches/054.patch",
+      "patch_sha256": "f5093bc7593a2832bdb1647449ec1a47464e8b419e429f4234412478e7d009c8",
+      "priority_reason": "Structural exploration after the low-risk recipe screens; revalidate against accepted group members. The declared 0.012 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 54,
+      "rank": 25,
+      "resource_risk": "high",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "explore"
+    },
+    {
+      "adaptation_risk": "high",
+      "conflict_groups": [
+        "mlp-structure",
+        "parameter-budget"
+      ],
+      "patch_path": "docs/proposals/patches/009.patch",
+      "patch_sha256": "300eeb753839e998addf633109396cf61b5fb0ec1d2559eecd7fb462ef640e97",
+      "priority_reason": "Structural exploration after the low-risk recipe screens; revalidate against accepted group members. The declared 0.012 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 9,
+      "rank": 26,
+      "resource_risk": "high",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "explore"
+    },
+    {
+      "adaptation_risk": "high",
+      "conflict_groups": [
+        "position-replacement",
+        "embedding-parameterization",
+        "parameter-budget"
+      ],
+      "patch_path": "docs/proposals/patches/003.patch",
+      "patch_sha256": "1febc18a6075b7581f709dcfeb40ce77ea331272578b70c403a675da109b0936",
+      "priority_reason": "Structural exploration after the low-risk recipe screens; revalidate against accepted group members. The declared 0.012 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 3,
+      "rank": 27,
+      "resource_risk": "high",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "explore"
+    },
+    {
+      "adaptation_risk": "high",
+      "conflict_groups": [
+        "position-replacement",
+        "attention-topology"
+      ],
+      "patch_path": "docs/proposals/patches/039.patch",
+      "patch_sha256": "0883fac76d2fbaa95f834b834da2d8c086b783ea5671c9e525ecae62ac403eac",
+      "priority_reason": "Structural exploration after the low-risk recipe screens; revalidate against accepted group members. The declared 0.006 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 39,
+      "rank": 28,
+      "resource_risk": "medium",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "explore"
+    },
+    {
+      "adaptation_risk": "medium",
+      "conflict_groups": [
+        "rope-variants",
+        "attention-topology"
+      ],
+      "patch_path": "docs/proposals/patches/060.patch",
+      "patch_sha256": "f21d3ac22e86e7047207810f9ff1dec8a362a65a88c28cbfcac80d972edab352",
+      "priority_reason": "Structural exploration after the low-risk recipe screens; revalidate against accepted group members. The declared 0.008 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 60,
+      "rank": 29,
+      "resource_risk": "medium",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "explore"
+    },
+    {
+      "adaptation_risk": "low",
+      "conflict_groups": [
+        "rope-variants"
+      ],
+      "patch_path": "docs/proposals/patches/013.patch",
+      "patch_sha256": "4a2f40a3162db74f4dae1fc42ae42d40e19484c524db4ec5148a665a58203b39",
+      "priority_reason": "Structural exploration after the low-risk recipe screens; revalidate against accepted group members. The declared 0.006 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 13,
+      "rank": 30,
+      "resource_risk": "low",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "explore"
+    },
+    {
+      "adaptation_risk": "medium",
+      "conflict_groups": [
+        "rope-variants",
+        "parameter-budget"
+      ],
+      "patch_path": "docs/proposals/patches/026.patch",
+      "patch_sha256": "354c9737b70fcc9221d750404bfe3401bd5bee1658879cfe3d6db6d3fd346144",
+      "priority_reason": "Structural exploration after the low-risk recipe screens; revalidate against accepted group members. The declared 0.006 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 26,
+      "rank": 31,
+      "resource_risk": "medium",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "explore"
+    },
+    {
+      "adaptation_risk": "medium",
+      "conflict_groups": [
+        "rope-variants",
+        "attention-topology",
+        "parameter-budget"
+      ],
+      "patch_path": "docs/proposals/patches/035.patch",
+      "patch_sha256": "9522aa827e0dfc63241df1145da0bed54129209b3611b711f5332b5fe648236a",
+      "priority_reason": "Structural exploration after the low-risk recipe screens; revalidate against accepted group members. The declared 0.008 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 35,
+      "rank": 32,
+      "resource_risk": "medium",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "explore"
+    },
+    {
+      "adaptation_risk": "low",
+      "conflict_groups": [
+        "attention-topology"
+      ],
+      "patch_path": "docs/proposals/patches/012.patch",
+      "patch_sha256": "97ff1fbea01f71df78a649a5f31e111a1e52785511161e0ddb6964aa0c99d730",
+      "priority_reason": "Structural exploration after the low-risk recipe screens; revalidate against accepted group members. The declared 0.006 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 12,
+      "rank": 33,
+      "resource_risk": "low",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "explore"
+    },
+    {
+      "adaptation_risk": "medium",
+      "conflict_groups": [
+        "attention-topology",
+        "parameter-budget"
+      ],
+      "patch_path": "docs/proposals/patches/023.patch",
+      "patch_sha256": "1cbb2891067616de8972c1a9799fe8fedbfb4758b897a233887124fd0b525174",
+      "priority_reason": "Structural exploration after the low-risk recipe screens; revalidate against accepted group members. The declared 0.006 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 23,
+      "rank": 34,
+      "resource_risk": "medium",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "explore"
+    },
+    {
+      "adaptation_risk": "low",
+      "conflict_groups": [
+        "attention-topology"
+      ],
+      "patch_path": "docs/proposals/patches/051.patch",
+      "patch_sha256": "71f378286b6b34fb94b1b7b017495ac64c866a392a66f0816328d70060467e21",
+      "priority_reason": "Structural exploration after the low-risk recipe screens; revalidate against accepted group members. The declared 0.006 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 51,
+      "rank": 35,
+      "resource_risk": "low",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "explore"
+    },
+    {
+      "adaptation_risk": "medium",
+      "conflict_groups": [
+        "attention-topology"
+      ],
+      "patch_path": "docs/proposals/patches/057.patch",
+      "patch_sha256": "7c1f16d402bffa78ec8eea6d78d48ce5ba48d98d720b6c665a6e40c3103a093a",
+      "priority_reason": "Structural exploration after the low-risk recipe screens; revalidate against accepted group members. The declared 0.004 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 57,
+      "rank": 36,
+      "resource_risk": "medium",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "explore"
+    },
+    {
+      "adaptation_risk": "medium",
+      "conflict_groups": [
+        "mlp-structure",
+        "data-locality",
+        "parameter-budget"
+      ],
+      "patch_path": "docs/proposals/patches/021.patch",
+      "patch_sha256": "9d4c2554af031205fc26ea9a7356b85498b7ff893072fdcd5987431e4b111730",
+      "priority_reason": "Structural exploration after the low-risk recipe screens; revalidate against accepted group members. The declared 0.008 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 21,
+      "rank": 37,
+      "resource_risk": "medium",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "explore"
+    },
+    {
+      "adaptation_risk": "medium",
+      "conflict_groups": [
+        "attention-topology",
+        "data-locality",
+        "parameter-budget"
+      ],
+      "patch_path": "docs/proposals/patches/029.patch",
+      "patch_sha256": "b06bed7ceb1b34d23681b3c9ff6d8918066e36ac7af7c445967c6ddcee93aa70",
+      "priority_reason": "Structural exploration after the low-risk recipe screens; revalidate against accepted group members. The declared 0.008 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 29,
+      "rank": 38,
+      "resource_risk": "medium",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "explore"
+    },
+    {
+      "adaptation_risk": "medium",
+      "conflict_groups": [
+        "mlp-structure",
+        "data-locality"
+      ],
+      "patch_path": "docs/proposals/patches/047.patch",
+      "patch_sha256": "7909cae3202b6ffe3b41e8e6fd431c7f6dffa0a34587e6d444bca7e9a1851176",
+      "priority_reason": "Structural exploration after the low-risk recipe screens; revalidate against accepted group members. The declared 0.004 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 47,
+      "rank": 39,
+      "resource_risk": "medium",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "explore"
+    },
+    {
+      "adaptation_risk": "medium",
+      "conflict_groups": [
+        "data-locality",
+        "embedding-parameterization",
+        "parameter-budget"
+      ],
+      "patch_path": "docs/proposals/patches/040.patch",
+      "patch_sha256": "346fe11b79144e8b6f4703c774c7d8ba7f1875c01a25d713bbb5da54528e34c0",
+      "priority_reason": "Structural exploration after the low-risk recipe screens; revalidate against accepted group members. The declared 0.008 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 40,
+      "rank": 40,
+      "resource_risk": "medium",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "explore"
+    },
+    {
+      "adaptation_risk": "medium",
+      "conflict_groups": [
+        "attention-topology",
+        "parameter-budget"
+      ],
+      "patch_path": "docs/proposals/patches/032.patch",
+      "patch_sha256": "067a373138c11dca5eff35c5027d185b2c6eed17f0bb870187083f64fbf47b85",
+      "priority_reason": "Structural exploration after the low-risk recipe screens; revalidate against accepted group members. The declared 0.006 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 32,
+      "rank": 41,
+      "resource_risk": "medium",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "explore"
+    },
+    {
+      "adaptation_risk": "medium",
+      "conflict_groups": [
+        "residual-layout-init",
+        "block-layout"
+      ],
+      "patch_path": "docs/proposals/patches/042.patch",
+      "patch_sha256": "e6d7bd5ef0349f57963851ae18edd6cfea3cf59a5817d079995098cb6c32dda4",
+      "priority_reason": "Structural exploration after the low-risk recipe screens; revalidate against accepted group members. The declared 0.004 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 42,
+      "rank": 42,
+      "resource_risk": "medium",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "explore"
+    },
+    {
+      "adaptation_risk": "medium",
+      "conflict_groups": [
+        "residual-layout-init",
+        "parameter-budget"
+      ],
+      "patch_path": "docs/proposals/patches/025.patch",
+      "patch_sha256": "86a6a7a9cd74b92cb31fefc1a5caef3e3a9221b371d0fb64daca9cfa20938e49",
+      "priority_reason": "Structural exploration after the low-risk recipe screens; revalidate against accepted group members. The declared 0.004 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 25,
+      "rank": 43,
+      "resource_risk": "medium",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "explore"
+    },
+    {
+      "adaptation_risk": "medium",
+      "conflict_groups": [
+        "residual-layout-init",
+        "embedding-parameterization",
+        "parameter-budget"
+      ],
+      "patch_path": "docs/proposals/patches/049.patch",
+      "patch_sha256": "b64a93ddd429082fbb88f7d3167100a365c05e4797c4702493a7a76bda2d12c4",
+      "priority_reason": "Structural exploration after the low-risk recipe screens; revalidate against accepted group members. The declared 0.004 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 49,
+      "rank": 44,
+      "resource_risk": "medium",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "explore"
+    },
+    {
+      "adaptation_risk": "medium",
+      "conflict_groups": [
+        "residual-layout-init",
+        "parameter-budget"
+      ],
+      "patch_path": "docs/proposals/patches/055.patch",
+      "patch_sha256": "f4f0ab2a3302c54e937bfc181241d4d01d23a11082847fd4ee12f4525cffdcf7",
+      "priority_reason": "Structural exploration after the low-risk recipe screens; revalidate against accepted group members. The declared 0.006 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 55,
+      "rank": 45,
+      "resource_risk": "medium",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "explore"
+    },
+    {
+      "adaptation_risk": "medium",
+      "conflict_groups": [
+        "activation-choice",
+        "mlp-structure"
+      ],
+      "patch_path": "docs/proposals/patches/001.patch",
+      "patch_sha256": "5ff11214770ebbee688644c8853b8bd163a835497bc4825e047b8a2b546c5cda",
+      "priority_reason": "Deferred until related evidence exists because overlap, parameter pressure, or adaptation cost is higher. The declared 0.008 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 1,
+      "rank": 46,
+      "resource_risk": "low",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "defer"
+    },
+    {
+      "adaptation_risk": "low",
+      "conflict_groups": [
+        "activation-choice",
+        "mlp-structure"
+      ],
+      "patch_path": "docs/proposals/patches/059.patch",
+      "patch_sha256": "67af4c86492d5298a7d372584ae7e99c8e6cb6b29084f8b49e9031315c4bc37e",
+      "priority_reason": "Deferred until related evidence exists because overlap, parameter pressure, or adaptation cost is higher. The declared 0.003 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 59,
+      "rank": 47,
+      "resource_risk": "low",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "defer"
+    },
+    {
+      "adaptation_risk": "medium",
+      "conflict_groups": [
+        "mlp-structure",
+        "parameter-budget"
+      ],
+      "patch_path": "docs/proposals/patches/034.patch",
+      "patch_sha256": "dd9c9fdf69239cbc3cf8966c097af86597b03829c361635ae586923cc8ffbe7e",
+      "priority_reason": "Deferred until related evidence exists because overlap, parameter pressure, or adaptation cost is higher. The declared 0.006 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 34,
+      "rank": 48,
+      "resource_risk": "medium",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "defer"
+    },
+    {
+      "adaptation_risk": "low",
+      "conflict_groups": [
+        "core-normalization"
+      ],
+      "patch_path": "docs/proposals/patches/037.patch",
+      "patch_sha256": "eaed10f7467f1c67bf9f5753603109d288dbc848fb198a99372d953549b4b184",
+      "priority_reason": "Deferred until related evidence exists because overlap, parameter pressure, or adaptation cost is higher. The declared 0.003 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 37,
+      "rank": 49,
+      "resource_risk": "low",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "defer"
+    },
+    {
+      "adaptation_risk": "medium",
+      "conflict_groups": [
+        "core-normalization",
+        "residual-layout-init",
+        "parameter-budget"
+      ],
+      "patch_path": "docs/proposals/patches/030.patch",
+      "patch_sha256": "11c9cb890e220d73b9276066e70da7aa734958d648713974273c900973441016",
+      "priority_reason": "Deferred until related evidence exists because overlap, parameter pressure, or adaptation cost is higher. The declared 0.004 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 30,
+      "rank": 50,
+      "resource_risk": "medium",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "defer"
+    },
+    {
+      "adaptation_risk": "medium",
+      "conflict_groups": [
+        "residual-layout-init",
+        "residual-output-init",
+        "parameter-budget"
+      ],
+      "patch_path": "docs/proposals/patches/010.patch",
+      "patch_sha256": "84a8e1fc7e87906e38a32fa4330e2ea73b49f8d6d049bb91727209017027d3b5",
+      "priority_reason": "Deferred until related evidence exists because overlap, parameter pressure, or adaptation cost is higher. The declared 0.004 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 10,
+      "rank": 51,
+      "resource_risk": "medium",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "defer"
+    },
+    {
+      "adaptation_risk": "low",
+      "conflict_groups": [
+        "residual-layout-init",
+        "residual-output-init"
+      ],
+      "patch_path": "docs/proposals/patches/043.patch",
+      "patch_sha256": "b1007e44dcd8665a3c53ce3db0c280255369de2f7f20119f6d8f58dcbfdbbd92",
+      "priority_reason": "Deferred until related evidence exists because overlap, parameter pressure, or adaptation cost is higher. The declared 0.006 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 43,
+      "rank": 52,
+      "resource_risk": "low",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "defer"
+    },
+    {
+      "adaptation_risk": "low",
+      "conflict_groups": [
+        "residual-layout-init",
+        "residual-output-init"
+      ],
+      "patch_path": "docs/proposals/patches/056.patch",
+      "patch_sha256": "f5430128f28546df4bfd271f351a11e62230915938cceb5085a227b3723262d5",
+      "priority_reason": "Deferred until related evidence exists because overlap, parameter pressure, or adaptation cost is higher. The declared 0.004 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 56,
+      "rank": 53,
+      "resource_risk": "low",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "defer"
+    },
+    {
+      "adaptation_risk": "medium",
+      "conflict_groups": [
+        "output-objective",
+        "embedding-parameterization",
+        "parameter-budget"
+      ],
+      "patch_path": "docs/proposals/patches/008.patch",
+      "patch_sha256": "20a7bc55c1f8c0894131b61c6c6be18f45ba2de4f4cb9699b16975fd7540385a",
+      "priority_reason": "Deferred until related evidence exists because overlap, parameter pressure, or adaptation cost is higher. The declared 0.012 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 8,
+      "rank": 54,
+      "resource_risk": "medium",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "defer"
+    },
+    {
+      "adaptation_risk": "medium",
+      "conflict_groups": [
+        "output-objective",
+        "parameter-budget"
+      ],
+      "patch_path": "docs/proposals/patches/028.patch",
+      "patch_sha256": "502625e382e08a0c0bbf85e408045210f3ce43f5702ce2326328cfe2f89de23f",
+      "priority_reason": "Deferred until related evidence exists because overlap, parameter pressure, or adaptation cost is higher. The declared 0.004 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 28,
+      "rank": 55,
+      "resource_risk": "medium",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "defer"
+    },
+    {
+      "adaptation_risk": "medium",
+      "conflict_groups": [
+        "output-objective",
+        "embedding-parameterization",
+        "parameter-budget"
+      ],
+      "patch_path": "docs/proposals/patches/052.patch",
+      "patch_sha256": "8bbbebb28a848f52d659c89839cbcc26d3992a5e39a03bd3fe03a2ac3b38a420",
+      "priority_reason": "Deferred until related evidence exists because overlap, parameter pressure, or adaptation cost is higher. The declared 0.006 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 52,
+      "rank": 56,
+      "resource_risk": "medium",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "defer"
+    },
+    {
+      "adaptation_risk": "high",
+      "conflict_groups": [
+        "output-objective",
+        "embedding-parameterization",
+        "parameter-budget"
+      ],
+      "patch_path": "docs/proposals/patches/020.patch",
+      "patch_sha256": "9c7caaaa3fec58f42e39dc9662694214b461b3f07e049bdefa9c2949697c40cf",
+      "priority_reason": "Deferred until related evidence exists because overlap, parameter pressure, or adaptation cost is higher. The declared 0.008 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 20,
+      "rank": 57,
+      "resource_risk": "high",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "defer"
+    },
+    {
+      "adaptation_risk": "high",
+      "conflict_groups": [
+        "output-objective",
+        "embedding-parameterization",
+        "parameter-budget"
+      ],
+      "patch_path": "docs/proposals/patches/036.patch",
+      "patch_sha256": "99803d91bb204fd5a4450a9613a735c006a3bf3f03e54a1b0f00bc845891dba3",
+      "priority_reason": "Deferred until related evidence exists because overlap, parameter pressure, or adaptation cost is higher. The declared 0.012 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 36,
+      "rank": 58,
+      "resource_risk": "high",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "defer"
+    },
+    {
+      "adaptation_risk": "medium",
+      "conflict_groups": [
+        "output-objective",
+        "auxiliary-objective"
+      ],
+      "patch_path": "docs/proposals/patches/015.patch",
+      "patch_sha256": "37b1fb3e6c5150933a12a25a001bd631ffd353b3d61f053852f95262a54ba0d0",
+      "priority_reason": "Deferred until related evidence exists because overlap, parameter pressure, or adaptation cost is higher. The declared 0.004 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 15,
+      "rank": 59,
+      "resource_risk": "medium",
+      "source_manifest": "docs/proposals/bank-001-030.json",
+      "tier": "defer"
+    },
+    {
+      "adaptation_risk": "high",
+      "conflict_groups": [
+        "output-objective",
+        "auxiliary-objective",
+        "parameter-budget"
+      ],
+      "patch_path": "docs/proposals/patches/048.patch",
+      "patch_sha256": "178395ae364881c2c756f32cb40d7c821c5592c615aae119ddb7a856ff577277",
+      "priority_reason": "Deferred until related evidence exists because overlap, parameter pressure, or adaptation cost is higher. The declared 0.008 BPB effect is a hypothesis, not evidence.",
+      "proposal_number": 48,
+      "rank": 60,
+      "resource_risk": "high",
+      "source_manifest": "docs/proposals/bank-031-060.json",
+      "tier": "defer"
+    }
+  ],
+  "objective": "Screen all 60 unmeasured fixed-parent patches for lower held-out validation BPB while preserving protected integrity, resource, and parameter constraints.",
+  "queue_id": "autodidact-tinystories-proposals-v1",
+  "ranking_policy": {
+    "principles": [
+      "Queue rank is compute triage, not evidence that a patch is better.",
+      "Screen low-disruption and high-information hypotheses before parameter-heavy structural variants.",
+      "Place one representative from major conflict families early and defer redundant alternatives.",
+      "After every promotion, revalidate or adapt all remaining patches against the new accepted parent.",
+      "Never use queue order to select seeds, override protected outcomes, or claim model quality."
+    ],
+    "tie_breaker": "Prefer lower adaptation risk, then lower resource risk, then lower original proposal number; no measured outcome was used."
+  },
+  "schema_version": 1,
+  "source_banks": [
+    "docs/proposals/bank-001-030.json",
+    "docs/proposals/bank-031-060.json"
+  ]
+}
