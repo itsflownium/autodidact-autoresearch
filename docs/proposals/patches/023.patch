@@ -1,0 +1,29 @@
+diff --git a/train.py b/train.py
+index a3838f6..e0b7869 100644
+--- a/train.py
++++ b/train.py
+@@ -32,7 +32,7 @@ from autodidact.data.config import END_OF_TEXT_TOKEN, default_output_root
+ from autodidact.data.integrity import verify_dataset
+ from autodidact.data.reader import PreparedSplit
+ 
+-EXPECTED_PARAMETER_COUNT = 1_016_960
++EXPECTED_PARAMETER_COUNT = 1_016_976
+ MAX_PARAMETER_COUNT = 1_050_000
+ CHECKPOINT_SCHEMA_VERSION = 2
+ METRICS_SCHEMA_VERSION = 1
+@@ -156,6 +156,7 @@ class CausalSelfAttention(nn.Module):
+         self.num_heads = config.num_heads
+         self.head_dim = config.head_dim
+         self.dropout = config.dropout
++        self.attention_logit_scale = nn.Parameter(torch.zeros(config.num_heads))
+         self.query_key_value = nn.Linear(
+             config.model_width,
+             3 * config.model_width,
+@@ -178,6 +179,7 @@ class CausalSelfAttention(nn.Module):
+ 
+         query, key, value = map(split_heads, (query, key, value))
+         query, key = self.rope(query, key)
++        query = query * self.attention_logit_scale.exp().view(1, self.num_heads, 1, 1)
+         attention = F.scaled_dot_product_attention(
+             query,
+             key,

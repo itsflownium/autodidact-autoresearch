@@ -1,0 +1,31 @@
+diff --git a/train.py b/train.py
+index a3838f6..64521a8 100644
+--- a/train.py
++++ b/train.py
+@@ -32,7 +32,7 @@ from autodidact.data.config import END_OF_TEXT_TOKEN, default_output_root
+ from autodidact.data.integrity import verify_dataset
+ from autodidact.data.reader import PreparedSplit
+ 
+-EXPECTED_PARAMETER_COUNT = 1_016_960
++EXPECTED_PARAMETER_COUNT = 1_018_752
+ MAX_PARAMETER_COUNT = 1_050_000
+ CHECKPOINT_SCHEMA_VERSION = 2
+ METRICS_SCHEMA_VERSION = 1
+@@ -233,7 +233,7 @@ class TransformerLM(nn.Module):
+             config.model_width,
+             config.layer_norm_epsilon,
+         )
+-        self.output = nn.Linear(config.model_width, config.vocab_size, bias=False)
++        self.output = nn.Linear(config.model_width, config.vocab_size, bias=True)
+ 
+         self.apply(self._initialize_weights)
+         self.output.weight = self.token_embedding.weight
+@@ -246,6 +246,8 @@ class TransformerLM(nn.Module):
+     def _initialize_weights(module: nn.Module) -> None:
+         if isinstance(module, (nn.Linear, nn.Embedding)):
+             nn.init.normal_(module.weight, mean=0.0, std=0.02)
++        if isinstance(module, nn.Linear) and module.bias is not None:
++            nn.init.zeros_(module.bias)
+ 
+     def forward(
+         self,

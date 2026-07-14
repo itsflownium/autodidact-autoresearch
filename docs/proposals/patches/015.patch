@@ -1,0 +1,31 @@
+diff --git a/train.py b/train.py
+index a3838f6..7d64461 100644
+--- a/train.py
++++ b/train.py
+@@ -54,6 +54,7 @@ class ModelConfig:
+     mlp_width: int = 512
+     rope_base: float = 10_000.0
+     layer_norm_epsilon: float = 1e-5
++    logit_z_loss_coefficient: float = 1e-4
+     dropout: float = 0.0
+ 
+     @property
+@@ -69,6 +70,8 @@ class ModelConfig:
+             raise ValueError("context_length must be positive")
+         if self.vocab_size <= 0:
+             raise ValueError("vocab_size must be positive")
++        if self.logit_z_loss_coefficient < 0.0:
++            raise ValueError("logit z-loss coefficient must be non-negative")
+         if not 0.0 <= self.dropout < 1.0:
+             raise ValueError("dropout must be in [0, 1)")
+ 
+@@ -272,6 +275,9 @@ class TransformerLM(nn.Module):
+                 targets.reshape(-1),
+                 ignore_index=-100,
+             )
++            valid_logits = logits[targets != -100]
++            z_loss = torch.logsumexp(valid_logits, dim=-1).square().mean()
++            loss = loss + self.config.logit_z_loss_coefficient * z_loss
+         return logits, loss
+ 
+ 

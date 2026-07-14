@@ -1,0 +1,91 @@
+diff --git a/train.py b/train.py
+index a3838f6..358b111 100644
+--- a/train.py
++++ b/train.py
+@@ -32,7 +32,7 @@ from autodidact.data.config import END_OF_TEXT_TOKEN, default_output_root
+ from autodidact.data.integrity import verify_dataset
+ from autodidact.data.reader import PreparedSplit
+ 
+-EXPECTED_PARAMETER_COUNT = 1_016_960
++EXPECTED_PARAMETER_COUNT = 1_049_728
+ MAX_PARAMETER_COUNT = 1_050_000
+ CHECKPOINT_SCHEMA_VERSION = 2
+ METRICS_SCHEMA_VERSION = 1
+@@ -52,7 +52,6 @@ class ModelConfig:
+     model_width: int = 128
+     num_heads: int = 4
+     mlp_width: int = 512
+-    rope_base: float = 10_000.0
+     layer_norm_epsilon: float = 1e-5
+     dropout: float = 0.0
+ 
+@@ -121,35 +120,6 @@ class WeightOnlyLayerNorm(nn.Module):
+         )
+ 
+ 
+-def _apply_rope(
+-    values: torch.Tensor,
+-    cosine: torch.Tensor,
+-    sine: torch.Tensor,
+-) -> torch.Tensor:
+-    even = values[..., ::2]
+-    odd = values[..., 1::2]
+-    rotated = torch.stack((even * cosine - odd * sine, even * sine + odd * cosine), dim=-1)
+-    return rotated.flatten(-2)
+-
+-
+-class RotaryEmbedding(nn.Module):
+-    def __init__(self, head_dim: int, base: float) -> None:
+-        super().__init__()
+-        frequencies = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+-        self.register_buffer("inverse_frequencies", frequencies, persistent=False)
+-
+-    def forward(
+-        self,
+-        query: torch.Tensor,
+-        key: torch.Tensor,
+-    ) -> tuple[torch.Tensor, torch.Tensor]:
+-        positions = torch.arange(query.size(-2), device=query.device, dtype=torch.float32)
+-        angles = torch.outer(positions, self.inverse_frequencies.to(device=query.device))
+-        cosine = angles.cos().to(dtype=query.dtype)[None, None, :, :]
+-        sine = angles.sin().to(dtype=query.dtype)[None, None, :, :]
+-        return _apply_rope(query, cosine, sine), _apply_rope(key, cosine, sine)
+-
+-
+ class CausalSelfAttention(nn.Module):
+     def __init__(self, config: ModelConfig) -> None:
+         super().__init__()
+@@ -162,7 +132,6 @@ class CausalSelfAttention(nn.Module):
+             bias=False,
+         )
+         self.output = nn.Linear(config.model_width, config.model_width, bias=False)
+-        self.rope = RotaryEmbedding(config.head_dim, config.rope_base)
+ 
+     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+         batch_size, sequence_length, width = inputs.shape
+@@ -177,7 +146,6 @@ class CausalSelfAttention(nn.Module):
+             ).transpose(1, 2)
+ 
+         query, key, value = map(split_heads, (query, key, value))
+-        query, key = self.rope(query, key)
+         attention = F.scaled_dot_product_attention(
+             query,
+             key,
+@@ -228,6 +196,7 @@ class TransformerLM(nn.Module):
+         config.validate()
+         self.config = config
+         self.token_embedding = nn.Embedding(config.vocab_size, config.model_width)
++        self.position_embedding = nn.Embedding(config.context_length, config.model_width)
+         self.blocks = nn.ModuleList(TransformerBlock(config) for _ in range(config.num_layers))
+         self.final_norm = WeightOnlyLayerNorm(
+             config.model_width,
+@@ -259,7 +228,8 @@ class TransformerLM(nn.Module):
+                 f"sequence length {token_ids.size(1)} exceeds "
+                 f"context length {self.config.context_length}"
+             )
+-        hidden = self.token_embedding(token_ids)
++        positions = torch.arange(token_ids.size(1), device=token_ids.device)
++        hidden = self.token_embedding(token_ids) + self.position_embedding(positions)
+         for block in self.blocks:
+             hidden = block(hidden)
+         logits = self.output(self.final_norm(hidden))

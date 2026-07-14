@@ -1,0 +1,62 @@
+diff --git a/train.py b/train.py
+index a3838f6..fc3ecf1 100644
+--- a/train.py
++++ b/train.py
+@@ -32,7 +32,7 @@ from autodidact.data.config import END_OF_TEXT_TOKEN, default_output_root
+ from autodidact.data.integrity import verify_dataset
+ from autodidact.data.reader import PreparedSplit
+ 
+-EXPECTED_PARAMETER_COUNT = 1_016_960
++EXPECTED_PARAMETER_COUNT = 1_018_112
+ MAX_PARAMETER_COUNT = 1_050_000
+ CHECKPOINT_SCHEMA_VERSION = 2
+ METRICS_SCHEMA_VERSION = 1
+@@ -103,12 +103,13 @@ TRAINING_MODES = {
+ }
+ 
+ 
+-class WeightOnlyLayerNorm(nn.Module):
+-    """LayerNorm with a learned scale and no learned bias."""
++class AffineLayerNorm(nn.Module):
++    """LayerNorm with learned scale and bias."""
+ 
+     def __init__(self, width: int, epsilon: float) -> None:
+         super().__init__()
+         self.weight = nn.Parameter(torch.ones(width))
++        self.bias = nn.Parameter(torch.zeros(width))
+         self.epsilon = epsilon
+ 
+     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+@@ -116,7 +117,7 @@ class WeightOnlyLayerNorm(nn.Module):
+             inputs,
+             (inputs.size(-1),),
+             weight=self.weight,
+-            bias=None,
++            bias=self.bias,
+             eps=self.epsilon,
+         )
+ 
+@@ -200,12 +201,12 @@ class CausalSelfAttention(nn.Module):
+ class TransformerBlock(nn.Module):
+     def __init__(self, config: ModelConfig) -> None:
+         super().__init__()
+-        self.attention_norm = WeightOnlyLayerNorm(
++        self.attention_norm = AffineLayerNorm(
+             config.model_width,
+             config.layer_norm_epsilon,
+         )
+         self.attention = CausalSelfAttention(config)
+-        self.mlp_norm = WeightOnlyLayerNorm(
++        self.mlp_norm = AffineLayerNorm(
+             config.model_width,
+             config.layer_norm_epsilon,
+         )
+@@ -229,7 +230,7 @@ class TransformerLM(nn.Module):
+         self.config = config
+         self.token_embedding = nn.Embedding(config.vocab_size, config.model_width)
+         self.blocks = nn.ModuleList(TransformerBlock(config) for _ in range(config.num_layers))
+-        self.final_norm = WeightOnlyLayerNorm(
++        self.final_norm = AffineLayerNorm(
+             config.model_width,
+             config.layer_norm_epsilon,
+         )
