@@ -1,0 +1,27 @@
+diff --git a/train.py b/train.py
+index a3838f6..7f4dbc3 100644
+--- a/train.py
++++ b/train.py
+@@ -121,6 +121,13 @@ class WeightOnlyLayerNorm(nn.Module):
+         )
+ 
+ 
++class SquaredReLU(nn.Module):
++    """Parameter-free ReLU-squared activation for transformer MLPs."""
++
++    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
++        return F.relu(inputs).square()
++
++
+ def _apply_rope(
+     values: torch.Tensor,
+     cosine: torch.Tensor,
+@@ -211,7 +218,7 @@ class TransformerBlock(nn.Module):
+         )
+         self.mlp = nn.Sequential(
+             nn.Linear(config.model_width, config.mlp_width, bias=False),
+-            nn.GELU(),
++            SquaredReLU(),
+             nn.Linear(config.mlp_width, config.model_width, bias=False),
+         )
+         self.dropout = nn.Dropout(config.dropout)

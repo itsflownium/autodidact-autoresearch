@@ -1,0 +1,18 @@
+diff --git a/train.py b/train.py
+index a3838f6..639bd47 100644
+--- a/train.py
++++ b/train.py
+@@ -490,8 +490,12 @@ def build_optimizer(
+ ) -> torch.optim.AdamW:
+     decay: list[nn.Parameter] = []
+     no_decay: list[nn.Parameter] = []
++    embedding_parameters = {
++        id(module.weight) for module in model.modules() if isinstance(module, nn.Embedding)
++    }
+     for parameter in model.parameters():
+-        (decay if parameter.ndim >= 2 else no_decay).append(parameter)
++        should_decay = parameter.ndim >= 2 and id(parameter) not in embedding_parameters
++        (decay if should_decay else no_decay).append(parameter)
+     return torch.optim.AdamW(
+         [
+             {"params": decay, "weight_decay": weight_decay},

@@ -1,0 +1,30 @@
+diff --git a/train.py b/train.py
+index a3838f6..beaa963 100644
+--- a/train.py
++++ b/train.py
+@@ -32,7 +32,7 @@ from autodidact.data.config import END_OF_TEXT_TOKEN, default_output_root
+ from autodidact.data.integrity import verify_dataset
+ from autodidact.data.reader import PreparedSplit
+ 
+-EXPECTED_PARAMETER_COUNT = 1_016_960
++EXPECTED_PARAMETER_COUNT = 1_016_961
+ MAX_PARAMETER_COUNT = 1_050_000
+ CHECKPOINT_SCHEMA_VERSION = 2
+ METRICS_SCHEMA_VERSION = 1
+@@ -234,6 +234,7 @@ class TransformerLM(nn.Module):
+             config.layer_norm_epsilon,
+         )
+         self.output = nn.Linear(config.model_width, config.vocab_size, bias=False)
++        self.logit_scale = nn.Parameter(torch.zeros(()))
+ 
+         self.apply(self._initialize_weights)
+         self.output.weight = self.token_embedding.weight
+@@ -262,7 +263,7 @@ class TransformerLM(nn.Module):
+         hidden = self.token_embedding(token_ids)
+         for block in self.blocks:
+             hidden = block(hidden)
+-        logits = self.output(self.final_norm(hidden))
++        logits = self.output(self.final_norm(hidden)) * self.logit_scale.exp()
+         loss = None
+         if targets is not None:
+             if targets.shape != token_ids.shape:

@@ -1,0 +1,39 @@
+diff --git a/train.py b/train.py
+index a3838f6..0decad4 100644
+--- a/train.py
++++ b/train.py
+@@ -32,7 +32,7 @@ from autodidact.data.config import END_OF_TEXT_TOKEN, default_output_root
+ from autodidact.data.integrity import verify_dataset
+ from autodidact.data.reader import PreparedSplit
+ 
+-EXPECTED_PARAMETER_COUNT = 1_016_960
++EXPECTED_PARAMETER_COUNT = 1_018_496
+ MAX_PARAMETER_COUNT = 1_050_000
+ CHECKPOINT_SCHEMA_VERSION = 2
+ METRICS_SCHEMA_VERSION = 1
+@@ -161,12 +161,25 @@ class CausalSelfAttention(nn.Module):
+             3 * config.model_width,
+             bias=False,
+         )
++        self.value_convolution = nn.Conv1d(
++            config.model_width,
++            config.model_width,
++            kernel_size=3,
++            groups=config.model_width,
++            bias=False,
++        )
++        nn.init.zeros_(self.value_convolution.weight)
++        with torch.no_grad():
++            self.value_convolution.weight[:, 0, -1] = 1.0
+         self.output = nn.Linear(config.model_width, config.model_width, bias=False)
+         self.rope = RotaryEmbedding(config.head_dim, config.rope_base)
+ 
+     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+         batch_size, sequence_length, width = inputs.shape
+         query, key, value = self.query_key_value(inputs).chunk(3, dim=-1)
++        value = self.value_convolution(
++            F.pad(value.transpose(1, 2), (2, 0)),
++        ).transpose(1, 2)
+ 
+         def split_heads(values: torch.Tensor) -> torch.Tensor:
+             return values.view(

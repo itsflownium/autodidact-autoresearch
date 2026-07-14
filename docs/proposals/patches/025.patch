@@ -1,0 +1,38 @@
+diff --git a/train.py b/train.py
+index a3838f6..4a00511 100644
+--- a/train.py
++++ b/train.py
+@@ -32,7 +32,7 @@ from autodidact.data.config import END_OF_TEXT_TOKEN, default_output_root
+ from autodidact.data.integrity import verify_dataset
+ from autodidact.data.reader import PreparedSplit
+ 
+-EXPECTED_PARAMETER_COUNT = 1_016_960
++EXPECTED_PARAMETER_COUNT = 1_017_984
+ MAX_PARAMETER_COUNT = 1_050_000
+ CHECKPOINT_SCHEMA_VERSION = 2
+ METRICS_SCHEMA_VERSION = 1
+@@ -205,6 +205,7 @@ class TransformerBlock(nn.Module):
+             config.layer_norm_epsilon,
+         )
+         self.attention = CausalSelfAttention(config)
++        self.attention_scale = nn.Parameter(torch.ones(config.model_width))
+         self.mlp_norm = WeightOnlyLayerNorm(
+             config.model_width,
+             config.layer_norm_epsilon,
+@@ -214,11 +215,14 @@ class TransformerBlock(nn.Module):
+             nn.GELU(),
+             nn.Linear(config.mlp_width, config.model_width, bias=False),
+         )
++        self.mlp_scale = nn.Parameter(torch.ones(config.model_width))
+         self.dropout = nn.Dropout(config.dropout)
+ 
+     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+-        inputs = inputs + self.dropout(self.attention(self.attention_norm(inputs)))
+-        return inputs + self.dropout(self.mlp(self.mlp_norm(inputs)))
++        inputs = inputs + self.dropout(
++            self.attention(self.attention_norm(inputs)) * self.attention_scale
++        )
++        return inputs + self.dropout(self.mlp(self.mlp_norm(inputs)) * self.mlp_scale)
+ 
+ 
+ class TransformerLM(nn.Module):

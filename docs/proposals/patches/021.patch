@@ -1,0 +1,51 @@
+diff --git a/train.py b/train.py
+index a3838f6..01ac5c2 100644
+--- a/train.py
++++ b/train.py
+@@ -32,7 +32,7 @@ from autodidact.data.config import END_OF_TEXT_TOKEN, default_output_root
+ from autodidact.data.integrity import verify_dataset
+ from autodidact.data.reader import PreparedSplit
+ 
+-EXPECTED_PARAMETER_COUNT = 1_016_960
++EXPECTED_PARAMETER_COUNT = 1_023_104
+ MAX_PARAMETER_COUNT = 1_050_000
+ CHECKPOINT_SCHEMA_VERSION = 2
+ METRICS_SCHEMA_VERSION = 1
+@@ -197,6 +197,29 @@ class CausalSelfAttention(nn.Module):
+         return self.output(attention)
+ 
+ 
++class CausalDepthwiseConv1d(nn.Module):
++    """Mix recent per-channel MLP features without looking ahead."""
++
++    def __init__(self, width: int, kernel_size: int = 3) -> None:
++        super().__init__()
++        self.kernel_size = kernel_size
++        self.convolution = nn.Conv1d(
++            width,
++            width,
++            kernel_size,
++            groups=width,
++            bias=False,
++        )
++        nn.init.zeros_(self.convolution.weight)
++        with torch.no_grad():
++            self.convolution.weight[:, 0, -1] = 1.0
++
++    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
++        channels_first = inputs.transpose(1, 2)
++        padded = F.pad(channels_first, (self.kernel_size - 1, 0))
++        return self.convolution(padded).transpose(1, 2)
++
++
+ class TransformerBlock(nn.Module):
+     def __init__(self, config: ModelConfig) -> None:
+         super().__init__()
+@@ -212,6 +235,7 @@ class TransformerBlock(nn.Module):
+         self.mlp = nn.Sequential(
+             nn.Linear(config.model_width, config.mlp_width, bias=False),
+             nn.GELU(),
++            CausalDepthwiseConv1d(config.mlp_width),
+             nn.Linear(config.mlp_width, config.model_width, bias=False),
+         )
+         self.dropout = nn.Dropout(config.dropout)

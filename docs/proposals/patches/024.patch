@@ -1,0 +1,71 @@
+diff --git a/train.py b/train.py
+index a3838f6..b27bfad 100644
+--- a/train.py
++++ b/train.py
+@@ -51,7 +51,8 @@ class ModelConfig:
+     num_layers: int = 4
+     model_width: int = 128
+     num_heads: int = 4
+-    mlp_width: int = 512
++    num_kv_heads: int = 1
++    mlp_width: int = 608
+     rope_base: float = 10_000.0
+     layer_norm_epsilon: float = 1e-5
+     dropout: float = 0.0
+@@ -63,6 +64,8 @@ class ModelConfig:
+     def validate(self) -> None:
+         if self.model_width % self.num_heads:
+             raise ValueError("model_width must be divisible by num_heads")
++        if self.num_kv_heads <= 0 or self.num_heads % self.num_kv_heads:
++            raise ValueError("num_kv_heads must be a positive divisor of num_heads")
+         if self.head_dim % 2:
+             raise ValueError("RoPE requires an even head dimension")
+         if self.context_length <= 0:
+@@ -154,11 +157,12 @@ class CausalSelfAttention(nn.Module):
+     def __init__(self, config: ModelConfig) -> None:
+         super().__init__()
+         self.num_heads = config.num_heads
++        self.num_kv_heads = config.num_kv_heads
+         self.head_dim = config.head_dim
+         self.dropout = config.dropout
+         self.query_key_value = nn.Linear(
+             config.model_width,
+-            3 * config.model_width,
++            config.model_width + 2 * config.num_kv_heads * config.head_dim,
+             bias=False,
+         )
+         self.output = nn.Linear(config.model_width, config.model_width, bias=False)
+@@ -166,18 +170,29 @@ class CausalSelfAttention(nn.Module):
+ 
+     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+         batch_size, sequence_length, width = inputs.shape
+-        query, key, value = self.query_key_value(inputs).chunk(3, dim=-1)
++        query, key, value = self.query_key_value(inputs).split(
++            (
++                width,
++                self.num_kv_heads * self.head_dim,
++                self.num_kv_heads * self.head_dim,
++            ),
++            dim=-1,
++        )
+ 
+-        def split_heads(values: torch.Tensor) -> torch.Tensor:
++        def split_heads(values: torch.Tensor, num_heads: int) -> torch.Tensor:
+             return values.view(
+                 batch_size,
+                 sequence_length,
+-                self.num_heads,
++                num_heads,
+                 self.head_dim,
+             ).transpose(1, 2)
+ 
+-        query, key, value = map(split_heads, (query, key, value))
++        query = split_heads(query, self.num_heads)
++        key = split_heads(key, self.num_kv_heads)
++        value = split_heads(value, self.num_kv_heads)
+         query, key = self.rope(query, key)
++        key = key.expand(-1, self.num_heads, -1, -1)
++        value = value.expand(-1, self.num_heads, -1, -1)
+         attention = F.scaled_dot_product_attention(
+             query,
+             key,

@@ -1,0 +1,57 @@
+diff --git a/train.py b/train.py
+index a3838f6..eec788a 100644
+--- a/train.py
++++ b/train.py
+@@ -103,8 +103,8 @@ TRAINING_MODES = {
+ }
+ 
+ 
+-class WeightOnlyLayerNorm(nn.Module):
+-    """LayerNorm with a learned scale and no learned bias."""
++class RMSNorm(nn.Module):
++    """Root-mean-square normalization with a learned scale."""
+ 
+     def __init__(self, width: int, epsilon: float) -> None:
+         super().__init__()
+@@ -112,13 +112,11 @@ class WeightOnlyLayerNorm(nn.Module):
+         self.epsilon = epsilon
+ 
+     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+-        return F.layer_norm(
+-            inputs,
+-            (inputs.size(-1),),
+-            weight=self.weight,
+-            bias=None,
+-            eps=self.epsilon,
++        inverse_rms = torch.rsqrt(
++            inputs.pow(2).mean(dim=-1, keepdim=True) + self.epsilon
+         )
++        normalized = inputs * inverse_rms
++        return normalized * self.weight
+ 
+ 
+ def _apply_rope(
+@@ -200,12 +198,12 @@ class CausalSelfAttention(nn.Module):
+ class TransformerBlock(nn.Module):
+     def __init__(self, config: ModelConfig) -> None:
+         super().__init__()
+-        self.attention_norm = WeightOnlyLayerNorm(
++        self.attention_norm = RMSNorm(
+             config.model_width,
+             config.layer_norm_epsilon,
+         )
+         self.attention = CausalSelfAttention(config)
+-        self.mlp_norm = WeightOnlyLayerNorm(
++        self.mlp_norm = RMSNorm(
+             config.model_width,
+             config.layer_norm_epsilon,
+         )
+@@ -229,7 +227,7 @@ class TransformerLM(nn.Module):
+         self.config = config
+         self.token_embedding = nn.Embedding(config.vocab_size, config.model_width)
+         self.blocks = nn.ModuleList(TransformerBlock(config) for _ in range(config.num_layers))
+-        self.final_norm = WeightOnlyLayerNorm(
++        self.final_norm = RMSNorm(
+             config.model_width,
+             config.layer_norm_epsilon,
+         )
