@@ -22,6 +22,7 @@ from autodidact.controller import (
 )
 from autodidact.data.config import default_output_root
 from autodidact.data.integrity import canonical_json_bytes
+from autodidact.execution_queue import ExecutionQueue, ExecutionQueueError
 from autodidact.ledger import ExperimentLedger, LedgerError, WriterRole
 from autodidact.records import (
     CandidateRecord,
@@ -226,6 +227,7 @@ class OrchestratorConfig:
     target_plugin_id: str | None = None
     target_metric_name: str = "validation_bpb"
     target_metric_direction: str = "lower"
+    execution_queue_path: Path | None = None
 
     def __post_init__(self) -> None:
         if type(self.researcher_token_allowance) is not int or self.researcher_token_allowance <= 0:
@@ -289,6 +291,45 @@ class ProposalOutcome:
     reason: str
 
 
+def _load_execution_queue(config: OrchestratorConfig) -> ExecutionQueue | None:
+    if config.execution_queue_path is None:
+        return None
+    return ExecutionQueue.from_path(
+        config.execution_queue_path,
+        repository_root=config.repository_root.expanduser().resolve(),
+    )
+
+
+def _queue_relative_path(queue: ExecutionQueue, repository_root: Path) -> str:
+    try:
+        return queue.path.relative_to(repository_root.expanduser().resolve()).as_posix()
+    except ValueError as error:
+        raise OrchestratorError(
+            "execution queue must be stored inside the target repository"
+        ) from error
+
+
+def _assert_queue_contract(
+    queue: ExecutionQueue | None,
+    limits: CampaignLimits,
+    *,
+    repository_root: Path,
+) -> None:
+    if limits.execution_queue_id is None:
+        if queue is not None:
+            raise OrchestratorError("cannot add an execution queue after campaign initialization")
+        return
+    if queue is None:
+        raise OrchestratorError("campaign recovery requires its persisted execution queue")
+    summary = queue.summary()
+    if queue.queue_id != limits.execution_queue_id:
+        raise OrchestratorError("execution queue ID differs from campaign state")
+    if summary["queue_sha256"] != limits.execution_queue_sha256:
+        raise OrchestratorError("execution queue hash differs from campaign state")
+    if _queue_relative_path(queue, repository_root) != limits.execution_queue_path:
+        raise OrchestratorError("execution queue path differs from campaign state")
+
+
 class AutonomousResearchOrchestrator:
     def __init__(
         self,
@@ -307,6 +348,19 @@ class AutonomousResearchOrchestrator:
         self.policy = policy or PatchRCTPolicy(max_parameter_count=config.max_parameter_count)
         self.runner_factory = runner_factory
         self.repository_root = config.repository_root.expanduser().resolve()
+        self.execution_queue = _load_execution_queue(config)
+        _assert_queue_contract(
+            self.execution_queue,
+            self.state.snapshot().limits,
+            repository_root=self.repository_root,
+        )
+        if (
+            self.execution_queue is not None
+            and self.state.snapshot().limits.max_proposals > len(self.execution_queue.items)
+        ):
+            raise OrchestratorError(
+                "campaign max_proposals exceeds the configured execution queue length"
+            )
 
     def _calibration_target(self) -> int:
         return self.state.snapshot().limits.reward_calibration_labels
@@ -410,7 +464,7 @@ class AutonomousResearchOrchestrator:
             )
         synchronize_accepted_ref(
             self.repository_root,
-            DEFAULT_ACCEPTED_REF,
+            self.config.accepted_ref,
             self.ledger.current_parent(),
         )
 
@@ -579,6 +633,11 @@ class AutonomousResearchOrchestrator:
             + json.dumps(self.config.target_summary(), indent=2, sort_keys=True)
             + "\n```\n"
         )
+        if self.execution_queue is not None:
+            program_text += self.execution_queue.assignment_text(
+                proposal_number,
+                current_parent_commit=snapshot.accepted_parent_commit,
+            )
         request = ResearchRequest(
             request_id=request_id,
             parent_commit=snapshot.accepted_parent_commit,
@@ -1352,6 +1411,9 @@ class AutonomousResearchOrchestrator:
             return {
                 "campaign_id": final.campaign_id,
                 "current_parent_commit": final.accepted_parent_commit,
+                "execution_queue": (
+                    None if self.execution_queue is None else self.execution_queue.summary()
+                ),
                 "generation": final.generation,
                 "outcomes": outcomes,
                 "phase": final.phase,
@@ -1394,6 +1456,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reward-root", type=_path, default=DEFAULT_REWARD_ROOT)
     parser.add_argument("--program", type=_path, default=DEFAULT_PROGRAM_PATH)
     parser.add_argument("--researcher-config", type=_path, default=DEFAULT_RESEARCHER_CONFIG_PATH)
+    parser.add_argument("--execution-queue", type=_path)
     parser.add_argument("--target-config", type=_path)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--accepted-ref", default=DEFAULT_ACCEPTED_REF)
@@ -1461,6 +1524,11 @@ def _config_from_args(args: argparse.Namespace) -> OrchestratorConfig:
         target_plugin_id=(None if plugin is None else plugin.plugin_id),
         target_metric_name=("validation_bpb" if plugin is None else plugin.metric.name),
         target_metric_direction=("lower" if plugin is None else plugin.metric.direction.value),
+        execution_queue_path=(
+            None
+            if args.execution_queue is None
+            else args.execution_queue.expanduser().resolve()
+        ),
         researcher_token_allowance=getattr(
             args,
             "researcher_token_allowance",
@@ -1474,6 +1542,16 @@ def main(argv: list[str] | None = None) -> int:
     try:
         repository_root = args.repository_root.resolve()
         if args.command == "initialize":
+            config = _config_from_args(args)
+            queue = _load_execution_queue(config)
+            if queue is not None and args.max_proposals > len(queue.items):
+                raise OrchestratorError(
+                    "campaign max_proposals exceeds the configured execution queue length"
+                )
+            queue_summary = None if queue is None else queue.summary()
+            queue_relative_path = (
+                None if queue is None else _queue_relative_path(queue, repository_root)
+            )
             with RepositoryLock(repository_root, campaign_id=args.campaign_id):
                 if args.ledger_path.exists():
                     ledger = ExperimentLedger.open(args.ledger_path, read_only=False)
@@ -1496,10 +1574,14 @@ def main(argv: list[str] | None = None) -> int:
                         max_compute_seconds=args.max_compute_seconds,
                         reward_calibration_labels=args.reward_calibration_labels,
                         use_downstream_allocation=args.use_downstream_allocation,
+                        execution_queue_id=(None if queue is None else queue.queue_id),
+                        execution_queue_path=queue_relative_path,
+                        execution_queue_sha256=(
+                            None if queue_summary is None else queue_summary["queue_sha256"]
+                        ),
                     ),
                 )
                 synchronize_accepted_ref(repository_root, args.accepted_ref, parent)
-            config = _config_from_args(args)
             calibration = _reward_calibration_status(
                 args.reward_calibration_labels,
                 features_path=config.features_path,
@@ -1513,19 +1595,24 @@ def main(argv: list[str] | None = None) -> int:
                     minimum_labels=(args.reward_calibration_labels or config.minimum_reward_labels),
                     model_path=config.model_path,
                 ),
+                "execution_queue": queue_summary,
                 "ledger": ledger.summary(),
                 "reward_calibration": calibration,
                 "target": config.target_summary(),
             }
         else:
             state = CampaignStore.open(args.state_path)
+            limits = state.snapshot().limits
+            if args.execution_queue is None and limits.execution_queue_path is not None:
+                args.execution_queue = repository_root / limits.execution_queue_path
             ledger = ExperimentLedger.open(
                 args.ledger_path,
                 read_only=args.command == "status",
             )
             if args.command == "status":
                 config = _config_from_args(args)
-                limits = state.snapshot().limits
+                queue = _load_execution_queue(config)
+                _assert_queue_contract(queue, limits, repository_root=repository_root)
                 target = limits.reward_calibration_labels
                 calibration = _reward_calibration_status(
                     target,
@@ -1540,6 +1627,7 @@ def main(argv: list[str] | None = None) -> int:
                         minimum_labels=target or config.minimum_reward_labels,
                         model_path=config.model_path,
                     ),
+                    "execution_queue": None if queue is None else queue.summary(),
                     "ledger": ledger.summary(),
                     "reward_calibration": calibration,
                     "target": config.target_summary(),
@@ -1570,6 +1658,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except (
         LedgerError,
+        ExecutionQueueError,
         OSError,
         OrchestratorError,
         ResearcherError,

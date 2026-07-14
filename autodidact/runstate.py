@@ -164,6 +164,9 @@ class CampaignLimits:
     max_compute_seconds: float
     reward_calibration_labels: int = 0
     use_downstream_allocation: bool = False
+    execution_queue_id: str | None = None
+    execution_queue_path: str | None = None
+    execution_queue_sha256: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("max_proposals", "max_researcher_tokens", "max_training_tokens"):
@@ -182,6 +185,28 @@ class CampaignLimits:
             raise RunStateError("reward_calibration_labels must be between zero and max_proposals")
         if type(self.use_downstream_allocation) is not bool:
             raise RunStateError("use_downstream_allocation must be boolean")
+        queue_values = (
+            self.execution_queue_id,
+            self.execution_queue_path,
+            self.execution_queue_sha256,
+        )
+        if any(value is None for value in queue_values) and any(
+            value is not None for value in queue_values
+        ):
+            raise RunStateError("execution queue identity, path, and hash must be set together")
+        if self.execution_queue_id is not None:
+            _validate_id("execution_queue_id", self.execution_queue_id)
+            assert self.execution_queue_path is not None
+            queue_path = Path(self.execution_queue_path)
+            if (
+                queue_path.is_absolute()
+                or self.execution_queue_path in {"", "."}
+                or ".." in queue_path.parts
+            ):
+                raise RunStateError("execution_queue_path must be repository-relative")
+            assert self.execution_queue_sha256 is not None
+            if not _SHA256_PATTERN.fullmatch(self.execution_queue_sha256):
+                raise RunStateError("execution_queue_sha256 must be a lowercase SHA-256")
 
 
 @dataclass(frozen=True, slots=True)
