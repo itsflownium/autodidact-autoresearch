@@ -108,6 +108,21 @@ class _CampaignStopped(OrchestratorError):
     """Internal clean-boundary control-flow signal."""
 
 
+def _minimum_calibration_training_tokens(
+    label_count: int,
+    policy: PatchRCTPolicy,
+) -> int:
+    per_candidate = 2 * sum(
+        policy.initial_pairs(stage) * policy.token_budget(stage)
+        for stage in (
+            ExperimentStage.CHEAP,
+            ExperimentStage.INTERMEDIATE,
+            ExperimentStage.FULL,
+        )
+    )
+    return label_count * per_candidate
+
+
 class ExperimentRunner(Protocol):
     def register_candidate(self) -> CandidateRecord: ...
 
@@ -119,6 +134,78 @@ RunnerFactory = Callable[[ExperimentRequest], ExperimentRunner]
 
 def _default_runner_factory(request: ExperimentRequest) -> ExperimentRunner:
     return PairedExperimentRunner(request)
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.expanduser().resolve().read_bytes()).hexdigest()
+
+
+def _stored_control_path(path: Path, repository_root: Path) -> str:
+    resolved = path.expanduser().resolve()
+    try:
+        return resolved.relative_to(repository_root).as_posix()
+    except ValueError:
+        return str(resolved)
+
+
+def _resolve_stored_control_path(value: str, repository_root: Path) -> Path:
+    path = Path(value).expanduser()
+    return path.resolve() if path.is_absolute() else (repository_root / path).resolve()
+
+
+def _resolve_cli_control_path(path: Path, repository_root: Path) -> Path:
+    expanded = path.expanduser()
+    return expanded.resolve() if expanded.is_absolute() else (repository_root / expanded).resolve()
+
+
+def _verified_control_path(
+    value: str,
+    expected_sha256: str,
+    *,
+    repository_root: Path,
+    name: str,
+) -> Path:
+    path = _resolve_stored_control_path(value, repository_root)
+    if _file_sha256(path) != expected_sha256:
+        raise OrchestratorError(f"{name} differs from the initialized campaign contract")
+    return path
+
+
+def _apply_campaign_control_contract(
+    args: argparse.Namespace,
+    limits: CampaignLimits,
+    *,
+    repository_root: Path,
+) -> None:
+    if limits.researcher_config_path is None:
+        return
+    assert limits.researcher_config_sha256 is not None
+    assert limits.program_path is not None
+    assert limits.program_sha256 is not None
+    args.decision_mode = DecisionMode(limits.decision_mode)
+    args.researcher_config = _verified_control_path(
+        limits.researcher_config_path,
+        limits.researcher_config_sha256,
+        repository_root=repository_root,
+        name="researcher configuration",
+    )
+    args.program = _verified_control_path(
+        limits.program_path,
+        limits.program_sha256,
+        repository_root=repository_root,
+        name="research program",
+    )
+    if limits.target_config_path is None:
+        if args.target_config is not None:
+            raise OrchestratorError("campaign was initialized without a target configuration")
+        return
+    assert limits.target_config_sha256 is not None
+    args.target_config = _verified_control_path(
+        limits.target_config_path,
+        limits.target_config_sha256,
+        repository_root=repository_root,
+        name="target configuration",
+    )
 
 
 def _stable_id(prefix: str, *parts: object) -> str:
@@ -1493,8 +1580,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _config_from_args(args: argparse.Namespace) -> OrchestratorConfig:
-    target = None if args.target_config is None else TargetConfig.from_path(args.target_config)
     repository_root = args.repository_root.resolve()
+    target_config_path = (
+        None
+        if args.target_config is None
+        else _resolve_cli_control_path(args.target_config, repository_root)
+    )
+    target = None if target_config_path is None else TargetConfig.from_path(target_config_path)
     plugin = None if target is None else target.load_plugin(repository_root)
     return OrchestratorConfig(
         repository_root=args.repository_root,
@@ -1506,7 +1598,7 @@ def _config_from_args(args: argparse.Namespace) -> OrchestratorConfig:
         workspace_root=args.workspace_root,
         researcher_artifact_root=args.researcher_artifact_root,
         reward_root=args.reward_root,
-        program_path=args.program,
+        program_path=_resolve_cli_control_path(args.program, repository_root),
         device=args.device if target is None else target.device,
         estimated_accelerator_hour_usd=(
             None if target is None else target.estimated_accelerator_hour_usd
@@ -1515,16 +1607,16 @@ def _config_from_args(args: argparse.Namespace) -> OrchestratorConfig:
         target_name=("Autodidact TinyStories transformer" if target is None else target.name),
         target_execution_location=("local" if target is None else target.execution_location.value),
         accepted_ref=args.accepted_ref,
-        target_config_path=(
-            None if args.target_config is None else args.target_config.expanduser().resolve()
-        ),
+        target_config_path=target_config_path,
         trainer_path=("train.py" if plugin is None else plugin.trainer_path),
         allowed_paths=(("train.py",) if plugin is None else plugin.editable_paths),
         target_plugin_id=(None if plugin is None else plugin.plugin_id),
         target_metric_name=("validation_bpb" if plugin is None else plugin.metric.name),
         target_metric_direction=("lower" if plugin is None else plugin.metric.direction.value),
         execution_queue_path=(
-            None if args.execution_queue is None else args.execution_queue.expanduser().resolve()
+            None
+            if args.execution_queue is None
+            else _resolve_cli_control_path(args.execution_queue, repository_root)
         ),
         researcher_token_allowance=getattr(
             args,
@@ -1540,6 +1632,31 @@ def main(argv: list[str] | None = None) -> int:
         repository_root = args.repository_root.resolve()
         if args.command == "initialize":
             config = _config_from_args(args)
+            researcher_config_path = _resolve_cli_control_path(
+                args.researcher_config,
+                repository_root,
+            )
+            ResearcherConfig.from_path(researcher_config_path)
+            program_sha256 = _file_sha256(config.program_path)
+            initialization_policy = PatchRCTPolicy(
+                decision_mode=args.decision_mode,
+                max_parameter_count=config.max_parameter_count,
+            )
+            if args.decision_mode is DecisionMode.GREEDY and (
+                args.reward_calibration_labels > 0 or args.use_downstream_allocation
+            ):
+                raise OrchestratorError(
+                    "greedy mode cannot calibrate or use downstream reward allocation"
+                )
+            minimum_calibration_tokens = _minimum_calibration_training_tokens(
+                args.reward_calibration_labels,
+                initialization_policy,
+            )
+            if args.max_training_tokens < minimum_calibration_tokens:
+                raise OrchestratorError(
+                    "reward calibration requires at least "
+                    f"{minimum_calibration_tokens} campaign training tokens"
+                )
             queue = _load_execution_queue(config)
             if queue is not None and args.max_proposals > len(queue.items):
                 raise OrchestratorError(
@@ -1548,6 +1665,44 @@ def main(argv: list[str] | None = None) -> int:
             queue_summary = None if queue is None else queue.summary()
             queue_relative_path = (
                 None if queue is None else _queue_relative_path(queue, repository_root)
+            )
+            campaign_limits = CampaignLimits(
+                max_proposals=args.max_proposals,
+                max_wall_seconds=args.max_wall_seconds,
+                max_researcher_tokens=args.max_researcher_tokens,
+                max_training_tokens=args.max_training_tokens,
+                max_compute_seconds=args.max_compute_seconds,
+                reward_calibration_labels=args.reward_calibration_labels,
+                use_downstream_allocation=args.use_downstream_allocation,
+                execution_queue_id=(None if queue is None else queue.queue_id),
+                execution_queue_path=queue_relative_path,
+                execution_queue_sha256=(
+                    None if queue_summary is None else queue_summary["queue_sha256"]
+                ),
+                decision_mode=args.decision_mode.value,
+                researcher_config_path=_stored_control_path(
+                    researcher_config_path,
+                    repository_root,
+                ),
+                researcher_config_sha256=_file_sha256(researcher_config_path),
+                program_path=_stored_control_path(
+                    config.program_path,
+                    repository_root,
+                ),
+                program_sha256=program_sha256,
+                target_config_path=(
+                    None
+                    if config.target_config_path is None
+                    else _stored_control_path(
+                        config.target_config_path,
+                        repository_root,
+                    )
+                ),
+                target_config_sha256=(
+                    None
+                    if config.target_config_path is None
+                    else _file_sha256(config.target_config_path)
+                ),
             )
             with RepositoryLock(repository_root, campaign_id=args.campaign_id):
                 if args.ledger_path.exists():
@@ -1563,20 +1718,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.state_path,
                     campaign_id=args.campaign_id,
                     initial_parent_commit=parent,
-                    limits=CampaignLimits(
-                        max_proposals=args.max_proposals,
-                        max_wall_seconds=args.max_wall_seconds,
-                        max_researcher_tokens=args.max_researcher_tokens,
-                        max_training_tokens=args.max_training_tokens,
-                        max_compute_seconds=args.max_compute_seconds,
-                        reward_calibration_labels=args.reward_calibration_labels,
-                        use_downstream_allocation=args.use_downstream_allocation,
-                        execution_queue_id=(None if queue is None else queue.queue_id),
-                        execution_queue_path=queue_relative_path,
-                        execution_queue_sha256=(
-                            None if queue_summary is None else queue_summary["queue_sha256"]
-                        ),
-                    ),
+                    limits=campaign_limits,
                 )
                 synchronize_accepted_ref(repository_root, args.accepted_ref, parent)
             calibration = _reward_calibration_status(
@@ -1600,6 +1742,12 @@ def main(argv: list[str] | None = None) -> int:
         else:
             state = CampaignStore.open(args.state_path)
             limits = state.snapshot().limits
+            if args.command in {"run", "status"}:
+                _apply_campaign_control_contract(
+                    args,
+                    limits,
+                    repository_root=repository_root,
+                )
             if args.execution_queue is None and limits.execution_queue_path is not None:
                 args.execution_queue = repository_root / limits.execution_queue_path
             ledger = ExperimentLedger.open(

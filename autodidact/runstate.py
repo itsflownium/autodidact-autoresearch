@@ -167,6 +167,13 @@ class CampaignLimits:
     execution_queue_id: str | None = None
     execution_queue_path: str | None = None
     execution_queue_sha256: str | None = None
+    decision_mode: str = "patch_rct"
+    researcher_config_path: str | None = None
+    researcher_config_sha256: str | None = None
+    program_path: str | None = None
+    program_sha256: str | None = None
+    target_config_path: str | None = None
+    target_config_sha256: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("max_proposals", "max_researcher_tokens", "max_training_tokens"):
@@ -207,6 +214,41 @@ class CampaignLimits:
             assert self.execution_queue_sha256 is not None
             if not _SHA256_PATTERN.fullmatch(self.execution_queue_sha256):
                 raise RunStateError("execution_queue_sha256 must be a lowercase SHA-256")
+        if self.decision_mode not in {"greedy", "patch_rct", "scout_patch_rct"}:
+            raise RunStateError("decision_mode is invalid")
+        if self.decision_mode == "greedy" and (
+            self.reward_calibration_labels > 0 or self.use_downstream_allocation
+        ):
+            raise RunStateError("greedy mode cannot calibrate or use downstream reward allocation")
+        required_control_values = (
+            self.researcher_config_path,
+            self.researcher_config_sha256,
+            self.program_path,
+            self.program_sha256,
+        )
+        if any(value is None for value in required_control_values) and any(
+            value is not None for value in required_control_values
+        ):
+            raise RunStateError("researcher and program identities must be set together")
+        target_values = (self.target_config_path, self.target_config_sha256)
+        if any(value is None for value in target_values) and any(
+            value is not None for value in target_values
+        ):
+            raise RunStateError("target configuration path and hash must be set together")
+        for name in ("researcher_config_path", "program_path", "target_config_path"):
+            value = getattr(self, name)
+            if value is not None and (
+                not isinstance(value, str) or not value.strip() or "\x00" in value
+            ):
+                raise RunStateError(f"{name} must be nonempty portable text")
+        for name in (
+            "researcher_config_sha256",
+            "program_sha256",
+            "target_config_sha256",
+        ):
+            value = getattr(self, name)
+            if value is not None and not _SHA256_PATTERN.fullmatch(value):
+                raise RunStateError(f"{name} must be a lowercase SHA-256")
 
 
 @dataclass(frozen=True, slots=True)
