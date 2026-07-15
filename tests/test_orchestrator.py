@@ -685,7 +685,7 @@ def test_campaign_resumes_across_calls_promotes_and_starts_from_new_parent(
             )
         ]
     assert paired_operation_keys
-    assert all(key.startswith("run-v3-") for key in paired_operation_keys)
+    assert all(key.startswith("run-v4-") for key in paired_operation_keys)
     assert (tmp_path / "reward" / "model.json").is_file()
     model = json.loads((tmp_path / "reward" / "model.json").read_text(encoding="utf-8"))
     assert model["label_count"] == 2
@@ -957,12 +957,12 @@ def test_training_budget_is_enforced_before_paired_runner_launch(tmp_path: Path)
     assert factory.registration_calls == 1
 
 
-def test_calibration_budget_counts_both_arms_at_every_required_stage() -> None:
+def test_calibration_budget_counts_each_continued_full_trajectory_once() -> None:
     policy = PatchRCTPolicy(decision_mode=DecisionMode.SCOUT_PATCH_RCT)
 
     required = _minimum_calibration_training_tokens(40, policy)
 
-    assert required == 5_920_000_000
+    assert required == 4_800_000_000
 
 
 def test_pause_request_prevents_new_research_invocation(tmp_path: Path) -> None:

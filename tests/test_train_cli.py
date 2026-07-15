@@ -5,6 +5,7 @@ from pathlib import Path
 
 import torch
 
+from autodidact.checkpoints import checkpoint_state_sha256
 from train import EXPECTED_PARAMETER_COUNT, main
 
 
@@ -146,3 +147,74 @@ def test_train_and_generate_commands_are_reproducible(
     assert resumed_summary["tokens_seen"] == 128
     assert resumed_summary["training_tokens_this_process"] == 0
     assert resumed_summary["training_tokens_per_second"] == 0
+
+
+def test_milestone_resume_matches_the_declared_full_trajectory(
+    baseline_dataset: Path,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    direct_checkpoint = tmp_path / "direct.pt"
+    first_checkpoint = tmp_path / "milestone.pt"
+    resumed_checkpoint = tmp_path / "resumed.pt"
+
+    common = [
+        "train",
+        "--mode",
+        "full",
+        "--data-root",
+        str(baseline_dataset),
+        "--device",
+        "cpu",
+        "--seed",
+        "37",
+        "--token-budget",
+        "256",
+        "--trajectory-milestones",
+        "128",
+        "--batch-size",
+        "2",
+        "--eval-batch-size",
+        "2",
+        "--skip-eval",
+        "--no-generate",
+    ]
+    assert main([*common, "--checkpoint-out", str(direct_checkpoint)]) == 0
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                *common,
+                "--stop-after-tokens",
+                "128",
+                "--checkpoint-out",
+                str(first_checkpoint),
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                *common,
+                "--resume",
+                str(first_checkpoint),
+                "--checkpoint-out",
+                str(resumed_checkpoint),
+            ]
+        )
+        == 0
+    )
+    resumed_summary = _json_lines(capsys.readouterr().out)[-1]
+
+    direct = torch.load(direct_checkpoint, map_location="cpu", weights_only=False)
+    resumed = torch.load(resumed_checkpoint, map_location="cpu", weights_only=False)
+    assert checkpoint_state_sha256(direct) == checkpoint_state_sha256(resumed)
+    assert direct["training"] == resumed["training"]
+    for section in ("model_state", "optimizer_state", "batcher_state", "rng_state"):
+        assert direct[section].keys() == resumed[section].keys()
+    for name, tensor in direct["model_state"].items():
+        torch.testing.assert_close(tensor, resumed["model_state"][name], rtol=0, atol=0)
+    assert resumed_summary["tokens_seen"] == 256
+    assert resumed_summary["training_tokens_this_process"] == 128

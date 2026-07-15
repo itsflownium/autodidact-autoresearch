@@ -126,6 +126,8 @@ class PatchRCTPolicy:
         )
         if any(count <= 0 or count > len(self.seed_pool) for count in initial_counts):
             raise ControllerError("initial stage pair counts must fit inside seed_pool")
+        if tuple(sorted(initial_counts)) != initial_counts:
+            raise ControllerError("stage pair counts must be nondecreasing")
         if any(
             value <= 0
             for value in (
@@ -138,6 +140,13 @@ class PatchRCTPolicy:
             )
         ):
             raise ControllerError("budgets, batch sizes, and timeout must be positive")
+        token_budgets = (
+            self.cheap_token_budget,
+            self.intermediate_token_budget,
+            self.full_token_budget,
+        )
+        if tuple(sorted(set(token_budgets))) != token_budgets:
+            raise ControllerError("stage token budgets must be strictly increasing")
         for value in (
             self.cheap_eval_tokens,
             self.intermediate_eval_tokens,

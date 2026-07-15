@@ -42,6 +42,8 @@ from autodidact.records import (
     PairedResult,
     PatchProposal,
     RunArm,
+    RunExecutionMode,
+    RunPlan,
     RunResult,
     RunStatus,
     TrialSchedule,
@@ -53,6 +55,7 @@ from autodidact.records import (
     record_from_envelope,
     record_id,
     record_to_envelope,
+    run_compatibility_sha256,
 )
 
 LEDGER_SCHEMA_VERSION = 1
@@ -258,6 +261,7 @@ _ALLOWED_WRITERS: dict[str, frozenset[WriterRole]] = {
     CandidateRecord.RECORD_TYPE: frozenset({WriterRole.CONTROLLER}),
     TrialSchedule.RECORD_TYPE: frozenset({WriterRole.CONTROLLER}),
     TrialSpec.RECORD_TYPE: frozenset({WriterRole.CONTROLLER}),
+    RunPlan.RECORD_TYPE: frozenset({WriterRole.EVALUATOR}),
     RunResult.RECORD_TYPE: frozenset({WriterRole.CONTROLLER, WriterRole.EVALUATOR}),
     ArtifactManifest.RECORD_TYPE: frozenset({WriterRole.CONTROLLER, WriterRole.EVALUATOR}),
     PairedResult.RECORD_TYPE: frozenset({WriterRole.CONTROLLER, WriterRole.EVALUATOR}),
@@ -1025,6 +1029,42 @@ class ExperimentLedger:
         return records
 
     @classmethod
+    def _run_plan_for(
+        cls,
+        connection: sqlite3.Connection,
+        trial_id: str,
+        arm: RunArm,
+    ) -> RunPlan | None:
+        plans = [
+            item
+            for item in cls._records_of_type(connection, RunPlan)
+            if item.trial_id == trial_id and item.arm is arm
+        ]
+        if len(plans) > 1:
+            raise LedgerStateError("trial arm has multiple run plans")
+        return plans[0] if plans else None
+
+    @classmethod
+    def _checkpoint_artifact(
+        cls,
+        connection: sqlite3.Connection,
+        run_id: str,
+    ) -> Any:
+        manifests = [
+            item
+            for item in cls._records_of_type(connection, ArtifactManifest)
+            if item.run_id == run_id
+        ]
+        if len(manifests) != 1:
+            raise LedgerStateError("source run requires one artifact manifest")
+        checkpoints = [
+            artifact for artifact in manifests[0].artifacts if artifact.kind == "checkpoint"
+        ]
+        if len(checkpoints) != 1:
+            raise LedgerStateError("source run requires one checkpoint artifact")
+        return checkpoints[0]
+
+    @classmethod
     def _current_lineage(
         cls,
         connection: sqlite3.Connection,
@@ -1185,9 +1225,88 @@ class ExperimentLedger:
                 raise LedgerStateError("candidate already has this stage and seed trial")
             return
 
+        if isinstance(record, RunPlan):
+            trial = cls._require_record(connection, record.trial_id, TrialSpec)
+            candidate = cls._require_record(connection, trial.candidate_id, CandidateRecord)
+            if record.run_id in {
+                item.run_id for item in cls._records_of_type(connection, RunResult)
+            }:
+                raise LedgerStateError("cannot plan a run after its result exists")
+            if cls._run_plan_for(connection, trial.trial_id, record.arm) is not None:
+                raise LedgerStateError("trial arm already has a run plan")
+            if record.trajectory_token_budget < trial.token_budget:
+                raise LedgerStateError("run trajectory is shorter than its trial milestone")
+            if (
+                trial.token_budget != record.trajectory_token_budget
+                and trial.token_budget not in record.trajectory_milestones
+            ):
+                raise LedgerStateError("trial budget is not a protected trajectory milestone")
+            expected_compatibility = run_compatibility_sha256(
+                trial,
+                candidate,
+                record.arm,
+                trajectory_token_budget=record.trajectory_token_budget,
+                trajectory_milestones=record.trajectory_milestones,
+            )
+            if record.compatibility_sha256 != expected_compatibility:
+                raise LedgerStateError("run plan compatibility hash is invalid")
+            if record.trajectory_id != f"trajectory-{expected_compatibility[:24]}":
+                raise LedgerStateError("run plan trajectory ID is invalid")
+            if record.execution_mode is RunExecutionMode.FRESH:
+                return
+
+            assert record.source_run_id is not None
+            assert record.source_checkpoint_sha256 is not None
+            source = cls._require_record(connection, record.source_run_id, RunResult)
+            source_trial = cls._require_record(connection, source.trial_id, TrialSpec)
+            source_plan = cls._run_plan_for(connection, source.trial_id, source.arm)
+            if source.status is not RunStatus.SUCCEEDED or source.arm is not record.arm:
+                raise LedgerStateError("run plan source is not a successful matching arm")
+            if source_plan is None:
+                raise LedgerStateError("run plan source has no protected trajectory plan")
+            checkpoint = cls._checkpoint_artifact(connection, source.run_id)
+            if checkpoint.sha256 != record.source_checkpoint_sha256:
+                raise LedgerStateError("run plan source checkpoint hash differs")
+            if (
+                source_plan.trajectory_id != record.trajectory_id
+                or source_plan.compatibility_sha256 != record.compatibility_sha256
+                or source_plan.trajectory_token_budget != record.trajectory_token_budget
+                or source_plan.trajectory_milestones != record.trajectory_milestones
+            ):
+                raise LedgerStateError("run plan source belongs to another trajectory")
+            if record.execution_mode is RunExecutionMode.CONTINUE:
+                if (
+                    source_trial.candidate_id != trial.candidate_id
+                    or source.tokens_seen != record.start_tokens
+                    or source.target_tokens >= trial.token_budget
+                    or _STAGE_ORDER[source_trial.stage] >= _STAGE_ORDER[trial.stage]
+                ):
+                    raise LedgerStateError(
+                        "continuation source is not an earlier candidate milestone"
+                    )
+                return
+            if record.arm is not RunArm.PARENT:
+                raise LedgerStateError("only protected parent results may be reused")
+            if (
+                source_trial.parent_commit != trial.parent_commit
+                or source_plan.start_tokens != record.start_tokens
+                or source_trial.stage is not trial.stage
+                or source_trial.seed != trial.seed
+                or source_trial.token_budget != trial.token_budget
+                or source_trial.eval_tokens != trial.eval_tokens
+                or source_trial.batch_size != trial.batch_size
+                or source_trial.eval_batch_size != trial.eval_batch_size
+                or source_trial.limits != trial.limits
+            ):
+                raise LedgerStateError("reused parent result differs from the target trial")
+            return
+
         if isinstance(record, RunResult):
             trial = cls._require_record(connection, record.trial_id, TrialSpec)
             candidate = cls._require_record(connection, trial.candidate_id, CandidateRecord)
+            plan = cls._run_plan_for(connection, trial.trial_id, record.arm)
+            if plan is not None and plan.run_id != record.run_id:
+                raise LedgerStateError("run result differs from its protected run plan")
             if record.seed != trial.seed or record.target_tokens != trial.token_budget:
                 raise LedgerStateError("run seed or budget does not match its trial")
             if trial.eval_tokens is not None and record.evaluation_tokens > trial.eval_tokens:
@@ -1213,6 +1332,13 @@ class ExperimentLedger:
                 for item in cls._records_of_type(connection, PairedResult)
             ):
                 raise LedgerStateError("cannot append a run after a paired result")
+            if plan is not None and plan.execution_mode is RunExecutionMode.REUSE:
+                assert plan.source_run_id is not None
+                source = cls._require_record(connection, plan.source_run_id, RunResult)
+                expected = asdict(source)
+                expected.update({"run_id": record.run_id, "trial_id": record.trial_id})
+                if asdict(record) != expected:
+                    raise LedgerStateError("reused parent outcome differs from its source run")
             return
 
         if isinstance(record, ArtifactManifest):
@@ -1228,6 +1354,33 @@ class ExperimentLedger:
                     raise LedgerStateError(
                         "successful runs require checkpoint and metrics artifacts"
                     )
+            plan = cls._run_plan_for(connection, run.trial_id, run.arm)
+            if plan is not None and plan.execution_mode is RunExecutionMode.REUSE:
+                assert plan.source_run_id is not None
+                source_manifest = next(
+                    (
+                        item
+                        for item in cls._records_of_type(connection, ArtifactManifest)
+                        if item.run_id == plan.source_run_id
+                    ),
+                    None,
+                )
+                if source_manifest is None:
+                    raise LedgerStateError("reused run source manifest is missing")
+
+                def artifact_key(item: Any) -> tuple[Any, ...]:
+                    return (
+                        item.kind,
+                        item.relative_path,
+                        item.sha256,
+                        item.size_bytes,
+                        item.retention,
+                    )
+
+                if sorted(map(artifact_key, record.artifacts)) != sorted(
+                    map(artifact_key, source_manifest.artifacts)
+                ):
+                    raise LedgerStateError("reused run artifacts differ from their source")
             return
 
         if isinstance(record, PairedResult):
@@ -1336,12 +1489,30 @@ class ExperimentLedger:
                 raise LedgerStateError("compute record run and trial differ")
             if record.device != trial.device:
                 raise LedgerStateError("compute device differs from trial")
+            plan = cls._run_plan_for(connection, trial.trial_id, run.arm)
+            if plan is None:
+                expected_training_tokens = run.tokens_seen
+                expected_evaluation_tokens = run.evaluation_tokens
+                expected_wall_seconds = run.wall_seconds
+            elif plan.execution_mode is RunExecutionMode.REUSE:
+                expected_training_tokens = 0
+                expected_evaluation_tokens = 0
+                expected_wall_seconds = 0.0
+            else:
+                expected_training_tokens = run.tokens_seen - plan.start_tokens
+                expected_evaluation_tokens = run.evaluation_tokens
+                expected_wall_seconds = run.wall_seconds
             if (
-                record.training_tokens != run.tokens_seen
-                or record.evaluation_tokens != run.evaluation_tokens
+                record.training_tokens != expected_training_tokens
+                or record.evaluation_tokens != expected_evaluation_tokens
             ):
                 raise LedgerStateError("compute token accounting differs from run result")
-            if not math.isclose(record.wall_seconds, run.wall_seconds, rel_tol=0.0, abs_tol=1e-9):
+            if not math.isclose(
+                record.wall_seconds,
+                expected_wall_seconds,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ):
                 raise LedgerStateError("compute wall time differs from run result")
             if any(
                 item.run_id == record.run_id

@@ -365,6 +365,7 @@ def initialize_study(
         raise StudyError(f"research program does not exist: {program}")
     target_path = None if target_config_path is None else _resolve(repository, target_config_path)
     target = None if target_path is None else TargetConfig.from_path(target_path)
+    plugin = None if target is None else target.load_plugin(repository)
     max_parameters = 1_050_000 if target is None else target.max_parameter_count
     bayesian_policy = _arm_policy(
         StudyArm.PATCH_RCT_BAYESIAN,
@@ -374,6 +375,7 @@ def initialize_study(
     minimum_calibration_tokens = _minimum_calibration_training_tokens(
         reward_calibration_labels,
         bayesian_policy,
+        checkpoint_continuation=plugin is None,
     )
     if limits.max_training_tokens < minimum_calibration_tokens:
         raise StudyError(

@@ -7,21 +7,25 @@ Autodidact configures two different models. Keep them separate:
 - The **target model** is the model trained and measured by the paired autoresearch experiments.
 
 Autodidact does not bundle or preload a trained 1M-parameter checkpoint into the research loop.
-Every parent and candidate arm constructs and trains the target described by `train.py` under the
-same declared seed, token budget, data contract, and device.
+Every trajectory begins from the target described by `train.py` under the same declared seed, token
+budget, data contract, and device. Built-in 2M and 6M stages preserve and continue the checkpoint
+toward 20M; they are not independent retraining runs.
 
 ## Target model
 
 The included 1,016,960-parameter TinyStories transformer is the cheap default target and benchmark
 parent. It is not preloaded into the loop and it is not a requirement for other campaigns. Every
-paired arm constructs and trains the selected target from its declared parent commit.
+paired trajectory constructs and trains the selected target from its declared parent commit. An
+identical protected parent result can be reused across candidates until the accepted parent or any
+training, data, evaluator, environment, batching, or resource contract changes.
 
 There are two target modes:
 
 - **Built-in:** `train.py`, TinyStories BPB, and a 1,050,000-parameter cap. Existing schema-version-1
   target files remain readable.
 - **Plugin:** user-selected trainer files, dataset contract, metric, evaluator, and parameter cap.
-  The 1,050,000 limit does not apply to a plugin target.
+  The 1,050,000 limit does not apply to a plugin target. Schema-version-1 plugins support protected
+  parent-result reuse; checkpoint continuation currently requires the built-in trainer contract.
 
 `autodidact-target doctor` constructs and counts the selected model without training it. The paired
 runner receives the same target file, hashes its control contract, and refuses incompatible drift.

@@ -645,6 +645,7 @@ def save_checkpoint(
     target_tokens: int,
     cumulative_loss: float,
     cumulative_loss_tokens: int,
+    trajectory_milestones: tuple[int, ...] = (),
 ) -> dict[str, str]:
     payload = {
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
@@ -659,6 +660,7 @@ def save_checkpoint(
             "seed": seed,
             "step": step,
             "target_tokens": target_tokens,
+            "trajectory_milestones": list(trajectory_milestones),
             "tokens_seen": tokens_seen,
             "cumulative_loss": cumulative_loss,
             "cumulative_loss_tokens": cumulative_loss_tokens,
@@ -693,6 +695,7 @@ def restore_training_checkpoint(
     batcher: TokenBatcher,
     device: torch.device,
     target_tokens: int,
+    trajectory_milestones: tuple[int, ...] = (),
 ) -> tuple[int, int, int, float, int]:
     payload = load_checkpoint_payload(path, device)
     if payload["model_config"] != asdict(model.config):
@@ -702,6 +705,8 @@ def restore_training_checkpoint(
     training = payload["training"]
     if training["target_tokens"] != target_tokens:
         raise TrainingError("checkpoint target token budget does not match this run")
+    if tuple(training.get("trajectory_milestones", ())) != trajectory_milestones:
+        raise TrainingError("checkpoint trajectory milestones do not match this run")
     model.load_state_dict(payload["model_state"])
     optimizer.load_state_dict(payload["optimizer_state"])
     batcher.load_state_dict(payload["batcher_state"])
@@ -899,6 +904,16 @@ def run_training(args: argparse.Namespace) -> int:
     target_tokens = args.token_budget if args.token_budget is not None else mode.target_tokens
     if target_tokens <= 0:
         raise TrainingError("token budget must be positive")
+    stop_after_tokens = target_tokens if args.stop_after_tokens is None else args.stop_after_tokens
+    if stop_after_tokens <= 0 or stop_after_tokens > target_tokens:
+        raise TrainingError("stop-after token budget must be within the training trajectory")
+    trajectory_milestones = tuple(args.trajectory_milestones)
+    if tuple(sorted(set(trajectory_milestones))) != trajectory_milestones or any(
+        value <= 0 or value >= target_tokens for value in trajectory_milestones
+    ):
+        raise TrainingError(
+            "trajectory milestones must be unique, increasing, and inside the token budget"
+        )
     eval_tokens = mode.eval_tokens if args.eval_tokens is None else args.eval_tokens
     if args.skip_eval:
         eval_tokens = 0
@@ -945,7 +960,9 @@ def run_training(args: argparse.Namespace) -> int:
     active_seed = args.seed
     cumulative_loss = 0.0
     cumulative_loss_tokens = 0
+    resume_checkpoint_sha256 = None
     if args.resume is not None:
+        resume_checkpoint_sha256 = file_sha256(args.resume)
         (
             step,
             tokens_seen,
@@ -959,13 +976,14 @@ def run_training(args: argparse.Namespace) -> int:
             batcher=batcher,
             device=device,
             target_tokens=target_tokens,
+            trajectory_milestones=trajectory_milestones,
         )
         if active_seed != args.seed:
             raise TrainingError(
                 f"checkpoint seed is {active_seed}; command requested seed {args.seed}"
             )
-        if tokens_seen > target_tokens:
-            raise TrainingError("checkpoint has already exceeded the target token budget")
+        if tokens_seen > stop_after_tokens:
+            raise TrainingError("checkpoint has already exceeded the requested milestone")
 
     process_start_tokens = tokens_seen
     next_log = (tokens_seen // log_every + 1) * log_every
@@ -995,13 +1013,20 @@ def run_training(args: argparse.Namespace) -> int:
             model=asdict(model_config),
             parameter_cap=MAX_PARAMETER_COUNT,
             parameter_count=parameter_count,
+            resume_checkpoint_sha256=resume_checkpoint_sha256,
             seed=args.seed,
+            stop_after_tokens=stop_after_tokens,
             target_tokens=target_tokens,
             tokenizer_sha256=manifest["tokenizer"]["artifact"]["sha256"],
+            trajectory_milestones=list(trajectory_milestones),
         )
         model.train()
-        while tokens_seen < target_tokens:
-            remaining = target_tokens - tokens_seen
+        while tokens_seen < stop_after_tokens:
+            next_boundary = next(
+                (value for value in trajectory_milestones if value > tokens_seen),
+                stop_after_tokens,
+            )
+            remaining = min(stop_after_tokens, next_boundary) - tokens_seen
             batch_size, sequence_length = batch_shape_for_remaining(
                 remaining,
                 maximum_batch_size=args.batch_size,
@@ -1054,7 +1079,7 @@ def run_training(args: argparse.Namespace) -> int:
             final_grad_norm = float(grad_norm.item())
             final_learning_rate = learning_rate
 
-            if tokens_seen >= next_log or tokens_seen == target_tokens:
+            if tokens_seen >= next_log or tokens_seen == stop_after_tokens:
                 mean_loss = interval_loss / interval_tokens
                 metrics.emit(
                     "train",
@@ -1074,7 +1099,7 @@ def run_training(args: argparse.Namespace) -> int:
                 while next_log <= tokens_seen:
                     next_log += log_every
 
-            if tokens_seen >= next_checkpoint and tokens_seen < target_tokens:
+            if tokens_seen >= next_checkpoint and tokens_seen < stop_after_tokens:
                 checkpoint_fingerprints = save_checkpoint(
                     checkpoint_path,
                     model=model,
@@ -1086,6 +1111,7 @@ def run_training(args: argparse.Namespace) -> int:
                     step=step,
                     tokens_seen=tokens_seen,
                     target_tokens=target_tokens,
+                    trajectory_milestones=trajectory_milestones,
                     cumulative_loss=cumulative_loss,
                     cumulative_loss_tokens=cumulative_loss_tokens,
                 )
@@ -1112,6 +1138,7 @@ def run_training(args: argparse.Namespace) -> int:
             step=step,
             tokens_seen=tokens_seen,
             target_tokens=target_tokens,
+            trajectory_milestones=trajectory_milestones,
             cumulative_loss=cumulative_loss,
             cumulative_loss_tokens=cumulative_loss_tokens,
         )
@@ -1187,14 +1214,17 @@ def run_training(args: argparse.Namespace) -> int:
             ),
             mode=args.mode,
             parameter_count=parameter_count,
+            resume_checkpoint_sha256=resume_checkpoint_sha256,
             seed=args.seed,
             steps=step,
+            stop_after_tokens=stop_after_tokens,
             target_tokens=target_tokens,
             tokens_seen=tokens_seen,
             training_seconds=training_seconds,
             training_tokens_per_second=(tokens_seen - process_start_tokens)
             / max(training_seconds, 1e-12),
             training_tokens_this_process=tokens_seen - process_start_tokens,
+            trajectory_milestones=list(trajectory_milestones),
             validation_bpb=evaluation["bpb"] if evaluation is not None else None,
             **final_checkpoint_fingerprints,
             **memory.snapshot(),
@@ -1293,6 +1323,8 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--mode", choices=tuple(TRAINING_MODES), default="cheap")
     train.add_argument("--data-root", type=_path, default=default_output_root())
     train.add_argument("--token-budget", type=int)
+    train.add_argument("--stop-after-tokens", type=int)
+    train.add_argument("--trajectory-milestones", type=int, nargs="*", default=())
     train.add_argument("--eval-tokens", type=int)
     train.add_argument("--skip-eval", action="store_true")
     train.add_argument("--batch-size", type=int, default=64)

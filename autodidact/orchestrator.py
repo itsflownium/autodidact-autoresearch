@@ -33,6 +33,8 @@ from autodidact.records import (
     ExperimentStage,
     PairedResult,
     PatchProposal,
+    RunArm,
+    RunPlan,
     RunResult,
     RunStatus,
     TrialSchedule,
@@ -111,15 +113,24 @@ class _CampaignStopped(OrchestratorError):
 def _minimum_calibration_training_tokens(
     label_count: int,
     policy: PatchRCTPolicy,
+    *,
+    checkpoint_continuation: bool = True,
 ) -> int:
-    per_candidate = 2 * sum(
-        policy.initial_pairs(stage) * policy.token_budget(stage)
-        for stage in (
-            ExperimentStage.CHEAP,
-            ExperimentStage.INTERMEDIATE,
-            ExperimentStage.FULL,
+    if checkpoint_continuation:
+        per_candidate = (
+            2
+            * policy.initial_pairs(ExperimentStage.FULL)
+            * policy.token_budget(ExperimentStage.FULL)
         )
-    )
+    else:
+        per_candidate = 2 * sum(
+            policy.initial_pairs(stage) * policy.token_budget(stage)
+            for stage in (
+                ExperimentStage.CHEAP,
+                ExperimentStage.INTERMEDIATE,
+                ExperimentStage.FULL,
+            )
+        )
     return label_count * per_candidate
 
 
@@ -447,6 +458,17 @@ class AutonomousResearchOrchestrator:
             raise OrchestratorError(
                 "campaign max_proposals exceeds the configured execution queue length"
             )
+
+    def _trajectory_options(self) -> dict[str, Any]:
+        if self.config.target_plugin_id is not None:
+            return {}
+        return {
+            "trajectory_token_budget": self.policy.full_token_budget,
+            "trajectory_milestones": (
+                self.policy.cheap_token_budget,
+                self.policy.intermediate_token_budget,
+            ),
+        }
 
     def _calibration_target(self) -> int:
         return self.state.snapshot().limits.reward_calibration_labels
@@ -985,6 +1007,7 @@ class AutonomousResearchOrchestrator:
             limits=self.policy.resource_limits(),
             estimated_accelerator_hour_usd=self.config.estimated_accelerator_hour_usd,
             target_config_path=self.config.target_config_path,
+            **self._trajectory_options(),
         )
 
     def _register_candidate(
@@ -1105,6 +1128,7 @@ class AutonomousResearchOrchestrator:
             limits=schedule.limits,
             estimated_accelerator_hour_usd=self.config.estimated_accelerator_hour_usd,
             target_config_path=self.config.target_config_path,
+            **self._trajectory_options(),
         )
 
     def _schedule_usage(self, schedule: TrialSchedule) -> BudgetAmount:
@@ -1121,9 +1145,48 @@ class AutonomousResearchOrchestrator:
             if record.run_id in run_ids
         ]
         return BudgetAmount(
-            training_tokens=sum(run.tokens_seen for run in runs),
+            training_tokens=sum(record.training_tokens for record in compute),
             compute_seconds=math.fsum(record.accelerator_seconds for record in compute),
         )
+
+    def _schedule_training_reservation(
+        self,
+        candidate: CandidateRecord,
+        schedule: TrialSchedule,
+    ) -> int:
+        if self.config.target_plugin_id is not None:
+            return schedule.token_budget * 2 * len(schedule.seeds)
+        evidence = self._record_snapshot()
+        planned_run_ids = {plan.run_id for plan in self._records(RunPlan, source=evidence)}
+        trials = {
+            trial.trial_id: trial
+            for trial in self._records(TrialSpec, candidate.candidate_id, source=evidence)
+        }
+        runs = self._records(RunResult, source=evidence)
+        if any(
+            run.status is RunStatus.SUCCEEDED
+            and run.trial_id in trials
+            and run.run_id not in planned_run_ids
+            for run in runs
+        ):
+            return schedule.token_budget * 2 * len(schedule.seeds)
+        total = 0
+        for seed in schedule.seeds:
+            for arm in (RunArm.PARENT, RunArm.CANDIDATE):
+                prior_tokens = max(
+                    (
+                        run.tokens_seen
+                        for run in runs
+                        if run.status is RunStatus.SUCCEEDED
+                        and run.arm is arm
+                        and run.trial_id in trials
+                        and trials[run.trial_id].seed == seed
+                        and run.tokens_seen < schedule.token_budget
+                    ),
+                    default=0,
+                )
+                total += schedule.token_budget - prior_tokens
+        return total
 
     def _run_schedule(
         self,
@@ -1138,7 +1201,7 @@ class AutonomousResearchOrchestrator:
         )
         reservation_id = f"budget-{operation_key}"
         requested = BudgetAmount(
-            training_tokens=schedule.token_budget * 2 * len(schedule.seeds),
+            training_tokens=self._schedule_training_reservation(candidate, schedule),
             compute_seconds=(schedule.limits.timeout_seconds * 4.0 * len(schedule.seeds)),
         )
         if claim.disposition is ClaimDisposition.REPLAY:
@@ -1651,6 +1714,7 @@ def main(argv: list[str] | None = None) -> int:
             minimum_calibration_tokens = _minimum_calibration_training_tokens(
                 args.reward_calibration_labels,
                 initialization_policy,
+                checkpoint_continuation=config.target_plugin_id is None,
             )
             if args.max_training_tokens < minimum_calibration_tokens:
                 raise OrchestratorError(

@@ -67,7 +67,7 @@ The baseline is a decoder-only, GPT-style transformer trained from scratch on [T
 | Trainable parameters | **1,016,960** |
 | Autoresearch limit | **1,050,000** |
 
-The starting training recipe uses AdamW, a cosine learning-rate schedule, gradient clipping, and a 16,384-token batch. Cheap, intermediate, and full experiments train for 2M, 6M, and 20M tokens respectively. These are baseline choices, not protected truths: the research agent may change the architecture, optimizer, batching, and training logic while remaining inside the parameter and evaluation constraints.
+The starting training recipe uses AdamW, a cosine learning-rate schedule, gradient clipping, and a 16,384-token batch. Cheap, intermediate, and full evidence is measured at 2M, 6M, and 20M tokens. In the built-in orchestrated target, those are protected milestones on one 20M learning-rate trajectory: later stages resume model, optimizer, RNG, and data-order state instead of restarting. These are baseline choices, not protected truths: the research agent may change the architecture, optimizer, batching, and training logic while remaining inside the parameter and evaluation constraints.
 
 The exact parameter count uses weight-only LayerNorm and bias-free linear layers. The token embedding contains 229,376 parameters; each transformer block contains 196,864; and the final normalization contains 128:
 
@@ -284,7 +284,8 @@ Native adapters are provided for Codex, Claude Code, and Hermes Agent. They use 
 The researcher model and the model under autoresearch are independent. `--model` below selects the
 researcher model used to propose patches; it does not select or download the target model. The loop
 does not preload a trained 1M-parameter checkpoint. The included `train.py` is the initial target
-implementation, and every paired arm trains it from scratch under the protected experiment budget.
+implementation. Each seed starts from scratch once; an escalated stage continues its protected
+checkpoint, and an exact parent result may be reused with explicit ledger provenance.
 
 Create or repair the ignored local configuration with one of:
 
@@ -366,7 +367,7 @@ For each candidate:
 - A **block** is a matched seed, initialization, data order, budget, and evaluator.
 - The **outcome** includes BPB, throughput, memory, and stability.
 
-Parent and patch are both trained for every selected seed. Their execution order is randomized to reduce hardware and thermal drift. Because the intended code patch is the only systematic difference, the paired result gives a much cleaner estimate of that patch's effect than one isolated training run.
+Parent and patch evidence is required for every selected seed. Fresh arms use a protected randomized order. When an identical parent result already exists for the same trajectory, milestone, seed, data, code, evaluator, environment, batching, and limits, the runner aliases that immutable result and records zero new compute. A changed accepted parent or any contract mismatch forces a fresh run. Because the intended code patch is the only systematic difference, the matched result gives a much cleaner estimate of that patch's effect than one isolated training run.
 
 An illustrative trial might look like this:
 
@@ -399,9 +400,10 @@ Before any training starts, the runner:
 - independently invokes protected inspection for both trainers, constructs their models, and counts parameters;
 - gives training only the declared public data root and reserves the protected root for evaluation;
 - commits every selected seed, balanced randomized execution order, budget, hash, evaluator, environment, and resource limit to trial records;
+- records whether each arm is fresh, continued from a hashed checkpoint, or an exact protected parent reuse;
 - creates detached parent and candidate Git worktrees that are removed after the experiment.
 
-For each seed, parent and candidate run sequentially in the precommitted order. Training receives no protected evaluation task. A protected evaluator then loads each checkpoint and emits the plugin's declared raw metric; the runner verifies and maps it to a canonical lower-is-better objective. Candidate-defined printed scores are not used as outcomes. The controller measures subprocess wall time and process RSS, collects device-memory diagnostics, classifies crashes, timeouts, OOMs, non-finite failures, cancellations, and integrity failures, and hashes every retained artifact.
+For each seed, arms requiring compute run sequentially in the precommitted order. Built-in continuation keeps the final learning-rate horizon and 2M/6M batch boundaries fixed, then restores model, optimizer, RNG, and data-order state from the verified source checkpoint. Training receives no protected evaluation task. A protected evaluator then loads each newly produced checkpoint and emits the plugin's declared raw metric; the runner verifies and maps it to a canonical lower-is-better objective. Candidate-defined printed scores are not used as outcomes. The controller measures subprocess wall time and process RSS, collects device-memory diagnostics, classifies crashes, timeouts, OOMs, non-finite failures, cancellations, and integrity failures, and hashes every retained artifact.
 
 Run a predeclared cheap experiment after its proposal is in the ledger:
 
@@ -500,6 +502,7 @@ Every component communicates through versioned, machine-readable records:
 - **Candidate:** proposal link, parent and candidate commits, diff and protected-file hashes, changed paths, and parameter count.
 - **Trial schedule:** stage, fixed seed prefix, assignment seed, budgets, resource limits, policy hash, source effect, and scheduling reason.
 - **Trial specification:** commits, stage, seed, token and evaluation budgets, execution order, protected input hashes, device, and resource limits.
+- **Run plan:** fresh, continued, or reused execution; full trajectory and milestones; source run and checkpoint hash; and complete compatibility commitment.
 - **Run result:** arm, completion status, BPB, losses, throughput, memory, timing, token counts, and seeded data-order hash.
 - **Artifact manifest:** portable relative paths, content hashes, sizes, kinds, and retention policy for each run artifact.
 - **Paired result:** parent-minus-candidate BPB gain, resource deltas, and protected constraint failures for one matched seed.
@@ -654,7 +657,7 @@ uv run autodidact-orchestrator \
   --max-proposals 50 \
   --max-wall-seconds 604800 \
   --max-researcher-tokens 50000000 \
-  --max-training-tokens 7400000000 \
+  --max-training-tokens 5000000000 \
   --max-compute-seconds 604800 \
   --reward-calibration-labels 40 \
   --use-downstream-allocation
@@ -673,10 +676,12 @@ count or pass a lower `run --researcher-token-allowance` after verifying that th
 reasoning effort can complete within that bound. Provider-reported usage above the reserved
 per-proposal allowance is rejected and reported with both counts.
 
-With the default paired schedule, one complete calibration label consumes at least 148M training
-tokens across both arms: 4M cheap, 24M intermediate, and 120M full. Initialization rejects a
-campaign budget below `148M * reward_calibration_labels`; 40 labels therefore require at least
-5.92B tokens before allowing for failed candidates or post-calibration experiments.
+With checkpoint continuation, one complete calibration label consumes at most 120M newly trained
+tokens before parent-cache savings: three 20M seed trajectories across both arms. The 2M and 6M
+measurements are checkpoints on those trajectories rather than separate retraining runs.
+Initialization conservatively requires `120M * reward_calibration_labels`; 40 forced labels require
+4.8B tokens before allowing for failures or post-calibration experiments. Exact parent reuse reduces
+actual settled usage but is not assumed by preflight budgeting.
 
 The test suite substitutes a deterministic local proposal command and synthetic paired measurements. It exercises the real queue assignment, fixed-parent patch adaptation, worktree, commit, ledger, PatchRCT, artifact, state, recovery, replay, and parent-advancement paths without invoking the configured external researcher or performing full model training. The bounded real-MPS diagnostic and its claim limits are recorded in [`docs/smoke/execution-queue-local.md`](docs/smoke/execution-queue-local.md).
 
