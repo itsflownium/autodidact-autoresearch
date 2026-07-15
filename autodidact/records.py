@@ -7,7 +7,7 @@ import math
 import re
 import statistics
 import uuid
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import asdict, dataclass, fields, is_dataclass
 from enum import StrEnum
 from pathlib import PurePosixPath
 from typing import Any, ClassVar, TypeAlias
@@ -48,6 +48,12 @@ class RunStatus(StrEnum):
     NON_FINITE = "non_finite"
     INTEGRITY_FAILURE = "integrity_failure"
     CANCELLED = "cancelled"
+
+
+class RunExecutionMode(StrEnum):
+    FRESH = "fresh"
+    CONTINUE = "continue"
+    REUSE = "reuse"
 
 
 class DecisionVerdict(StrEnum):
@@ -534,6 +540,94 @@ class RunResult:
 
 
 @dataclass(frozen=True, slots=True)
+class RunPlan:
+    RECORD_TYPE: ClassVar[str] = "run_plan"
+
+    plan_id: str
+    trial_id: str
+    run_id: str
+    arm: RunArm
+    execution_mode: RunExecutionMode
+    trajectory_id: str
+    trajectory_token_budget: int
+    trajectory_milestones: tuple[int, ...]
+    start_tokens: int
+    source_run_id: str | None
+    source_checkpoint_sha256: str | None
+    compatibility_sha256: str
+
+    def __post_init__(self) -> None:
+        for name in ("plan_id", "trial_id", "run_id", "trajectory_id"):
+            _validate_id(name, getattr(self, name))
+        _validate_enum("arm", self.arm, RunArm)
+        _validate_enum("execution_mode", self.execution_mode, RunExecutionMode)
+        _validate_integer("trajectory_token_budget", self.trajectory_token_budget, minimum=1)
+        _validate_unique("trajectory_milestones", self.trajectory_milestones)
+        if tuple(sorted(self.trajectory_milestones)) != self.trajectory_milestones or any(
+            value <= 0 or value >= self.trajectory_token_budget
+            for value in self.trajectory_milestones
+        ):
+            raise RecordValidationError(
+                "trajectory milestones must be increasing and inside the trajectory budget"
+            )
+        _validate_integer("start_tokens", self.start_tokens, minimum=0)
+        _validate_sha256("compatibility_sha256", self.compatibility_sha256)
+        if self.execution_mode is RunExecutionMode.FRESH:
+            if (
+                self.start_tokens != 0
+                or self.source_run_id is not None
+                or self.source_checkpoint_sha256 is not None
+            ):
+                raise RecordValidationError("fresh run plans cannot declare a source")
+        else:
+            if self.source_run_id is None or self.source_checkpoint_sha256 is None:
+                raise RecordValidationError("continued and reused run plans require a source")
+            _validate_id("source_run_id", self.source_run_id)
+            _validate_sha256("source_checkpoint_sha256", self.source_checkpoint_sha256)
+            if self.execution_mode is RunExecutionMode.CONTINUE and self.start_tokens <= 0:
+                raise RecordValidationError("continued run plans require source tokens")
+
+
+def run_compatibility_sha256(
+    trial: TrialSpec,
+    candidate: CandidateRecord,
+    arm: RunArm,
+    *,
+    trajectory_token_budget: int,
+    trajectory_milestones: tuple[int, ...],
+) -> str:
+    """Commit to every protected input that can affect a reusable training trajectory."""
+
+    _validate_enum("arm", arm, RunArm)
+    if trial.candidate_id != candidate.candidate_id:
+        raise RecordValidationError("run compatibility candidate differs from its trial")
+    commit = trial.parent_commit if arm is RunArm.PARENT else trial.candidate_commit
+    trainer_sha256 = (
+        trial.parent_trainer_sha256 if arm is RunArm.PARENT else trial.candidate_trainer_sha256
+    )
+    payload = {
+        "arm": arm.value,
+        "batch_size": trial.batch_size,
+        "code_commit": commit,
+        "data_config_sha256": trial.data_config_sha256,
+        "device": trial.device,
+        "environment_sha256": trial.environment_sha256,
+        "evaluator_sha256": trial.evaluator_sha256,
+        "limits": asdict(trial.limits),
+        "policy_sha256": candidate.policy_sha256,
+        "runner_sha256": trial.runner_sha256,
+        "seed": trial.seed,
+        "tokenizer_sha256": trial.tokenizer_sha256,
+        "trainer_sha256": trainer_sha256,
+        "trajectory_milestones": list(trajectory_milestones),
+        "trajectory_token_budget": trajectory_token_budget,
+    }
+    return hashlib.sha256(
+        b"autodidact-run-compatibility-v1\0" + canonical_json_bytes(payload)
+    ).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
 class ArtifactManifest:
     RECORD_TYPE: ClassVar[str] = "artifact_manifest"
 
@@ -902,6 +996,7 @@ ExperimentRecord: TypeAlias = (
     | TrialSpec
     | TrialSchedule
     | RunResult
+    | RunPlan
     | ArtifactManifest
     | PairedResult
     | EffectEstimate
@@ -920,6 +1015,7 @@ _RECORD_CLASSES: dict[str, type[ExperimentRecord]] = {
         TrialSpec,
         TrialSchedule,
         RunResult,
+        RunPlan,
         ArtifactManifest,
         PairedResult,
         EffectEstimate,
@@ -937,6 +1033,7 @@ _RECORD_ID_FIELDS: dict[type[ExperimentRecord], str] = {
     TrialSpec: "trial_id",
     TrialSchedule: "schedule_id",
     RunResult: "run_id",
+    RunPlan: "plan_id",
     ArtifactManifest: "manifest_id",
     PairedResult: "paired_result_id",
     EffectEstimate: "estimate_id",
@@ -998,6 +1095,7 @@ def _parse_record(record_type: str, payload: dict[str, Any]) -> ExperimentRecord
         CandidateRecord.RECORD_TYPE: ("changed_paths",),
         TrialSpec.RECORD_TYPE: ("execution_order",),
         TrialSchedule.RECORD_TYPE: ("seeds",),
+        RunPlan.RECORD_TYPE: ("trajectory_milestones",),
         ArtifactManifest.RECORD_TYPE: ("artifacts",),
         PairedResult.RECORD_TYPE: ("constraint_failures",),
         EffectEstimate.RECORD_TYPE: ("paired_result_ids", "seeds"),
@@ -1027,6 +1125,9 @@ def _parse_record(record_type: str, payload: dict[str, Any]) -> ExperimentRecord
         elif record_type == RunResult.RECORD_TYPE:
             values["arm"] = RunArm(values["arm"])
             values["status"] = RunStatus(values["status"])
+        elif record_type == RunPlan.RECORD_TYPE:
+            values["arm"] = RunArm(values["arm"])
+            values["execution_mode"] = RunExecutionMode(values["execution_mode"])
         elif record_type == ArtifactManifest.RECORD_TYPE:
             artifacts = []
             for artifact in values["artifacts"]:

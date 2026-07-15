@@ -18,7 +18,7 @@ import tempfile
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -51,11 +51,14 @@ from autodidact.records import (
     PatchProposal,
     ResourceLimits,
     RunArm,
+    RunExecutionMode,
+    RunPlan,
     RunResult,
     RunStatus,
     TrialSpec,
     build_paired_result,
     record_to_envelope,
+    run_compatibility_sha256,
 )
 from autodidact.target import TargetConfig, TargetError
 from autodidact.target_plugins import (
@@ -64,7 +67,7 @@ from autodidact.target_plugins import (
     resolve_repository_path,
 )
 
-RUNNER_SCHEMA_VERSION = 3
+RUNNER_SCHEMA_VERSION = 4
 DEFAULT_OUTPUT_ROOT = Path("artifacts/experiments")
 DEFAULT_LEDGER_PATH = Path("artifacts/ledger/experiments.sqlite3")
 MAX_SEED = 2**32 - 1
@@ -137,6 +140,9 @@ class ExperimentRequest:
     limits: ResourceLimits
     estimated_accelerator_hour_usd: float | None = None
     target_config_path: Path | None = None
+    trajectory_token_budget: int | None = None
+    trajectory_milestones: tuple[int, ...] = ()
+    allow_parent_reuse: bool = True
 
     def __post_init__(self) -> None:
         if not self.seeds or len(set(self.seeds)) != len(self.seeds):
@@ -153,6 +159,20 @@ class ExperimentRequest:
             raise RunnerError("batch sizes must be positive")
         if self.timeout_seconds <= 0:
             raise RunnerError("timeout_seconds must be positive")
+        trajectory_budget = self.trajectory_token_budget or self.token_budget
+        if trajectory_budget < self.token_budget:
+            raise RunnerError("trajectory token budget cannot be shorter than the stage budget")
+        if tuple(sorted(set(self.trajectory_milestones))) != self.trajectory_milestones or any(
+            value <= 0 or value >= trajectory_budget for value in self.trajectory_milestones
+        ):
+            raise RunnerError("trajectory milestones must be unique, increasing, and in budget")
+        if (
+            self.token_budget != trajectory_budget
+            and self.token_budget not in self.trajectory_milestones
+        ):
+            raise RunnerError("stage token budget must be a declared trajectory milestone")
+        if type(self.allow_parent_reuse) is not bool:
+            raise RunnerError("allow_parent_reuse must be boolean")
         if self.estimated_accelerator_hour_usd is not None and (
             not math.isfinite(self.estimated_accelerator_hour_usd)
             or self.estimated_accelerator_hour_usd < 0.0
@@ -665,6 +685,14 @@ class PairedExperimentRunner:
                 raise RunnerError(str(error)) from error
         self.trainer_path = "train.py" if self.plugin is None else self.plugin.trainer_path
         self.editable_paths = ("train.py",) if self.plugin is None else self.plugin.editable_paths
+        self.trajectory_token_budget = request.trajectory_token_budget or request.token_budget
+        self.trajectory_milestones = request.trajectory_milestones
+        if self.plugin is not None and (
+            self.trajectory_token_budget != request.token_budget or self.trajectory_milestones
+        ):
+            raise RunnerError(
+                "external target plugin does not declare checkpoint-continuation support"
+            )
         self.policy_contract_sha256 = (
             policy_sha256()
             if self.target_config is None
@@ -784,8 +812,10 @@ class PairedExperimentRunner:
         self,
         trainer: Path,
         trial: TrialSpec,
+        plan: RunPlan,
         paths: dict[str, Path],
         public_data_root: Path,
+        resume_checkpoint: Path | None,
     ) -> list[str]:
         defaults = STAGE_DEFAULTS[trial.stage]
         if self.plugin is not None:
@@ -805,7 +835,7 @@ class PairedExperimentRunner:
                 ),
             )
         log_interval = min(trial.token_budget, max(1, trial.token_budget // 4))
-        return [
+        command = [
             sys.executable,
             str(trainer),
             "train",
@@ -818,6 +848,8 @@ class PairedExperimentRunner:
             "--seed",
             str(trial.seed),
             "--token-budget",
+            str(plan.trajectory_token_budget),
+            "--stop-after-tokens",
             str(trial.token_budget),
             "--batch-size",
             str(trial.batch_size),
@@ -835,6 +867,16 @@ class PairedExperimentRunner:
             "--no-generate",
             "--deterministic",
         ]
+        if plan.trajectory_milestones:
+            command.extend(
+                [
+                    "--trajectory-milestones",
+                    *(str(value) for value in plan.trajectory_milestones),
+                ]
+            )
+        if resume_checkpoint is not None:
+            command.extend(["--resume", str(resume_checkpoint)])
+        return command
 
     def _evaluation_command(
         self,
@@ -898,7 +940,7 @@ class PairedExperimentRunner:
         paths: dict[str, Path],
     ) -> ArtifactManifest:
         kinds = (
-            ("checkpoint", "checkpoint", ArtifactRetention.EPHEMERAL),
+            ("checkpoint", "checkpoint", ArtifactRetention.RETAINED),
             ("metrics", "metrics", ArtifactRetention.COMPACT),
             ("stdout", "training_stdout", ArtifactRetention.COMPACT),
             ("stderr", "training_stderr", ArtifactRetention.COMPACT),
@@ -937,6 +979,167 @@ class PairedExperimentRunner:
                 raise RunnerError("retained run artifact is missing or outside the output root")
             if path.stat().st_size != artifact.size_bytes or file_sha256(path) != artifact.sha256:
                 raise RunnerError("retained run artifact failed hash verification")
+
+    def _manifest_for_run(
+        self,
+        ledger: ExperimentLedger,
+        run_id: str,
+    ) -> ArtifactManifest:
+        manifests = [
+            event.record
+            for event in ledger.events()
+            if isinstance(event.record, ArtifactManifest) and event.record.run_id == run_id
+        ]
+        if len(manifests) != 1:
+            raise RunnerError("source run does not have exactly one artifact manifest")
+        self._verify_manifest(manifests[0])
+        return manifests[0]
+
+    def _checkpoint_for_run(
+        self,
+        ledger: ExperimentLedger,
+        run_id: str,
+    ) -> tuple[Path, str]:
+        manifest = self._manifest_for_run(ledger, run_id)
+        checkpoints = [artifact for artifact in manifest.artifacts if artifact.kind == "checkpoint"]
+        if len(checkpoints) != 1:
+            raise RunnerError("source run does not have exactly one checkpoint artifact")
+        artifact = checkpoints[0]
+        relative = PurePosixPath(artifact.relative_path)
+        path = self.output_root.joinpath(*relative.parts).resolve()
+        if not path.is_relative_to(self.output_root) or not _file_matches(path, artifact.sha256):
+            raise RunnerError("source checkpoint failed protected hash verification")
+        return path, artifact.sha256
+
+    def _run_plan(
+        self,
+        ledger: ExperimentLedger,
+        candidate: CandidateRecord,
+        trial: TrialSpec,
+        arm: RunArm,
+    ) -> RunPlan:
+        plan_id = _stable_id("plan", trial.trial_id, arm.value)
+        compatibility = run_compatibility_sha256(
+            trial,
+            candidate,
+            arm,
+            trajectory_token_budget=self.trajectory_token_budget,
+            trajectory_milestones=self.trajectory_milestones,
+        )
+        trajectory_id = f"trajectory-{compatibility[:24]}"
+        existing = _record_or_none(ledger, plan_id, RunPlan)
+        if existing is not None:
+            if (
+                existing.compatibility_sha256 != compatibility
+                or existing.trajectory_id != trajectory_id
+                or existing.trajectory_token_budget != self.trajectory_token_budget
+                or existing.trajectory_milestones != self.trajectory_milestones
+            ):
+                raise RunnerError("existing run plan differs from the requested trajectory")
+            if existing.source_run_id is not None:
+                self._checkpoint_for_run(ledger, existing.source_run_id)
+            return existing
+        evidence = tuple(event.record for event in ledger.events())
+        trials = {record.trial_id: record for record in evidence if isinstance(record, TrialSpec)}
+        runs = [
+            record
+            for record in evidence
+            if isinstance(record, RunResult)
+            and record.arm is arm
+            and record.status is RunStatus.SUCCEEDED
+        ]
+        plans = {record.run_id: record for record in evidence if isinstance(record, RunPlan)}
+
+        continuation_sources = []
+        for source in runs:
+            source_trial = trials.get(source.trial_id)
+            source_plan = plans.get(source.run_id)
+            if (
+                source_trial is not None
+                and source_plan is not None
+                and source_trial.candidate_id == trial.candidate_id
+                and source_trial.seed == trial.seed
+                and source_plan.trajectory_id == trajectory_id
+                and source.tokens_seen < trial.token_budget
+            ):
+                continuation_sources.append((source.tokens_seen, source, source_plan))
+        continuation = (
+            max(continuation_sources, key=lambda item: item[0]) if continuation_sources else None
+        )
+        intended_start = 0 if continuation is None else continuation[0]
+
+        reusable = None
+        if arm is RunArm.PARENT and self.request.allow_parent_reuse:
+            for source in runs:
+                source_trial = trials.get(source.trial_id)
+                source_plan = plans.get(source.run_id)
+                if (
+                    source_trial is not None
+                    and source_plan is not None
+                    and source_trial.trial_id != trial.trial_id
+                    and source_trial.stage is trial.stage
+                    and source_trial.seed == trial.seed
+                    and source_trial.token_budget == trial.token_budget
+                    and source_trial.eval_tokens == trial.eval_tokens
+                    and source_plan.execution_mode is not RunExecutionMode.REUSE
+                    and source_plan.trajectory_id == trajectory_id
+                    and source_plan.start_tokens == intended_start
+                ):
+                    reusable = (source, source_plan)
+                    break
+
+        run_id = _stable_id("run", trial.trial_id, arm.value)
+        if reusable is not None:
+            source, source_plan = reusable
+            _path, checkpoint_sha256 = self._checkpoint_for_run(ledger, source.run_id)
+            plan = RunPlan(
+                plan_id=plan_id,
+                trial_id=trial.trial_id,
+                run_id=run_id,
+                arm=arm,
+                execution_mode=RunExecutionMode.REUSE,
+                trajectory_id=trajectory_id,
+                trajectory_token_budget=self.trajectory_token_budget,
+                trajectory_milestones=self.trajectory_milestones,
+                start_tokens=source_plan.start_tokens,
+                source_run_id=source.run_id,
+                source_checkpoint_sha256=checkpoint_sha256,
+                compatibility_sha256=compatibility,
+            )
+        elif continuation is not None:
+            start_tokens, source, _source_plan = continuation
+            _path, checkpoint_sha256 = self._checkpoint_for_run(ledger, source.run_id)
+            plan = RunPlan(
+                plan_id=plan_id,
+                trial_id=trial.trial_id,
+                run_id=run_id,
+                arm=arm,
+                execution_mode=RunExecutionMode.CONTINUE,
+                trajectory_id=trajectory_id,
+                trajectory_token_budget=self.trajectory_token_budget,
+                trajectory_milestones=self.trajectory_milestones,
+                start_tokens=start_tokens,
+                source_run_id=source.run_id,
+                source_checkpoint_sha256=checkpoint_sha256,
+                compatibility_sha256=compatibility,
+            )
+        else:
+            plan = RunPlan(
+                plan_id=plan_id,
+                trial_id=trial.trial_id,
+                run_id=run_id,
+                arm=arm,
+                execution_mode=RunExecutionMode.FRESH,
+                trajectory_id=trajectory_id,
+                trajectory_token_budget=self.trajectory_token_budget,
+                trajectory_milestones=self.trajectory_milestones,
+                start_tokens=0,
+                source_run_id=None,
+                source_checkpoint_sha256=None,
+                compatibility_sha256=compatibility,
+            )
+        ledger.append(plan, writer_role=WriterRole.EVALUATOR)
+        return plan
 
     def _failed_run(
         self,
@@ -1012,6 +1215,7 @@ class PairedExperimentRunner:
     def _successful_run(
         self,
         trial: TrialSpec,
+        plan: RunPlan,
         arm: RunArm,
         trainer: Path,
         paths: dict[str, Path],
@@ -1041,7 +1245,9 @@ class PairedExperimentRunner:
             )
         expected = {
             "seed": trial.seed,
-            "target_tokens": trial.token_budget,
+            "stop_after_tokens": trial.token_budget,
+            "target_tokens": plan.trajectory_token_budget,
+            "trajectory_milestones": list(plan.trajectory_milestones),
             "parameter_count": parameter_count,
         }
         for key, value in expected.items():
@@ -1053,6 +1259,19 @@ class PairedExperimentRunner:
             raise RunnerError("training metrics changed the protected tokenizer contract")
         if summary.get("tokens_seen") != trial.token_budget:
             raise RunnerError("successful training did not consume the exact token budget")
+        expected_resume_sha256 = (
+            plan.source_checkpoint_sha256
+            if plan.execution_mode is RunExecutionMode.CONTINUE
+            else None
+        )
+        if (
+            config.get("resume_checkpoint_sha256") != expected_resume_sha256
+            or summary.get("resume_checkpoint_sha256") != expected_resume_sha256
+        ):
+            raise RunnerError("training metrics changed the protected resume checkpoint")
+        training_tokens = _optional_nonnegative_int(summary.get("training_tokens_this_process"))
+        if training_tokens != trial.token_budget - plan.start_tokens:
+            raise RunnerError("training metrics changed incremental token accounting")
         data_order = _valid_sha256(summary.get("data_order_sha256"))
         if data_order is None:
             raise RunnerError("training summary has no valid data-order commitment")
@@ -1119,7 +1338,7 @@ class PairedExperimentRunner:
             parameter_count=parameter_count,
             validation_bpb=validation_bpb,
             mean_train_loss=mean_train_loss,
-            training_tokens_per_second=trial.token_budget / training.wall_seconds,
+            training_tokens_per_second=training_tokens / training.wall_seconds,
             evaluation_tokens_per_second=evaluation_tps,
             peak_process_rss_bytes=max(peak_values),
             peak_device_allocated_bytes=max(allocated_values) if allocated_values else None,
@@ -1246,8 +1465,17 @@ class PairedExperimentRunner:
             data_order_sha256=data_order,
         )
 
-    def _compute_record(self, run: RunResult, trial: TrialSpec) -> ComputeRecord:
+    def _compute_record(
+        self,
+        run: RunResult,
+        trial: TrialSpec,
+        plan: RunPlan,
+    ) -> ComputeRecord:
+        reused = plan.execution_mode is RunExecutionMode.REUSE
+        wall_seconds = 0.0 if reused else run.wall_seconds
         accelerator_seconds = run.wall_seconds if trial.device != "cpu" else 0.0
+        if reused:
+            accelerator_seconds = 0.0
         cost = None
         if self.request.estimated_accelerator_hour_usd is not None:
             cost = accelerator_seconds / 3_600.0 * self.request.estimated_accelerator_hour_usd
@@ -1256,10 +1484,10 @@ class PairedExperimentRunner:
             trial_id=trial.trial_id,
             run_id=run.run_id,
             device=trial.device,
-            wall_seconds=run.wall_seconds,
+            wall_seconds=wall_seconds,
             accelerator_seconds=accelerator_seconds,
-            training_tokens=run.tokens_seen,
-            evaluation_tokens=run.evaluation_tokens,
+            training_tokens=(0 if reused else max(0, run.tokens_seen - plan.start_tokens)),
+            evaluation_tokens=0 if reused else run.evaluation_tokens,
             attempts=1,
             estimated_cost_usd=cost,
         )
@@ -1270,6 +1498,7 @@ class PairedExperimentRunner:
         candidate_root: Path,
         public_data_root: Path,
         trial: TrialSpec,
+        plan: RunPlan,
         arm: RunArm,
         trainer: Path,
         *,
@@ -1284,10 +1513,59 @@ class PairedExperimentRunner:
             self._verify_manifest(manifest)
             return existing
 
+        if plan.execution_mode is RunExecutionMode.REUSE:
+            assert plan.source_run_id is not None
+            source = _record_or_none(ledger, plan.source_run_id, RunResult)
+            if source is None or source.status is not RunStatus.SUCCEEDED:
+                raise RunnerError("protected parent reuse source is unavailable")
+            source_manifest = self._manifest_for_run(ledger, source.run_id)
+            run = replace(source, run_id=run_id, trial_id=trial.trial_id)
+            manifest = ArtifactManifest(
+                manifest_id=_stable_id("manifest", run.run_id),
+                run_id=run.run_id,
+                artifacts=tuple(
+                    replace(
+                        artifact,
+                        artifact_id=_stable_id(
+                            "artifact",
+                            run.run_id,
+                            artifact.kind,
+                            index,
+                        ),
+                    )
+                    for index, artifact in enumerate(source_manifest.artifacts)
+                ),
+            )
+            compute = self._compute_record(run, trial, plan)
+            ledger.append_many(
+                (
+                    (run, WriterRole.EVALUATOR),
+                    (manifest, WriterRole.EVALUATOR),
+                    (compute, WriterRole.EVALUATOR),
+                )
+            )
+            return run
+
         paths = self._arm_paths(candidate_root, trial, arm)
         paths["root"].mkdir(parents=True, exist_ok=True)
+        resume_checkpoint = None
+        if plan.execution_mode is RunExecutionMode.CONTINUE:
+            assert plan.source_run_id is not None
+            resume_checkpoint, checkpoint_sha256 = self._checkpoint_for_run(
+                ledger,
+                plan.source_run_id,
+            )
+            if checkpoint_sha256 != plan.source_checkpoint_sha256:
+                raise RunnerError("continued run source checkpoint changed after planning")
         training = self._run_process(
-            self._training_command(trainer, trial, paths, public_data_root),
+            self._training_command(
+                trainer,
+                trial,
+                plan,
+                paths,
+                public_data_root,
+                resume_checkpoint,
+            ),
             cwd=self._worktree_root(trainer),
             seed=trial.seed,
             stdout_path=paths["stdout"],
@@ -1340,6 +1618,7 @@ class PairedExperimentRunner:
                 try:
                     run = self._successful_run(
                         trial,
+                        plan,
                         arm,
                         trainer,
                         paths,
@@ -1356,7 +1635,7 @@ class PairedExperimentRunner:
                     reason = "protected artifact validation failed"
                 else:
                     manifest = self._artifact_manifest(run, paths)
-                    compute = self._compute_record(run, trial)
+                    compute = self._compute_record(run, trial, plan)
                     ledger.append_many(
                         (
                             (run, WriterRole.EVALUATOR),
@@ -1377,7 +1656,7 @@ class PairedExperimentRunner:
             evaluation=evaluation,
         )
         manifest = self._artifact_manifest(run, paths)
-        compute = self._compute_record(run, trial)
+        compute = self._compute_record(run, trial, plan)
         ledger.append_many(
             (
                 (run, WriterRole.EVALUATOR),
@@ -1621,6 +1900,9 @@ class PairedExperimentRunner:
                 "stage": self.request.stage.value,
                 "target_contract_sha256": self.policy_contract_sha256,
                 "token_budget": self.request.token_budget,
+                "trajectory_milestones": list(self.trajectory_milestones),
+                "trajectory_token_budget": self.trajectory_token_budget,
+                "allow_parent_reuse": self.request.allow_parent_reuse,
                 "trial_contract_sha256": [
                     _sha256_payload(record_to_envelope(trial)) for trial in trials
                 ],
@@ -1643,6 +1925,10 @@ class PairedExperimentRunner:
             run_summaries = []
             pair_ids = []
             for trial in trials:
+                plans = {
+                    arm: self._run_plan(ledger, candidate, trial, arm)
+                    for arm in (RunArm.PARENT, RunArm.CANDIDATE)
+                }
                 results: dict[RunArm, RunResult] = {}
                 for arm in trial.execution_order:
                     results[arm] = self._execute_arm(
@@ -1650,6 +1936,7 @@ class PairedExperimentRunner:
                         candidate_root,
                         public_data_root,
                         trial,
+                        plans[arm],
                         arm,
                         worktrees[arm] / self.trainer_path,
                         parameter_count=int(inspections[arm]["parameter_count"]),
@@ -1681,6 +1968,8 @@ class PairedExperimentRunner:
                         "execution_order": [arm.value for arm in trial.execution_order],
                         "gain_bpb": None if paired is None else paired.gain_bpb,
                         "parent_status": parent.status.value,
+                        "parent_execution_mode": plans[RunArm.PARENT].execution_mode.value,
+                        "candidate_execution_mode": plans[RunArm.CANDIDATE].execution_mode.value,
                         "seed": trial.seed,
                         "trial_id": trial.trial_id,
                     }
@@ -1727,6 +2016,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seeds", type=int, nargs="+", required=True)
     parser.add_argument("--assignment-seed", type=int, required=True)
     parser.add_argument("--token-budget", type=int)
+    parser.add_argument("--trajectory-token-budget", type=int)
+    parser.add_argument("--trajectory-milestones", type=int, nargs="*", default=())
     parser.add_argument("--eval-tokens", type=int)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--eval-batch-size", type=int, default=64)
@@ -1740,6 +2031,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-process-rss-regression", type=float)
     parser.add_argument("--max-device-memory-regression", type=float)
     parser.add_argument("--estimated-accelerator-hour-usd", type=float)
+    parser.add_argument(
+        "--reuse-parent",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     return parser
 
 
@@ -1785,6 +2081,9 @@ def request_from_args(args: argparse.Namespace) -> ExperimentRequest:
             else target.estimated_accelerator_hour_usd
         ),
         target_config_path=args.target_config,
+        trajectory_token_budget=args.trajectory_token_budget,
+        trajectory_milestones=tuple(args.trajectory_milestones),
+        allow_parent_reuse=args.reuse_parent,
     )
 
 

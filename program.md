@@ -41,7 +41,12 @@ uv run train.py --mode full --device auto
 uv run train.py generate --checkpoint CHECKPOINT --prompt "Once upon a time"
 ```
 
-Diagnostic token and evaluation overrides, checkpoint resume, JSONL metrics, and deterministic seed handling must remain functional. A patch must keep the model at or below 1,050,000 trainable parameters. Unless the proposal explicitly tests a parameter-neutral architecture variant, it should preserve the baseline count of 1,016,960.
+Diagnostic token and evaluation overrides, `--stop-after-tokens`,
+`--trajectory-milestones`, checkpoint resume, JSONL metrics, and deterministic seed handling must
+remain functional. The protected controller uses those interfaces to continue one declared learning-
+rate trajectory across 2M and 6M milestones. A patch must keep the model at or below 1,050,000
+trainable parameters. Unless the proposal explicitly tests a parameter-neutral architecture variant,
+it should preserve the baseline count of 1,016,960.
 
 ## Research Unit
 

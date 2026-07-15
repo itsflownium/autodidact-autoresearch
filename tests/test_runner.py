@@ -23,6 +23,8 @@ from autodidact.records import (
     PatchProposal,
     ResourceLimits,
     RunArm,
+    RunExecutionMode,
+    RunPlan,
     RunResult,
     RunStatus,
     TrialSchedule,
@@ -165,11 +167,31 @@ class FakeProcesses:
                 return ProcessOutcome(1, 1.5, 650_000_000)
             seed = int(_argument(command, "--seed"))
             token_budget = int(_argument(command, "--token-budget"))
+            stop_after_tokens = int(_argument(command, "--stop-after-tokens"))
+            trajectory_milestones: list[int] = []
+            if "--trajectory-milestones" in command:
+                start = command.index("--trajectory-milestones") + 1
+                end = next(
+                    (
+                        index
+                        for index in range(start, len(command))
+                        if command[index].startswith("--")
+                    ),
+                    len(command),
+                )
+                trajectory_milestones = [int(value) for value in command[start:end]]
+            resume_sha256 = None
+            start_tokens = 0
+            if "--resume" in command:
+                resume = Path(_argument(command, "--resume"))
+                resume_sha256 = file_sha256(resume)
+                start_tokens = int(resume.read_text(encoding="utf-8").split(":")[-1])
             checkpoint = Path(_argument(command, "--checkpoint-out"))
             metrics = Path(_argument(command, "--metrics-file"))
             checkpoint.parent.mkdir(parents=True, exist_ok=True)
-            checkpoint.write_bytes(
-                ("candidate" if is_candidate else "parent").encode() + str(seed).encode()
+            checkpoint.write_text(
+                f"{'candidate' if is_candidate else 'parent'}-{seed}:{stop_after_tokens}",
+                encoding="utf-8",
             )
             order_hash = hashlib.sha256(f"order-{seed}".encode()).hexdigest()
             events = [
@@ -177,9 +199,12 @@ class FakeProcesses:
                     "event": "config",
                     "data_config_sha256": manifest["pipeline"]["config_sha256"],
                     "parameter_count": 1_016_960,
+                    "resume_checkpoint_sha256": resume_sha256,
                     "seed": seed,
+                    "stop_after_tokens": stop_after_tokens,
                     "target_tokens": token_budget,
                     "tokenizer_sha256": manifest["tokenizer"]["artifact"]["sha256"],
+                    "trajectory_milestones": trajectory_milestones,
                 },
                 {
                     "event": "summary",
@@ -188,9 +213,13 @@ class FakeProcesses:
                     "parameter_count": 1_016_960,
                     "peak_device_allocated_bytes": None,
                     "peak_device_reserved_bytes": None,
+                    "resume_checkpoint_sha256": resume_sha256,
                     "seed": seed,
+                    "stop_after_tokens": stop_after_tokens,
                     "target_tokens": token_budget,
-                    "tokens_seen": token_budget,
+                    "tokens_seen": stop_after_tokens,
+                    "training_tokens_this_process": stop_after_tokens - start_tokens,
+                    "trajectory_milestones": trajectory_milestones,
                     "validation_bpb": 0.0,
                 },
             ]
@@ -466,6 +495,206 @@ def test_runner_keeps_output_contracts_separate_across_stages_and_seed_batches(
         [11, 23],
         [37],
     ]
+
+
+def test_runner_continues_milestones_and_reuses_only_compatible_parent(
+    prepared_dataset: Path,
+    tmp_path: Path,
+) -> None:
+    repository, parent, first_candidate = _repository(tmp_path)
+    ledger_path = tmp_path / "ledger.sqlite3"
+    ledger = ExperimentLedger.create(ledger_path, initial_parent_commit=parent)
+    ledger.append(_proposal(parent), writer_role=WriterRole.RESEARCH_AGENT)
+    cheap = replace(
+        _request(
+            tmp_path,
+            prepared_dataset,
+            repository,
+            ledger_path,
+            first_candidate,
+            seeds=(11,),
+        ),
+        trajectory_token_budget=384,
+        trajectory_milestones=(128, 256),
+    )
+    PairedExperimentRunner(
+        cheap,
+        process_runner=FakeProcesses(ledger_path=ledger_path, expected_trial_count=1),
+    ).run()
+
+    intermediate = replace(
+        cheap,
+        stage=ExperimentStage.INTERMEDIATE,
+        token_budget=256,
+        eval_tokens=256,
+    )
+    intermediate_processes = FakeProcesses(
+        ledger_path=ledger_path,
+        expected_trial_count=2,
+    )
+    result = PairedExperimentRunner(
+        intermediate,
+        process_runner=intermediate_processes,
+    ).run()
+
+    assert len(result["pair_ids"]) == 1
+    assert intermediate_processes.training_calls == 2
+    intermediate_trial_id = result["runs"][0]["trial_id"]
+    intermediate_plans = [
+        event.record
+        for event in ledger.events()
+        if isinstance(event.record, RunPlan) and event.record.trial_id == intermediate_trial_id
+    ]
+    assert {plan.execution_mode for plan in intermediate_plans} == {RunExecutionMode.CONTINUE}
+    continued_compute = [
+        event.record
+        for event in ledger.events()
+        if isinstance(event.record, ComputeRecord)
+        and event.record.trial_id == intermediate_trial_id
+    ]
+    assert [record.training_tokens for record in continued_compute] == [128, 128]
+
+    _git(repository, "switch", "-c", "candidate-two", parent)
+    (repository / "train.py").write_text(
+        "BASELINE = True\n# second candidate treatment\n",
+        encoding="utf-8",
+    )
+    _git(repository, "add", "train.py")
+    _git(repository, "commit", "-m", "Add second candidate")
+    second_candidate = _git(repository, "rev-parse", "HEAD")
+    second_proposal = replace(
+        _proposal(parent),
+        proposal_id="proposal-runner-002",
+        title="Second candidate treatment",
+    )
+    ledger.append(second_proposal, writer_role=WriterRole.RESEARCH_AGENT)
+    second_request = replace(
+        cheap,
+        proposal_id=second_proposal.proposal_id,
+        candidate_commit=second_candidate,
+    )
+    second_processes = FakeProcesses(
+        ledger_path=ledger_path,
+        expected_trial_count=3,
+    )
+
+    second_result = PairedExperimentRunner(
+        second_request,
+        process_runner=second_processes,
+    ).run()
+
+    assert len(second_result["pair_ids"]) == 1
+    assert second_processes.training_calls == 1
+    assert second_processes.evaluation_calls == 1
+    assert second_result["runs"][0]["parent_execution_mode"] == "reuse"
+    assert second_result["runs"][0]["candidate_execution_mode"] == "fresh"
+    second_trial_id = second_result["runs"][0]["trial_id"]
+    second_compute = [
+        event.record
+        for event in ledger.events()
+        if isinstance(event.record, ComputeRecord) and event.record.trial_id == second_trial_id
+    ]
+    assert sorted(record.training_tokens for record in second_compute) == [0, 128]
+    assert ledger.summary()["compute"]["training_tokens"] == 640
+
+    _git(repository, "switch", "-c", "candidate-three", parent)
+    (repository / "train.py").write_text(
+        "BASELINE = True\n# third candidate treatment\n",
+        encoding="utf-8",
+    )
+    _git(repository, "add", "train.py")
+    _git(repository, "commit", "-m", "Add third candidate")
+    third_candidate = _git(repository, "rev-parse", "HEAD")
+    third_proposal = replace(
+        _proposal(parent),
+        proposal_id="proposal-runner-003",
+        title="Third candidate treatment",
+    )
+    ledger.append(third_proposal, writer_role=WriterRole.RESEARCH_AGENT)
+    incompatible_request = replace(
+        cheap,
+        proposal_id=third_proposal.proposal_id,
+        candidate_commit=third_candidate,
+        batch_size=4,
+    )
+    incompatible_processes = FakeProcesses(
+        ledger_path=ledger_path,
+        expected_trial_count=4,
+    )
+
+    incompatible_result = PairedExperimentRunner(
+        incompatible_request,
+        process_runner=incompatible_processes,
+    ).run()
+
+    assert incompatible_processes.training_calls == 2
+    assert incompatible_result["runs"][0]["parent_execution_mode"] == "fresh"
+
+
+def test_parent_reuse_fails_closed_after_checkpoint_tampering(
+    prepared_dataset: Path,
+    tmp_path: Path,
+) -> None:
+    repository, parent, first_candidate = _repository(tmp_path)
+    ledger_path = tmp_path / "ledger.sqlite3"
+    ledger = ExperimentLedger.create(ledger_path, initial_parent_commit=parent)
+    ledger.append(_proposal(parent), writer_role=WriterRole.RESEARCH_AGENT)
+    request = _request(
+        tmp_path,
+        prepared_dataset,
+        repository,
+        ledger_path,
+        first_candidate,
+        seeds=(11,),
+    )
+    PairedExperimentRunner(
+        request,
+        process_runner=FakeProcesses(ledger_path=ledger_path, expected_trial_count=1),
+    ).run()
+    parent_run = next(
+        event.record
+        for event in ledger.events()
+        if isinstance(event.record, RunResult) and event.record.arm is RunArm.PARENT
+    )
+    parent_manifest = next(
+        event.record
+        for event in ledger.events()
+        if isinstance(event.record, ArtifactManifest) and event.record.run_id == parent_run.run_id
+    )
+    checkpoint = next(
+        artifact for artifact in parent_manifest.artifacts if artifact.kind == "checkpoint"
+    )
+    checkpoint_path = request.output_root / checkpoint.relative_path
+    checkpoint_path.write_text("tampered", encoding="utf-8")
+
+    _git(repository, "switch", "-c", "candidate-two", parent)
+    (repository / "train.py").write_text(
+        "BASELINE = True\n# second candidate treatment\n",
+        encoding="utf-8",
+    )
+    _git(repository, "add", "train.py")
+    _git(repository, "commit", "-m", "Add second candidate")
+    second_candidate = _git(repository, "rev-parse", "HEAD")
+    second_proposal = replace(
+        _proposal(parent),
+        proposal_id="proposal-runner-002",
+        title="Second candidate treatment",
+    )
+    ledger.append(second_proposal, writer_role=WriterRole.RESEARCH_AGENT)
+    second_request = replace(
+        request,
+        proposal_id=second_proposal.proposal_id,
+        candidate_commit=second_candidate,
+    )
+
+    with pytest.raises(RunnerError, match="hash verification"):
+        PairedExperimentRunner(
+            second_request,
+            process_runner=FakeProcesses(
+                ledger_path=ledger_path,
+                expected_trial_count=2,
+            ),
+        ).run()
 
 
 def test_candidate_preflight_is_recorded_before_controller_schedule(

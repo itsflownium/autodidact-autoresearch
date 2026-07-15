@@ -141,7 +141,7 @@ def test_study_rejects_budget_below_forced_calibration_minimum(tmp_path: Path) -
     researcher = _researcher_config(repository)
     root = tmp_path / "underfunded-study"
 
-    with pytest.raises(StudyError, match="requires at least 5920000000"):
+    with pytest.raises(StudyError, match="requires at least 4800000000"):
         initialize_study(
             study_root=root,
             repository_root=repository,
@@ -151,7 +151,7 @@ def test_study_rejects_budget_below_forced_calibration_minimum(tmp_path: Path) -
                 max_proposals=50,
                 max_wall_seconds=10_000,
                 max_researcher_tokens=500_000,
-                max_training_tokens=5_919_999_999,
+                max_training_tokens=4_799_999_999,
                 max_compute_seconds=100_000,
             ),
             reward_calibration_labels=40,
