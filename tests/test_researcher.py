@@ -176,6 +176,8 @@ print(RESPONSE)
     proposal_work = prompt["contract"]["proposal_work"]
     assert "at most 12" in proposal_work["commands"]
     assert "Git history" in proposal_work["inspection"]
+    assert "repair it once" in proposal_work["repair"]
+    assert "post-submission repair requires a new proposal" in proposal_work["repair"]
     assert "Do not run training" in proposal_work["validation"]
     assert "controller owns comprehensive validation" in proposal_work["validation"]
     assert transcript["response"]["proposal"]["hypothesis"] == (

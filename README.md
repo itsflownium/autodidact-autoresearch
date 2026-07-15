@@ -452,7 +452,7 @@ flowchart TB
         promotion -->|Reject| rejected["Rejected archive"]
         promotion -->|Escalate| scheduler
         promotion -->|Promote| accepted["Accepted commit<br/>new parent"]
-        accepted --> interactions["Patch-interaction auditor"]
+        accepted --> interactions["Patch-interaction audit planner"]
     end
 
     subgraph persistence["5. Persistence and final evaluation"]
@@ -461,8 +461,8 @@ flowchart TB
     end
 
     accepted -->|Lineage complete| hidden
-    interactions -->|Pass| agent
-    interactions -->|Conflict| lineage
+    interactions -->|Current| agent
+    interactions -->|Leave-one-out required| scheduler
     scheduler -.-> ledger
     metrics -.-> ledger
     effect -.-> ledger
@@ -488,7 +488,7 @@ flowchart TB
 | Downstream-reward estimator | Predicts the patch's full-budget held-out gain from its early learning curves and resource signals. | Predictive distribution and calibrated interval |
 | Protected compute allocator | Uses calibrated predictions to stop, gather another predetermined seed, run full, or select an outcome-independent audit. | Downstream allocation record and authorized schedule |
 | Promotion controller | Applies the predeclared evidence threshold and resource constraints. | Reject, escalate, or promote decision |
-| Patch-interaction auditor | Tests whether promoted changes remain helpful in the accepted stack and through leave-one-out ablations. | Interaction and stack-validity records |
+| Patch-interaction audit planner | Marks older promotions for leave-one-out revalidation and checks whether their original diffs can be reversed from the accepted stack. | Deterministic audit plan tied to ledger evidence |
 | Evidence ledger | Stores claims, commits, trial specifications, artifacts, estimates, decisions, and compute usage. | Reproducible experiment history |
 | Sealed final evaluator | Evaluates a completed lineage once on untouched data, seeds, and longer budgets. | Final transfer result |
 
@@ -547,6 +547,18 @@ uv run autodidact-ledger \
   export --output experiments/evidence.json --format snapshot
 ```
 
+Write a compact Karpathy-style results table derived from the same verified evidence:
+
+```bash
+uv run autodidact-ledger \
+  --path artifacts/ledger/experiments.sqlite3 \
+  results --output experiments/results.tsv
+```
+
+The TSV contains one row per candidate with the latest paired BPB effect, useful-gain probability,
+resource deltas, decision, parameter count, changed paths, and reason. It is a readable index, not
+a replacement for the hash-chained JSON or JSONL evidence export.
+
 Ledger databases, WAL files, and shared-memory files remain local and ignored by Git. The compact JSON or JSONL export is the portable review surface. Schema migration is explicit through `autodidact-ledger migrate` and must preserve the event head. The ledger is tamper-evident under the repository's file-access boundary; it is not a cryptographically signed remote transparency log.
 
 ## Campaign state and recovery
@@ -597,6 +609,11 @@ For each proposal, the orchestrator:
 9. extracts early reward features or full-budget labels, updates the Bayesian model, and records available predictions;
 10. lets PatchRCT reject, request the next seed, escalate, or promote; and
 11. starts the next proposal from the newly accepted parent after promotion.
+
+Within the proposal call, the researcher may repair one implementation error exposed by a permitted
+focused static check. That repair must preserve the original hypothesis and cannot use training or
+quality metrics. A submitted candidate commit remains immutable; later repair requires a new
+proposal and evidence trail.
 
 When a campaign has a nonzero reward-calibration target, each safe candidate is advanced through the initial cheap, intermediate, and full paired stages until the target number of unique candidates has both an early feature snapshot and a full label. Low efficacy cannot stop those calibration candidates early, but crashes, non-finite outcomes, integrity failures, parameter violations, and resource regressions still reject them immediately. Full-stage promotion continues to use the normal PatchRCT threshold. Once the target is reached, ordinary early rejection resumes automatically.
 
@@ -674,6 +691,14 @@ The initial probability model is a protected normal-normal posterior. Its observ
 - promote only after the required full-stage pairs reach at least 95%;
 - otherwise schedule the next fixed seed until the pool is exhausted, then reject as inconclusive.
 
+An optional `scout_patch_rct` decision mode borrows autoresearch's fast positive/negative screen
+without borrowing single-run promotion. One fixed 2M-token cheap pair rejects a non-positive
+observed gain or escalates a positive gain to ordinary protected intermediate PatchRCT. It can never
+promote at the scout stage; intermediate and full evidence still use the minimum-useful-effect
+posterior and resource gates above. Fixed token budgets make this comparable across laptop and GPU
+hardware, unlike a literal five-minute timer. Forced reward calibration and downstream allocation
+retain their protected evidence paths instead of using the scout shortcut.
+
 Initialize a validated candidate and inspect the persisted schedule:
 
 ```bash
@@ -687,6 +712,14 @@ After the scheduled trial records and outcomes are present, advance the state ma
 uv run autodidact-controller advance --candidate-id candidate-001
 ```
 
+Select the scout for an autonomous campaign by placing the global option before the command:
+
+```bash
+uv run autodidact-orchestrator \
+  --decision-mode scout_patch_rct \
+  run --max-new-proposals 1
+```
+
 An escalation decision and its next-stage schedule are appended in one transaction. A promotion decision and lineage transition are also atomic; after the ledger parent advances, the controller synchronizes `refs/autodidact/accepted` to the accepted candidate commit. Crashes, timeouts, OOMs, non-finite outcomes, and incomplete pairs cannot be converted into a favorable effect and are rejected or left waiting with explicit reasons.
 
 ### Trust boundaries
@@ -697,6 +730,27 @@ An escalation decision and its next-stage schedule are appended in one transacti
 - The metric collector computes results from run artifacts. A candidate cannot promote itself by printing a favorable score.
 - Parent results are reused only when commit, seed, data block, budget, backend, and evaluator version all match.
 - Every decision is reconstructable from the evidence ledger without relying on the research agent's narrative.
+
+## Promoted-stack interaction audit planning
+
+Each promotion is directly tested against the accepted stack that existed at that generation. A
+later promotion can change whether an older patch remains useful. `autodidact-interactions` builds a
+deterministic plan from verified lineage evidence, marks every older promotion as requiring a
+leave-one-out test, and optionally checks the reverse diff against the current stack in an isolated
+temporary worktree:
+
+```bash
+uv run autodidact-interactions \
+  --ledger-path artifacts/ledger/experiments.sqlite3 \
+  --repository-root . \
+  --output experiments/interaction-plan.json
+```
+
+This command does not modify the accepted branch, create favorable replacement code, or claim an
+interaction result. A clean reverse patch means an ablation candidate can be prepared for the
+protected paired runner. A conflict means the removal requires explicit adaptation and a new
+auditable candidate. Leave-one-out training and its verdict remain future experiment evidence until
+those planned candidates actually run.
 
 ## Estimating downstream reward
 

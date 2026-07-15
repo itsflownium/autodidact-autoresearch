@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
+import io
 import json
 import math
 import os
@@ -76,6 +78,28 @@ _STAGE_ORDER = {
     ExperimentStage.PROMOTION: 3,
     ExperimentStage.SEALED_FINAL: 4,
 }
+
+RESULTS_TSV_COLUMNS = (
+    "experiment_index",
+    "candidate_id",
+    "candidate_commit",
+    "parent_commit",
+    "status",
+    "stage",
+    "paired_seeds",
+    "mean_gain_bpb",
+    "minimum_useful_gain_bpb",
+    "probability_exceeds_minimum",
+    "parent_bpb_mean",
+    "candidate_bpb_mean",
+    "throughput_delta_mean",
+    "peak_rss_delta_bytes_mean",
+    "constraints_passed",
+    "parameter_count",
+    "changed_paths",
+    "title",
+    "reason",
+)
 
 _SCHEMA_SQL = f"""
 PRAGMA application_id = {APPLICATION_ID};
@@ -1870,6 +1894,120 @@ class ExperimentLedger:
             connection.close()
             self._refresh_snapshot_fingerprint()
 
+    def results_rows(self) -> list[dict[str, Any]]:
+        """Return a compact, human-readable view derived from verified ledger evidence."""
+
+        events = self.events()
+        proposals = {
+            event.record.proposal_id: event.record
+            for event in events
+            if isinstance(event.record, PatchProposal)
+        }
+        pairs = {
+            event.record.paired_result_id: event.record
+            for event in events
+            if isinstance(event.record, PairedResult)
+        }
+        rows: list[dict[str, Any]] = []
+        candidates = [event.record for event in events if isinstance(event.record, CandidateRecord)]
+        for index, candidate in enumerate(candidates, start=1):
+            proposal = proposals[candidate.proposal_id]
+            estimates = [
+                event.record
+                for event in events
+                if isinstance(event.record, EffectEstimate)
+                and event.record.candidate_id == candidate.candidate_id
+            ]
+            decisions = [
+                event.record
+                for event in events
+                if isinstance(event.record, DecisionRecord)
+                and event.record.candidate_id == candidate.candidate_id
+            ]
+            schedules = [
+                event.record
+                for event in events
+                if isinstance(event.record, TrialSchedule)
+                and event.record.candidate_id == candidate.candidate_id
+            ]
+            effect = estimates[-1] if estimates else None
+            decision = decisions[-1] if decisions else None
+            effect_pairs = (
+                [] if effect is None else [pairs[item] for item in effect.paired_result_ids]
+            )
+            stage = (
+                effect.stage if effect is not None else (schedules[-1].stage if schedules else None)
+            )
+            rows.append(
+                {
+                    "experiment_index": index,
+                    "candidate_id": candidate.candidate_id,
+                    "candidate_commit": candidate.candidate_commit,
+                    "parent_commit": candidate.parent_commit,
+                    "status": "running" if decision is None else decision.verdict.value,
+                    "stage": "" if stage is None else stage.value,
+                    "paired_seeds": ",".join(str(item.seed) for item in effect_pairs),
+                    "mean_gain_bpb": None if effect is None else effect.mean_gain_bpb,
+                    "minimum_useful_gain_bpb": proposal.minimum_useful_gain_bpb,
+                    "probability_exceeds_minimum": (
+                        None if effect is None else effect.probability_exceeds_minimum
+                    ),
+                    "parent_bpb_mean": (
+                        None
+                        if not effect_pairs
+                        else statistics.fmean(item.parent_bpb for item in effect_pairs)
+                    ),
+                    "candidate_bpb_mean": (
+                        None
+                        if not effect_pairs
+                        else statistics.fmean(item.candidate_bpb for item in effect_pairs)
+                    ),
+                    "throughput_delta_mean": (
+                        None
+                        if not effect_pairs
+                        else statistics.fmean(
+                            item.training_throughput_delta for item in effect_pairs
+                        )
+                    ),
+                    "peak_rss_delta_bytes_mean": (
+                        None
+                        if not effect_pairs
+                        else statistics.fmean(
+                            item.peak_process_rss_delta_bytes for item in effect_pairs
+                        )
+                    ),
+                    "constraints_passed": (None if effect is None else effect.constraints_passed),
+                    "parameter_count": candidate.parameter_count,
+                    "changed_paths": ",".join(candidate.changed_paths),
+                    "title": proposal.title,
+                    "reason": "" if decision is None else "; ".join(decision.reasons),
+                }
+            )
+        return rows
+
+    def export_results_tsv(self, output_path: Path) -> None:
+        """Write a review-oriented TSV without replacing the authoritative ledger export."""
+
+        stream = io.StringIO(newline="")
+        writer = csv.DictWriter(stream, fieldnames=RESULTS_TSV_COLUMNS, dialect="excel-tab")
+        writer.writeheader()
+        for row in self.results_rows():
+            writer.writerow(
+                {
+                    key: (
+                        ""
+                        if value is None
+                        else str(value).lower()
+                        if isinstance(value, bool)
+                        else format(value, ".12g")
+                        if isinstance(value, float)
+                        else value
+                    )
+                    for key, value in row.items()
+                }
+            )
+        _atomic_write(output_path.expanduser().resolve(), stream.getvalue())
+
     @classmethod
     def _events_without_verification(
         cls,
@@ -1972,6 +2110,9 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("--format", choices=("snapshot", "jsonl"), default="snapshot")
     export.add_argument("--redact", action="append", default=[])
 
+    results = commands.add_parser("results", help="write a compact review-oriented TSV")
+    results.add_argument("--output", type=_path, required=True)
+
     commands.add_parser("migrate", help="apply explicit non-evidence schema migrations")
     return parser
 
@@ -2020,6 +2161,9 @@ def main(argv: list[str] | None = None) -> int:
                     redactions=args.redact,
                 )
                 payload = {"exported": str(args.output), "format": args.format}
+            elif args.command == "results":
+                ledger.export_results_tsv(args.output)
+                payload = {"exported": str(args.output), "format": "tsv"}
             else:
                 raise AssertionError(f"unhandled command: {args.command}")
         print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))

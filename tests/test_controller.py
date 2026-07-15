@@ -388,6 +388,74 @@ def test_greedy_mode_cannot_enable_patchrct_calibration_or_allocation() -> None:
         )
 
 
+def test_scout_patchrct_escalates_positive_scout_without_promoting(tmp_path: Path) -> None:
+    policy = PatchRCTPolicy(decision_mode=DecisionMode.SCOUT_PATCH_RCT)
+    ledger, controller, candidate, _repository_root = _setup(tmp_path, policy=policy)
+    controller.initialize(candidate.candidate_id)
+    cheap = _latest_schedule(ledger, ExperimentStage.CHEAP)
+    _complete_schedule(ledger, candidate, cheap, {11: 0.0001})
+
+    action = controller.advance(candidate.candidate_id)
+
+    assert action["verdict"] == "escalate"
+    assert action["from_stage"] == ExperimentStage.CHEAP.value
+    assert action["stage"] == ExperimentStage.INTERMEDIATE.value
+    assert action["seeds"] == [11, 23]
+    assert ledger.current_parent() == candidate.parent_commit
+    decisions = [
+        event.record for event in ledger.events() if isinstance(event.record, DecisionRecord)
+    ]
+    assert decisions[-1].probability_threshold == 0.0
+    assert "positive scout gain" in decisions[-1].reasons[0]
+
+
+def test_scout_patchrct_rejects_nonpositive_scout(tmp_path: Path) -> None:
+    policy = PatchRCTPolicy(decision_mode=DecisionMode.SCOUT_PATCH_RCT)
+    ledger, controller, candidate, _repository_root = _setup(tmp_path, policy=policy)
+    controller.initialize(candidate.candidate_id)
+    cheap = _latest_schedule(ledger, ExperimentStage.CHEAP)
+    _complete_schedule(ledger, candidate, cheap, {11: 0.0})
+
+    action = controller.advance(candidate.candidate_id)
+
+    assert action["action"] == "reject"
+    assert action["stage"] == ExperimentStage.CHEAP.value
+    assert ledger.current_parent() == candidate.parent_commit
+    decisions = [
+        event.record for event in ledger.events() if isinstance(event.record, DecisionRecord)
+    ]
+    assert decisions[-1].probability_threshold == 0.0
+    assert "cheap scout" in decisions[-1].reasons[0]
+
+
+def test_scout_patchrct_requires_exactly_one_initial_cheap_pair() -> None:
+    with pytest.raises(ControllerError, match="requires one cheap pair"):
+        PatchRCTPolicy(
+            decision_mode=DecisionMode.SCOUT_PATCH_RCT,
+            cheap_initial_pairs=2,
+        )
+
+
+def test_scout_patchrct_does_not_bias_forced_calibration_labels(tmp_path: Path) -> None:
+    policy = PatchRCTPolicy(
+        decision_mode=DecisionMode.SCOUT_PATCH_RCT,
+        force_full_evaluation=True,
+    )
+    ledger, controller, candidate, _repository_root = _setup(tmp_path, policy=policy)
+    controller.initialize(candidate.candidate_id)
+    cheap = _latest_schedule(ledger, ExperimentStage.CHEAP)
+    _complete_schedule(ledger, candidate, cheap, {11: -0.01})
+
+    action = controller.advance(candidate.candidate_id)
+
+    assert action["verdict"] == "escalate"
+    assert action["stage"] == ExperimentStage.INTERMEDIATE.value
+    decisions = [
+        event.record for event in ledger.events() if isinstance(event.record, DecisionRecord)
+    ]
+    assert "calibration policy" in decisions[-1].reasons[0]
+
+
 def test_controller_escalates_all_stages_and_atomically_promotes_git_parent(
     tmp_path: Path,
 ) -> None:
