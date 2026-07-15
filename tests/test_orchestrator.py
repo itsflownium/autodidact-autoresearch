@@ -9,13 +9,14 @@ from pathlib import Path
 import pytest
 
 from autodidact.checkpoints import file_sha256
-from autodidact.controller import PatchRCTPolicy
+from autodidact.controller import DecisionMode, PatchRCTPolicy
 from autodidact.data.integrity import policy_sha256
 from autodidact.execution_queue import QUEUE_ASSIGNMENT_MARKER, ExecutionQueue
 from autodidact.ledger import ExperimentLedger, WriterRole
 from autodidact.orchestrator import (
     AutonomousResearchOrchestrator,
     OrchestratorConfig,
+    _minimum_calibration_training_tokens,
     main,
 )
 from autodidact.records import (
@@ -956,6 +957,14 @@ def test_training_budget_is_enforced_before_paired_runner_launch(tmp_path: Path)
     assert factory.registration_calls == 1
 
 
+def test_calibration_budget_counts_both_arms_at_every_required_stage() -> None:
+    policy = PatchRCTPolicy(decision_mode=DecisionMode.SCOUT_PATCH_RCT)
+
+    required = _minimum_calibration_training_tokens(40, policy)
+
+    assert required == 5_920_000_000
+
+
 def test_pause_request_prevents_new_research_invocation(tmp_path: Path) -> None:
     orchestrator, state, ledger, factory, _repository_root = _campaign(
         tmp_path,
@@ -978,6 +987,33 @@ def test_cli_initializes_and_reports_campaign_without_researcher_call(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     repository, parent = _repository(tmp_path)
+    researcher_config = repository / "artifacts" / "control" / "researcher.json"
+    researcher_config.parent.mkdir(parents=True)
+    researcher_config.write_text(
+        json.dumps(
+            {
+                "command": ["python", "fake-researcher.py"],
+                "provider": "command",
+                "schema_version": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    target_config = repository / "artifacts" / "control" / "target.json"
+    target_config.write_text(
+        json.dumps(
+            {
+                "data_root": str(tmp_path / "unused-data"),
+                "device": "cpu",
+                "execution_location": "local",
+                "max_parameter_count": 1_050_000,
+                "name": "CLI test target",
+                "schema_version": 2,
+                "trainer_path": "train.py",
+            }
+        ),
+        encoding="utf-8",
+    )
     ledger_path = tmp_path / "cli-ledger.sqlite3"
     state_path = tmp_path / "cli-state.sqlite3"
     common = [
@@ -987,6 +1023,12 @@ def test_cli_initializes_and_reports_campaign_without_researcher_call(
         str(ledger_path),
         "--state-path",
         str(state_path),
+        "--decision-mode",
+        "scout_patch_rct",
+        "--researcher-config",
+        str(researcher_config),
+        "--target-config",
+        str(target_config),
     ]
 
     exit_code = main(
@@ -1002,7 +1044,7 @@ def test_cli_initializes_and_reports_campaign_without_researcher_call(
             "--max-researcher-tokens",
             "10000",
             "--max-training-tokens",
-            "100000",
+            "400000000",
             "--max-compute-seconds",
             "1000",
             "--reward-calibration-labels",
@@ -1016,11 +1058,23 @@ def test_cli_initializes_and_reports_campaign_without_researcher_call(
     assert initialized["campaign"]["accepted_parent_commit"] == parent
     assert initialized["campaign"]["limits"]["reward_calibration_labels"] == 2
     assert initialized["campaign"]["limits"]["use_downstream_allocation"] is True
+    assert initialized["campaign"]["limits"]["decision_mode"] == "scout_patch_rct"
+    assert initialized["campaign"]["limits"]["researcher_config_sha256"] is not None
+    assert initialized["campaign"]["limits"]["program_sha256"] is not None
+    assert initialized["campaign"]["limits"]["target_config_sha256"] is not None
     assert initialized["downstream_allocation"]["ready"] is False
     assert initialized["reward_calibration"]["remaining_labels"] == 2
     assert _git(repository, "rev-parse", "refs/autodidact/accepted") == parent
 
-    assert main([*common, "status"]) == 0
+    resume_common = [
+        "--repository-root",
+        str(repository),
+        "--ledger-path",
+        str(ledger_path),
+        "--state-path",
+        str(state_path),
+    ]
+    assert main([*resume_common, "status"]) == 0
     status = json.loads(capsys.readouterr().out)
     assert status["campaign"]["status"] == "running"
     assert status["ledger"]["event_count"] == 0
@@ -1037,3 +1091,9 @@ def test_cli_initializes_and_reports_campaign_without_researcher_call(
         "remaining_labels": 2,
         "target_labels": 2,
     }
+    assert status["target"]["device"] == "cpu"
+    assert status["target"]["name"] == "CLI test target"
+
+    target_config.write_text(target_config.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    assert main([*resume_common, "status"]) == 2
+    assert "target configuration differs" in capsys.readouterr().err

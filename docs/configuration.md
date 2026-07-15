@@ -56,8 +56,21 @@ uv run autodidact-target init \
 uv run autodidact-orchestrator \
   --target-config artifacts/control/target.json \
   --researcher-config artifacts/control/researcher.json \
-  run
+  initialize \
+  --campaign-id gpu-campaign-001 \
+  --max-proposals 60 \
+  --max-wall-seconds 604800 \
+  --max-researcher-tokens 60000000 \
+  --max-training-tokens 9000000000 \
+  --max-compute-seconds 604800
+
+uv run autodidact-orchestrator run
 ```
+
+Initialization hashes and persists the researcher configuration, target configuration,
+`program.md`, decision mode, and optional execution queue. Later `run` and `status` commands reload
+those exact files and reject drift before inference or training. Create a new campaign rather than
+editing the pinned target when moving between laptop and GPU configurations.
 
 The user configures the GPU runtime, drivers, storage mount, and credentials. Autodidact does not
 store cloud credentials or upload checkpoints. Running the orchestrator on the GPU host keeps the
