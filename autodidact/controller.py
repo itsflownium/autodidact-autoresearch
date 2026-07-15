@@ -62,6 +62,7 @@ class ControllerError(RuntimeError):
 class DecisionMode(StrEnum):
     GREEDY = "greedy"
     PATCH_RCT = "patch_rct"
+    SCOUT_PATCH_RCT = "scout_patch_rct"
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +178,8 @@ class PatchRCTPolicy:
             raise ControllerError(
                 "greedy mode requires one cheap pair and cannot force calibration or allocation"
             )
+        if mode is DecisionMode.SCOUT_PATCH_RCT and self.cheap_initial_pairs != 1:
+            raise ControllerError("scout_patch_rct mode requires one cheap pair")
         for name in (
             "allocation_rejection_probability",
             "allocation_full_test_probability",
@@ -622,11 +625,12 @@ class PatchRCTController:
         *,
         forced_for_calibration: bool = False,
         forced_for_allocation: bool = False,
+        scout_screen: bool = False,
     ) -> dict[str, Any]:
-        if forced_for_calibration and forced_for_allocation:
-            raise ControllerError("an escalation cannot use two forced policies")
+        if sum((forced_for_calibration, forced_for_allocation, scout_screen)) > 1:
+            raise ControllerError("an escalation cannot use multiple special policies")
         next_stage = _NEXT_STAGE[stage]
-        forced = forced_for_calibration or forced_for_allocation
+        forced = forced_for_calibration or forced_for_allocation or scout_screen
         threshold = 0.0 if forced else self.policy.continuation_probability
         if forced_for_calibration:
             reason = "calibration policy requires complete early and full-budget evidence"
@@ -634,6 +638,9 @@ class PatchRCTController:
         elif forced_for_allocation:
             reason = "allocation policy requires intermediate evidence before prediction"
             schedule_reason = "cheap evidence advanced to intermediate allocation evidence"
+        elif scout_screen:
+            reason = "positive scout gain warrants protected PatchRCT evaluation"
+            schedule_reason = "positive cheap scout advanced to protected intermediate evidence"
         else:
             reason = "useful-gain probability satisfies the stage continuation threshold"
             schedule_reason = f"{stage.value} evidence escalated to {next_stage.value}"
@@ -1059,6 +1066,31 @@ class PatchRCTController:
         allocation_active = (
             self.policy.use_downstream_allocation and not self.policy.force_full_evaluation
         )
+        scout_active = (
+            self.policy.decision_mode is DecisionMode.SCOUT_PATCH_RCT
+            and not self.policy.force_full_evaluation
+            and not allocation_active
+        )
+        if scout_active and stage is ExperimentStage.CHEAP:
+            if len(pairs) != 1:
+                raise ControllerError("scout_patch_rct mode requires one completed cheap pair")
+            if effect.mean_gain_bpb <= 0.0:
+                return self._reject(
+                    candidate,
+                    proposal,
+                    stage,
+                    effect=effect,
+                    constraints_passed=True,
+                    reasons=("cheap scout did not observe a positive BPB gain",),
+                    probability_threshold=0.0,
+                )
+            return self._escalate(
+                candidate,
+                proposal,
+                stage,
+                effect,
+                scout_screen=True,
+            )
         protected_early_stage = forced_for_calibration or (
             allocation_active and stage in {ExperimentStage.CHEAP, ExperimentStage.INTERMEDIATE}
         )

@@ -373,6 +373,13 @@ class ResearchRequest:
                         "Inspect only the allowed files and supplied previous results. Do not "
                         "inspect Git history, tests, documentation, artifacts, or unrelated files."
                     ),
+                    "repair": (
+                        "If a permitted focused check exposes an implementation error, you may "
+                        "repair it once before submission. Preserve the original hypothesis and "
+                        "mechanism, do not use model-quality metrics to guide the repair, and "
+                        "return failed if the focused check still fails. A submitted candidate is "
+                        "immutable; post-submission repair requires a new proposal."
+                    ),
                     "validation": (
                         "Do not run training, evaluation, generation, pytest, or repository-wide "
                         "checks. The controller owns comprehensive validation and experiments. "

@@ -53,6 +53,13 @@ and do not run training, evaluation, generation, pytest, or repository-wide chec
 than 12 shell or tool calls in total. Focused formatting, lint, and `train.py inspect` checks are
 allowed; the controller owns comprehensive validation and every experiment.
 
+If one of those permitted focused checks exposes a syntax, import, shape, interface, or parameter-
+count implementation error, you may make one repair before submitting the candidate. The repair
+must preserve the stated hypothesis and mechanism and cannot use training or model-quality metrics
+as feedback. If the same focused check still fails, return the exact failure instead of broadening
+the patch or retrying again. Once submitted, the candidate commit is immutable; any later repair is
+a new proposal with a new evidence trail.
+
 Before editing, produce this proposal record:
 
 ```text

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import sqlite3
 from dataclasses import replace
@@ -76,6 +77,26 @@ def test_complete_lifecycle_is_reconstructable_from_immutable_events(tmp_path: P
             "status": "promote",
         }
     ]
+
+
+def test_results_tsv_is_a_readable_view_of_verified_evidence(tmp_path: Path) -> None:
+    ledger = create_ledger(tmp_path)
+    ledger.append_many(lifecycle_entries())
+    output = tmp_path / "results.tsv"
+
+    ledger.export_results_tsv(output)
+
+    with output.open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream, dialect="excel-tab"))
+    assert len(rows) == 1
+    assert rows[0]["experiment_index"] == "1"
+    assert rows[0]["candidate_id"] == "candidate-001"
+    assert rows[0]["status"] == "promote"
+    assert rows[0]["stage"] == "cheap"
+    assert rows[0]["paired_seeds"] == "11"
+    assert float(rows[0]["mean_gain_bpb"]) == pytest.approx(0.005)
+    assert rows[0]["constraints_passed"] == "true"
+    assert rows[0]["title"] == "Tune warmup"
 
 
 def test_verified_snapshot_is_reused_and_shared_after_external_append(
@@ -379,6 +400,7 @@ def test_cli_initializes_verifies_summarizes_and_exports(
 ) -> None:
     path = tmp_path / "cli.sqlite3"
     export_path = tmp_path / "cli-export.json"
+    results_path = tmp_path / "cli-results.tsv"
 
     assert main(["--path", str(path), "init", "--initial-parent", PARENT_COMMIT]) == 0
     initialized = json.loads(capsys.readouterr().out)
@@ -406,6 +428,22 @@ def test_cli_initializes_verifies_summarizes_and_exports(
     )
     capsys.readouterr()
     assert json.loads(export_path.read_text(encoding="utf-8"))["ledger"]["event_count"] == 0
+
+    assert (
+        main(
+            [
+                "--path",
+                str(path),
+                "results",
+                "--output",
+                str(results_path),
+            ]
+        )
+        == 0
+    )
+    result = json.loads(capsys.readouterr().out)
+    assert result["format"] == "tsv"
+    assert results_path.read_text(encoding="utf-8").startswith("experiment_index\t")
 
 
 def test_invalid_creation_contract_is_rejected(tmp_path: Path) -> None:
