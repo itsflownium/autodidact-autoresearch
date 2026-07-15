@@ -64,7 +64,7 @@ def _initialize(tmp_path: Path, *, assignment_seed: int = 17):
         max_proposals=50,
         max_wall_seconds=10_000,
         max_researcher_tokens=500_000,
-        max_training_tokens=1_000_000_000,
+        max_training_tokens=7_400_000_000,
         max_compute_seconds=100_000,
     )
     manifest = initialize_study(
@@ -106,6 +106,7 @@ def test_study_initialization_isolates_three_arms_with_matched_limits(tmp_path: 
         bayesian = arm is StudyArm.PATCH_RCT_BAYESIAN
         assert state.limits.use_downstream_allocation is bayesian
         assert state.limits.reward_calibration_labels == (40 if bayesian else 0)
+        assert state.limits.decision_mode == ("greedy" if arm is StudyArm.GREEDY else "patch_rct")
 
 
 def test_study_arm_order_and_policy_hashes_are_deterministic(tmp_path: Path) -> None:
@@ -133,6 +134,36 @@ def test_study_arm_order_and_policy_hashes_are_deterministic(tmp_path: Path) -> 
         max_parameter_count=1_050_000,
         minimum_reward_labels=40,
     ).use_downstream_allocation
+
+
+def test_study_rejects_budget_below_forced_calibration_minimum(tmp_path: Path) -> None:
+    repository, _parent = _repository(tmp_path)
+    researcher = _researcher_config(repository)
+    root = tmp_path / "underfunded-study"
+
+    with pytest.raises(StudyError, match="requires at least 5920000000"):
+        initialize_study(
+            study_root=root,
+            repository_root=repository,
+            study_id="underfunded-study",
+            assignment_seed=17,
+            limits=StudyLimits(
+                max_proposals=50,
+                max_wall_seconds=10_000,
+                max_researcher_tokens=500_000,
+                max_training_tokens=5_919_999_999,
+                max_compute_seconds=100_000,
+            ),
+            reward_calibration_labels=40,
+            researcher_config_path=str(researcher),
+            target_config_path=None,
+            program_path="program.md",
+            data_root="artifacts/data",
+            device="cpu",
+            estimated_accelerator_hour_usd=None,
+        )
+
+    assert not root.exists()
 
 
 def test_study_status_reports_each_isolated_arm(tmp_path: Path) -> None:

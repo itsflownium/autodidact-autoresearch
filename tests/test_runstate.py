@@ -182,6 +182,61 @@ def test_execution_queue_contract_is_validated_and_persisted(tmp_path: Path) -> 
         )
 
 
+def test_campaign_control_contract_is_validated_and_persisted(tmp_path: Path) -> None:
+    limits = CampaignLimits(
+        max_proposals=2,
+        max_wall_seconds=3_600.0,
+        max_researcher_tokens=50_000,
+        max_training_tokens=100_000_000,
+        max_compute_seconds=20_000.0,
+        decision_mode="scout_patch_rct",
+        researcher_config_path="artifacts/control/researcher.json",
+        researcher_config_sha256="a" * 64,
+        program_path="program.md",
+        program_sha256="b" * 64,
+        target_config_path="artifacts/control/target.json",
+        target_config_sha256="c" * 64,
+    )
+    store = CampaignStore.create(
+        tmp_path / "control.sqlite3",
+        campaign_id="campaign-control-001",
+        initial_parent_commit=PARENT,
+        limits=limits,
+        clock=FakeClock(),
+    )
+
+    assert CampaignStore.open(store.path, clock=FakeClock()).snapshot().limits == limits
+
+    with pytest.raises(RunStateError, match="researcher and program identities"):
+        CampaignLimits(
+            max_proposals=2,
+            max_wall_seconds=3_600.0,
+            max_researcher_tokens=50_000,
+            max_training_tokens=100_000_000,
+            max_compute_seconds=20_000.0,
+            researcher_config_path="artifacts/control/researcher.json",
+        )
+    with pytest.raises(RunStateError, match="decision_mode"):
+        CampaignLimits(
+            max_proposals=2,
+            max_wall_seconds=3_600.0,
+            max_researcher_tokens=50_000,
+            max_training_tokens=100_000_000,
+            max_compute_seconds=20_000.0,
+            decision_mode="reroll_until_lucky",
+        )
+    with pytest.raises(RunStateError, match="greedy mode"):
+        CampaignLimits(
+            max_proposals=2,
+            max_wall_seconds=3_600.0,
+            max_researcher_tokens=50_000,
+            max_training_tokens=100_000_000,
+            max_compute_seconds=20_000.0,
+            decision_mode="greedy",
+            reward_calibration_labels=1,
+        )
+
+
 def test_repository_lock_excludes_second_controller(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
     first = RepositoryLock(repository, campaign_id="campaign-001")

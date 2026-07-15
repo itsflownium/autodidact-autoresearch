@@ -29,6 +29,7 @@ from autodidact.orchestrator import (
     AutonomousResearchOrchestrator,
     OrchestratorConfig,
     OrchestratorError,
+    _minimum_calibration_training_tokens,
 )
 from autodidact.records import DecisionRecord, DecisionVerdict, LineageRecord
 from autodidact.researcher import ResearcherConfig, ResearcherError
@@ -365,6 +366,20 @@ def initialize_study(
     target_path = None if target_config_path is None else _resolve(repository, target_config_path)
     target = None if target_path is None else TargetConfig.from_path(target_path)
     max_parameters = 1_050_000 if target is None else target.max_parameter_count
+    bayesian_policy = _arm_policy(
+        StudyArm.PATCH_RCT_BAYESIAN,
+        max_parameter_count=max_parameters,
+        minimum_reward_labels=reward_calibration_labels,
+    )
+    minimum_calibration_tokens = _minimum_calibration_training_tokens(
+        reward_calibration_labels,
+        bayesian_policy,
+    )
+    if limits.max_training_tokens < minimum_calibration_tokens:
+        raise StudyError(
+            "Bayesian-arm reward calibration requires at least "
+            f"{minimum_calibration_tokens} training tokens"
+        )
     policies = tuple(
         (
             arm,
@@ -422,6 +437,11 @@ def initialize_study(
                         reward_calibration_labels if arm is StudyArm.PATCH_RCT_BAYESIAN else 0
                     ),
                     use_downstream_allocation=arm is StudyArm.PATCH_RCT_BAYESIAN,
+                    decision_mode=(
+                        DecisionMode.GREEDY.value
+                        if arm is StudyArm.GREEDY
+                        else DecisionMode.PATCH_RCT.value
+                    ),
                 ),
             )
         _write_manifest(staging, manifest)

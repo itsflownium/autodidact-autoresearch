@@ -565,7 +565,12 @@ Ledger databases, WAL files, and shared-memory files remain local and ignored by
 
 `autodidact-state` maintains the mutable control state that must survive a controller restart without weakening the immutable evidence ledger. Its transactional SQLite store tracks the accepted parent, generation, active proposal and candidate, current phase, pause or cancellation request, replay-safe operation keys, and separate used and reserved budgets.
 
-Campaign limits also persist an optional reward-calibration label target and whether calibrated predictions control allocation. This makes both behaviors restart-stable: a command-line change cannot silently switch an active campaign between ordinary early stopping, forced full-label collection, and prediction-guided allocation.
+Campaign limits also persist an optional reward-calibration label target, whether calibrated
+predictions control allocation, the decision mode, and SHA-256 identities for the researcher
+configuration, target configuration, and research program. These inputs are automatically reloaded
+and verified on `status` and `run`. A restart therefore cannot silently change the researcher model,
+reasoning effort, target device, editable surface, proposal contract, or switch between ordinary
+PatchRCT and the protected scout.
 
 Before an external researcher call or paired run starts, the controller records a deterministic operation key and reserves its worst-case proposal, researcher-token, training-token, and compute allowance. A completed key replays its stored result. A key left running by a process crash becomes `interrupted` and must be reconciled against its transcript, Git commit, or ledger evidence before it can be completed or explicitly restarted. Settling records actual usage and releases the unused reservation; exceeding the reservation or campaign maximum fails before new work starts.
 
@@ -647,10 +652,10 @@ uv run autodidact-orchestrator \
   initialize \
   --campaign-id campaign-local-001 \
   --max-proposals 50 \
-  --max-wall-seconds 86400 \
+  --max-wall-seconds 604800 \
   --max-researcher-tokens 50000000 \
-  --max-training-tokens 1000000000 \
-  --max-compute-seconds 86400 \
+  --max-training-tokens 7400000000 \
+  --max-compute-seconds 604800 \
   --reward-calibration-labels 40 \
   --use-downstream-allocation
 
@@ -667,6 +672,11 @@ The default per-proposal researcher allowance is 1,000,000 tokens. The campaign-
 count or pass a lower `run --researcher-token-allowance` after verifying that the selected agent and
 reasoning effort can complete within that bound. Provider-reported usage above the reserved
 per-proposal allowance is rejected and reported with both counts.
+
+With the default paired schedule, one complete calibration label consumes at least 148M training
+tokens across both arms: 4M cheap, 24M intermediate, and 120M full. Initialization rejects a
+campaign budget below `148M * reward_calibration_labels`; 40 labels therefore require at least
+5.92B tokens before allowing for failed candidates or post-calibration experiments.
 
 The test suite substitutes a deterministic local proposal command and synthetic paired measurements. It exercises the real queue assignment, fixed-parent patch adaptation, worktree, commit, ledger, PatchRCT, artifact, state, recovery, replay, and parent-advancement paths without invoking the configured external researcher or performing full model training. The bounded real-MPS diagnostic and its claim limits are recorded in [`docs/smoke/execution-queue-local.md`](docs/smoke/execution-queue-local.md).
 
@@ -712,12 +722,23 @@ After the scheduled trial records and outcomes are present, advance the state ma
 uv run autodidact-controller advance --candidate-id candidate-001
 ```
 
-Select the scout for an autonomous campaign by placing the global option before the command:
+Select the scout when initializing the campaign. The persisted campaign contract automatically
+reuses it on every later `run`:
 
 ```bash
 uv run autodidact-orchestrator \
   --decision-mode scout_patch_rct \
-  run --max-new-proposals 1
+  --researcher-config artifacts/control/researcher.json \
+  --target-config artifacts/control/target.json \
+  initialize \
+  --campaign-id campaign-scout-001 \
+  --max-proposals 60 \
+  --max-wall-seconds 604800 \
+  --max-researcher-tokens 60000000 \
+  --max-training-tokens 3000000000 \
+  --max-compute-seconds 604800
+
+uv run autodidact-orchestrator run --max-new-proposals 1
 ```
 
 An escalation decision and its next-stage schedule are appended in one transaction. A promotion decision and lineage transition are also atomic; after the ledger parent advances, the controller synchronizes `refs/autodidact/accepted` to the accepted candidate commit. Crashes, timeouts, OOMs, non-finite outcomes, and incomplete pairs cannot be converted into a favorable effect and are rejected or left waiting with explicit reasons.
