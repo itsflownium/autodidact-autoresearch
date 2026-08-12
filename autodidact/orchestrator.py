@@ -20,9 +20,8 @@ from autodidact.controller import (
     PatchRCTPolicy,
     synchronize_accepted_ref,
 )
-from autodidact.data.config import default_output_root
-from autodidact.data.integrity import canonical_json_bytes
 from autodidact.execution_queue import ExecutionQueue, ExecutionQueueError
+from autodidact.integrity import canonical_json_bytes
 from autodidact.ledger import ExperimentLedger, LedgerError, WriterRole
 from autodidact.records import (
     CandidateRecord,
@@ -92,7 +91,7 @@ from autodidact.runstate import (
 from autodidact.target import TargetConfig, TargetError
 from autodidact.target_plugins import TargetPluginError
 
-ORCHESTRATOR_SCHEMA_VERSION = 1
+ORCHESTRATOR_SCHEMA_VERSION = 2
 DEFAULT_PROGRAM_PATH = Path("program.md")
 DEFAULT_RESEARCHER_CONFIG_PATH = Path("artifacts/control/researcher.json")
 DEFAULT_RESEARCHER_ARTIFACT_ROOT = Path("artifacts/researcher")
@@ -304,7 +303,7 @@ def _downstream_allocation_status(
 class OrchestratorConfig:
     repository_root: Path
     ledger_path: Path = DEFAULT_LEDGER_PATH
-    data_root: Path = default_output_root()
+    data_root: Path = Path("data")
     output_root: Path = DEFAULT_OUTPUT_ROOT
     workspace_root: Path = DEFAULT_WORKSPACE_ROOT
     researcher_artifact_root: Path = DEFAULT_RESEARCHER_ARTIFACT_ROOT
@@ -315,16 +314,17 @@ class OrchestratorConfig:
     previous_result_limit: int = DEFAULT_PREVIOUS_RESULT_LIMIT
     minimum_reward_labels: int = DEFAULT_MINIMUM_LABELS
     estimated_accelerator_hour_usd: float | None = None
-    max_parameter_count: int = 1_050_000
-    target_name: str = "Autodidact TinyStories transformer"
+    max_parameter_count: int = 2**63 - 1
+    target_name: str = "External autoresearch target"
     target_execution_location: str = "local"
     accepted_ref: str = DEFAULT_ACCEPTED_REF
     target_config_path: Path | None = None
-    trainer_path: str = "train.py"
-    allowed_paths: tuple[str, ...] = ("train.py",)
+    trainer_path: str = ""
+    allowed_paths: tuple[str, ...] = ()
     target_plugin_id: str | None = None
-    target_metric_name: str = "validation_bpb"
+    target_metric_name: str = "objective_value"
     target_metric_direction: str = "lower"
+    target_rl: dict[str, Any] | None = None
     execution_queue_path: Path | None = None
 
     def __post_init__(self) -> None:
@@ -351,6 +351,8 @@ class OrchestratorConfig:
             raise OrchestratorError("accepted_ref must be a protected refs/autodidact Git ref")
         if not self.allowed_paths or self.trainer_path not in self.allowed_paths:
             raise OrchestratorError("target editable paths must include its trainer")
+        if self.target_config_path is None or self.target_plugin_id is None:
+            raise OrchestratorError("orchestration requires a configured target plugin")
 
     @property
     def features_path(self) -> Path:
@@ -376,7 +378,14 @@ class OrchestratorConfig:
             "metric_direction": self.target_metric_direction,
             "metric_name": self.target_metric_name,
             "plugin_id": self.target_plugin_id,
+            "rl": self.target_rl,
         }
+
+    def researcher_target_summary(self) -> dict[str, Any]:
+        summary = self.target_summary()
+        summary.pop("data_root")
+        summary["protected_evaluation"] = "configured"
+        return summary
 
 
 @dataclass(frozen=True, slots=True)
@@ -460,15 +469,7 @@ class AutonomousResearchOrchestrator:
             )
 
     def _trajectory_options(self) -> dict[str, Any]:
-        if self.config.target_plugin_id is not None:
-            return {}
-        return {
-            "trajectory_token_budget": self.policy.full_token_budget,
-            "trajectory_milestones": (
-                self.policy.cheap_token_budget,
-                self.policy.intermediate_token_budget,
-            ),
-        }
+        return {}
 
     def _calibration_target(self) -> int:
         return self.state.snapshot().limits.reward_calibration_labels
@@ -643,7 +644,7 @@ class AutonomousResearchOrchestrator:
                     "candidate_id": decision.candidate_id,
                     "constraints_passed": decision.constraints_passed,
                     "hypothesis": proposal.hypothesis,
-                    "mean_gain_bpb": None if effect is None else effect.mean_gain_bpb,
+                    "mean_objective_gain": None if effect is None else effect.mean_objective_gain,
                     "probability_exceeds_minimum": (
                         None if effect is None else effect.probability_exceeds_minimum
                     ),
@@ -738,7 +739,7 @@ class AutonomousResearchOrchestrator:
             "\n\n## Protected target contract\n\n"
             "The controller-supplied target contract below overrides generic examples in this "
             "program. Do not edit or reinterpret it.\n\n```json\n"
-            + json.dumps(self.config.target_summary(), indent=2, sort_keys=True)
+            + json.dumps(self.config.researcher_target_summary(), indent=2, sort_keys=True)
             + "\n```\n"
         )
         if self.execution_queue is not None:
@@ -1348,7 +1349,7 @@ class AutonomousResearchOrchestrator:
                     self.ledger.ensure(prediction, writer_role=WriterRole.CONTROLLER)
                     result.update(
                         {
-                            "expected_full_gain_bpb": distribution.mean,
+                            "expected_full_objective_gain": distribution.mean,
                             "prediction_id": prediction.prediction_id,
                             "probability_exceeds_minimum": (
                                 distribution.probability_exceeds_minimum
@@ -1594,7 +1595,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repository-root", type=_path, default=Path.cwd())
     parser.add_argument("--ledger-path", type=_path, default=DEFAULT_LEDGER_PATH)
     parser.add_argument("--state-path", type=_path, default=DEFAULT_STATE_PATH)
-    parser.add_argument("--data-root", type=_path, default=default_output_root())
     parser.add_argument("--output-root", type=_path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--workspace-root", type=_path, default=DEFAULT_WORKSPACE_ROOT)
     parser.add_argument(
@@ -1607,7 +1607,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--researcher-config", type=_path, default=DEFAULT_RESEARCHER_CONFIG_PATH)
     parser.add_argument("--execution-queue", type=_path)
     parser.add_argument("--target-config", type=_path)
-    parser.add_argument("--device", default="auto")
     parser.add_argument("--accepted-ref", default=DEFAULT_ACCEPTED_REF)
     parser.add_argument(
         "--decision-mode",
@@ -1644,38 +1643,33 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _config_from_args(args: argparse.Namespace) -> OrchestratorConfig:
     repository_root = args.repository_root.resolve()
-    target_config_path = (
-        None
-        if args.target_config is None
-        else _resolve_cli_control_path(args.target_config, repository_root)
-    )
-    target = None if target_config_path is None else TargetConfig.from_path(target_config_path)
-    plugin = None if target is None else target.load_plugin(repository_root)
+    if args.target_config is None:
+        raise OrchestratorError("a target configuration is required")
+    target_config_path = _resolve_cli_control_path(args.target_config, repository_root)
+    target = TargetConfig.from_path(target_config_path)
+    plugin = target.load_plugin(repository_root)
     return OrchestratorConfig(
         repository_root=args.repository_root,
         ledger_path=args.ledger_path,
-        data_root=(
-            args.data_root if target is None else target.resolved_data_root(repository_root)
-        ),
+        data_root=target.resolved_data_root(repository_root),
         output_root=args.output_root,
         workspace_root=args.workspace_root,
         researcher_artifact_root=args.researcher_artifact_root,
         reward_root=args.reward_root,
         program_path=_resolve_cli_control_path(args.program, repository_root),
-        device=args.device if target is None else target.device,
-        estimated_accelerator_hour_usd=(
-            None if target is None else target.estimated_accelerator_hour_usd
-        ),
-        max_parameter_count=(1_050_000 if target is None else target.max_parameter_count),
-        target_name=("Autodidact TinyStories transformer" if target is None else target.name),
-        target_execution_location=("local" if target is None else target.execution_location.value),
+        device=target.device,
+        estimated_accelerator_hour_usd=target.estimated_accelerator_hour_usd,
+        max_parameter_count=target.max_parameter_count,
+        target_name=target.name,
+        target_execution_location=target.execution_location.value,
         accepted_ref=args.accepted_ref,
         target_config_path=target_config_path,
-        trainer_path=("train.py" if plugin is None else plugin.trainer_path),
-        allowed_paths=(("train.py",) if plugin is None else plugin.editable_paths),
-        target_plugin_id=(None if plugin is None else plugin.plugin_id),
-        target_metric_name=("validation_bpb" if plugin is None else plugin.metric.name),
-        target_metric_direction=("lower" if plugin is None else plugin.metric.direction.value),
+        trainer_path=plugin.trainer_path,
+        allowed_paths=plugin.editable_paths,
+        target_plugin_id=plugin.plugin_id,
+        target_metric_name=plugin.metric.name,
+        target_metric_direction=plugin.metric.direction.value,
+        target_rl=None if plugin.rl is None else plugin.rl.to_mapping(),
         execution_queue_path=(
             None
             if args.execution_queue is None
@@ -1714,7 +1708,7 @@ def main(argv: list[str] | None = None) -> int:
             minimum_calibration_tokens = _minimum_calibration_training_tokens(
                 args.reward_calibration_labels,
                 initialization_policy,
-                checkpoint_continuation=config.target_plugin_id is None,
+                checkpoint_continuation=False,
             )
             if args.max_training_tokens < minimum_calibration_tokens:
                 raise OrchestratorError(

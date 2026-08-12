@@ -12,11 +12,11 @@ from enum import StrEnum
 from pathlib import PurePosixPath
 from typing import Any, ClassVar, TypeAlias
 
-from autodidact.data.integrity import canonical_json_bytes
+from autodidact.integrity import canonical_json_bytes
 
-RECORD_SCHEMA_VERSION = 1
+RECORD_SCHEMA_VERSION = 2
 MAX_PYTHON_SEED = 2**32 - 1
-DEFAULT_PARAMETER_CAP = 1_050_000
+DEFAULT_PARAMETER_CAP = 2**63 - 1
 
 _ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{2,95}$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -261,12 +261,12 @@ class PatchProposal:
     hypothesis: str
     mechanism: str
     change: str
-    expected_effect_bpb: float
-    minimum_useful_gain_bpb: float
+    expected_effect: float
+    minimum_useful_gain: float
     resource_risk: str
     failure_signal: str
     interaction_risk: str
-    primary_metric: str = "validation_bpb"
+    primary_metric: str = "objective_value"
     expected_direction: str = "lower"
 
     def __post_init__(self) -> None:
@@ -282,13 +282,13 @@ class PatchProposal:
             "interaction_risk",
         ):
             _validate_text(name, getattr(self, name))
-        _validate_finite("expected_effect_bpb", self.expected_effect_bpb)
-        _validate_finite("minimum_useful_gain_bpb", self.minimum_useful_gain_bpb, minimum=0.0)
-        if self.minimum_useful_gain_bpb == 0.0:
-            raise RecordValidationError("minimum_useful_gain_bpb must be positive")
-        if self.primary_metric != "validation_bpb" or self.expected_direction != "lower":
+        _validate_finite("expected_effect", self.expected_effect)
+        _validate_finite("minimum_useful_gain", self.minimum_useful_gain, minimum=0.0)
+        if self.minimum_useful_gain == 0.0:
+            raise RecordValidationError("minimum_useful_gain must be positive")
+        if self.primary_metric != "objective_value" or self.expected_direction != "lower":
             raise RecordValidationError(
-                "the initial research contract requires lower validation_bpb"
+                "the initial research contract requires lower objective_value"
             )
 
 
@@ -453,7 +453,7 @@ class RunResult:
     tokens_seen: int
     evaluation_tokens: int
     parameter_count: int
-    validation_bpb: float | None
+    objective_value: float | None
     mean_train_loss: float | None
     training_tokens_per_second: float | None
     evaluation_tokens_per_second: float | None
@@ -465,6 +465,16 @@ class RunResult:
     wall_seconds: float
     data_order_sha256: str | None
     failure_reason: str | None = None
+    training_paradigm: str | None = None
+    algorithm_id: str | None = None
+    mean_train_reward: float | None = None
+    train_reward_standard_deviation: float | None = None
+    rollout_valid_fraction: float | None = None
+    policy_loss: float | None = None
+    kl_divergence: float | None = None
+    policy_entropy: float | None = None
+    evaluation_reward_standard_deviation: float | None = None
+    verifier_coverage: float | None = None
 
     def __post_init__(self) -> None:
         _validate_id("run_id", self.run_id)
@@ -492,8 +502,7 @@ class RunResult:
                 _validate_integer(name, value, minimum=0)
 
         metric_names = (
-            "validation_bpb",
-            "mean_train_loss",
+            "objective_value",
             "training_tokens_per_second",
             "evaluation_tokens_per_second",
         )
@@ -501,12 +510,68 @@ class RunResult:
             value = getattr(self, name)
             if value is not None:
                 _validate_finite(name, value, minimum=0.0)
+        if self.mean_train_loss is not None:
+            _validate_finite("mean_train_loss", self.mean_train_loss)
+
+        rl_nonnegative = (
+            "train_reward_standard_deviation",
+            "kl_divergence",
+            "policy_entropy",
+            "evaluation_reward_standard_deviation",
+        )
+        for name in rl_nonnegative:
+            value = getattr(self, name)
+            if value is not None:
+                _validate_finite(name, value, minimum=0.0)
+        for name in ("mean_train_reward", "policy_loss"):
+            value = getattr(self, name)
+            if value is not None:
+                _validate_finite(name, value)
+        for name in ("rollout_valid_fraction", "verifier_coverage"):
+            value = getattr(self, name)
+            if value is not None:
+                _validate_finite(name, value, minimum=0.0)
+                if value > 1.0:
+                    raise RecordValidationError(f"{name} must not exceed one")
+        if self.training_paradigm is None:
+            if any(
+                getattr(self, name) is not None
+                for name in (
+                    "algorithm_id",
+                    "mean_train_reward",
+                    "train_reward_standard_deviation",
+                    "rollout_valid_fraction",
+                    "policy_loss",
+                    "kl_divergence",
+                    "policy_entropy",
+                    "evaluation_reward_standard_deviation",
+                    "verifier_coverage",
+                )
+            ):
+                raise RecordValidationError("RL diagnostics require a training_paradigm")
+        else:
+            if self.training_paradigm not in {"rl", "rlvr"}:
+                raise RecordValidationError("training_paradigm must be rl or rlvr")
+            if not isinstance(self.algorithm_id, str) or not self.algorithm_id.strip():
+                raise RecordValidationError("RL runs require an algorithm_id")
+            required_rl = (
+                "mean_train_reward",
+                "train_reward_standard_deviation",
+                "rollout_valid_fraction",
+            )
+            if any(getattr(self, name) is None for name in required_rl):
+                raise RecordValidationError("RL runs are missing training diagnostics")
+            if self.status is RunStatus.SUCCEEDED:
+                if self.evaluation_reward_standard_deviation is None:
+                    raise RecordValidationError("successful RL runs require reward dispersion")
+                if self.training_paradigm == "rlvr" and self.verifier_coverage is None:
+                    raise RecordValidationError("successful RLVR runs require verifier coverage")
 
         if self.status is RunStatus.SUCCEEDED:
             if self.tokens_seen != self.target_tokens:
                 raise RecordValidationError("successful runs must consume their exact token budget")
             required = (
-                "validation_bpb",
+                "objective_value",
                 "mean_train_loss",
                 "training_tokens_per_second",
                 "evaluation_tokens_per_second",
@@ -530,8 +595,8 @@ class RunResult:
             if self.failure_reason is not None:
                 raise RecordValidationError("successful runs cannot contain a failure reason")
         else:
-            if self.validation_bpb is not None:
-                raise RecordValidationError("failed runs cannot claim validation BPB")
+            if self.objective_value is not None:
+                raise RecordValidationError("failed runs cannot claim an objective value")
             if self.failure_reason is None:
                 raise RecordValidationError("failed runs require a failure reason")
             _validate_text("failure_reason", self.failure_reason)
@@ -657,9 +722,9 @@ class PairedResult:
     seed: int
     parent_run_id: str
     candidate_run_id: str
-    parent_bpb: float
-    candidate_bpb: float
-    gain_bpb: float
+    parent_objective: float
+    candidate_objective: float
+    objective_gain: float
     training_throughput_delta: float
     peak_process_rss_delta_bytes: int
     constraints_passed: bool
@@ -674,15 +739,17 @@ class PairedResult:
             raise RecordValidationError("paired runs must be distinct")
         _validate_seed(self.seed)
         for name in (
-            "parent_bpb",
-            "candidate_bpb",
-            "gain_bpb",
+            "parent_objective",
+            "candidate_objective",
+            "objective_gain",
             "training_throughput_delta",
         ):
             _validate_finite(name, getattr(self, name))
-        expected_gain = self.parent_bpb - self.candidate_bpb
-        if not math.isclose(self.gain_bpb, expected_gain, rel_tol=0.0, abs_tol=1e-12):
-            raise RecordValidationError("gain_bpb must equal parent_bpb - candidate_bpb")
+        expected_gain = self.parent_objective - self.candidate_objective
+        if not math.isclose(self.objective_gain, expected_gain, rel_tol=0.0, abs_tol=1e-12):
+            raise RecordValidationError(
+                "objective_gain must equal parent_objective - candidate_objective"
+            )
         _validate_integer("peak_process_rss_delta_bytes", self.peak_process_rss_delta_bytes)
         _validate_unique("constraint_failures", self.constraint_failures)
         _validate_boolean("constraints_passed", self.constraints_passed)
@@ -703,10 +770,10 @@ class EffectEstimate:
     stage: ExperimentStage
     paired_result_ids: tuple[str, ...]
     seeds: tuple[int, ...]
-    mean_gain_bpb: float
+    mean_objective_gain: float
     sample_variance: float
     standard_error: float
-    minimum_useful_gain_bpb: float
+    minimum_useful_gain: float
     probability_exceeds_minimum: float
     constraints_passed: bool
     estimator_version: str
@@ -726,16 +793,16 @@ class EffectEstimate:
         for seed in self.seeds:
             _validate_seed(seed)
         for name in (
-            "mean_gain_bpb",
+            "mean_objective_gain",
             "sample_variance",
             "standard_error",
-            "minimum_useful_gain_bpb",
+            "minimum_useful_gain",
         ):
             _validate_finite(name, getattr(self, name))
         if self.sample_variance < 0.0 or self.standard_error < 0.0:
             raise RecordValidationError("effect uncertainty cannot be negative")
-        if self.minimum_useful_gain_bpb <= 0.0:
-            raise RecordValidationError("minimum_useful_gain_bpb must be positive")
+        if self.minimum_useful_gain <= 0.0:
+            raise RecordValidationError("minimum_useful_gain must be positive")
         _validate_probability("probability_exceeds_minimum", self.probability_exceeds_minimum)
         _validate_boolean("constraints_passed", self.constraints_passed)
         _validate_text("estimator_version", self.estimator_version, maximum=120)
@@ -750,11 +817,11 @@ class DownstreamPrediction:
     source_trial_ids: tuple[str, ...]
     source_stages: tuple[ExperimentStage, ...]
     target_stage: ExperimentStage
-    expected_gain_bpb: float
+    expected_objective_gain: float
     predictive_standard_deviation: float
-    interval_lower_bpb: float
-    interval_upper_bpb: float
-    minimum_useful_gain_bpb: float
+    interval_lower: float
+    interval_upper: float
+    minimum_useful_gain: float
     probability_exceeds_minimum: float
     model_version: str
     full_budget_label_count: int
@@ -774,19 +841,19 @@ class DownstreamPrediction:
             _validate_enum("source stage", stage, ExperimentStage)
         _validate_enum("target_stage", self.target_stage, ExperimentStage)
         for name in (
-            "expected_gain_bpb",
+            "expected_objective_gain",
             "predictive_standard_deviation",
-            "interval_lower_bpb",
-            "interval_upper_bpb",
-            "minimum_useful_gain_bpb",
+            "interval_lower",
+            "interval_upper",
+            "minimum_useful_gain",
         ):
             _validate_finite(name, getattr(self, name))
         if self.predictive_standard_deviation < 0.0:
             raise RecordValidationError("predictive_standard_deviation cannot be negative")
-        if self.interval_lower_bpb > self.interval_upper_bpb:
+        if self.interval_lower > self.interval_upper:
             raise RecordValidationError("predictive interval bounds are reversed")
-        if self.minimum_useful_gain_bpb <= 0.0:
-            raise RecordValidationError("minimum_useful_gain_bpb must be positive")
+        if self.minimum_useful_gain <= 0.0:
+            raise RecordValidationError("minimum_useful_gain must be positive")
         _validate_probability("probability_exceeds_minimum", self.probability_exceeds_minimum)
         _validate_text("model_version", self.model_version, maximum=120)
         _validate_integer("full_budget_label_count", self.full_budget_label_count, minimum=0)
@@ -893,7 +960,7 @@ class DecisionRecord:
     verdict: DecisionVerdict
     effect_estimate_id: str | None
     downstream_prediction_id: str | None
-    minimum_useful_gain_bpb: float
+    minimum_useful_gain: float
     probability_threshold: float
     constraints_passed: bool
     reasons: tuple[str, ...]
@@ -909,9 +976,9 @@ class DecisionRecord:
         _validate_enum("verdict", self.verdict, DecisionVerdict)
         if self.downstream_prediction_id is not None:
             _validate_id("downstream_prediction_id", self.downstream_prediction_id)
-        _validate_finite("minimum_useful_gain_bpb", self.minimum_useful_gain_bpb)
-        if self.minimum_useful_gain_bpb <= 0.0:
-            raise RecordValidationError("minimum_useful_gain_bpb must be positive")
+        _validate_finite("minimum_useful_gain", self.minimum_useful_gain)
+        if self.minimum_useful_gain <= 0.0:
+            raise RecordValidationError("minimum_useful_gain must be positive")
         _validate_probability("probability_threshold", self.probability_threshold)
         if not self.reasons:
             raise RecordValidationError("decisions require at least one reason")
@@ -1199,8 +1266,8 @@ def build_paired_result(
         raise RecordValidationError("paired results require two successful runs")
     if parent.trial_id != trial.trial_id or candidate.trial_id != trial.trial_id:
         raise RecordValidationError("paired runs do not belong to the trial")
-    assert parent.validation_bpb is not None
-    assert candidate.validation_bpb is not None
+    assert parent.objective_value is not None
+    assert candidate.objective_value is not None
     assert parent.training_tokens_per_second is not None
     assert candidate.training_tokens_per_second is not None
     assert parent.peak_process_rss_bytes is not None
@@ -1212,9 +1279,9 @@ def build_paired_result(
         seed=trial.seed,
         parent_run_id=parent.run_id,
         candidate_run_id=candidate.run_id,
-        parent_bpb=parent.validation_bpb,
-        candidate_bpb=candidate.validation_bpb,
-        gain_bpb=parent.validation_bpb - candidate.validation_bpb,
+        parent_objective=parent.objective_value,
+        candidate_objective=candidate.objective_value,
+        objective_gain=parent.objective_value - candidate.objective_value,
         training_throughput_delta=(
             candidate.training_tokens_per_second - parent.training_tokens_per_second
         ),
@@ -1232,13 +1299,13 @@ def build_effect_estimate(
     candidate_id: str,
     stage: ExperimentStage,
     pairs: tuple[PairedResult, ...],
-    minimum_useful_gain_bpb: float,
+    minimum_useful_gain: float,
     probability_exceeds_minimum: float,
     estimator_version: str,
 ) -> EffectEstimate:
     if not pairs:
         raise RecordValidationError("at least one paired result is required")
-    gains = [pair.gain_bpb for pair in pairs]
+    gains = [pair.objective_gain for pair in pairs]
     variance = statistics.variance(gains) if len(gains) > 1 else 0.0
     standard_error = math.sqrt(variance / len(gains))
     return EffectEstimate(
@@ -1247,10 +1314,10 @@ def build_effect_estimate(
         stage=stage,
         paired_result_ids=tuple(pair.paired_result_id for pair in pairs),
         seeds=tuple(pair.seed for pair in pairs),
-        mean_gain_bpb=statistics.fmean(gains),
+        mean_objective_gain=statistics.fmean(gains),
         sample_variance=variance,
         standard_error=standard_error,
-        minimum_useful_gain_bpb=minimum_useful_gain_bpb,
+        minimum_useful_gain=minimum_useful_gain,
         probability_exceeds_minimum=probability_exceeds_minimum,
         constraints_passed=all(pair.constraints_passed for pair in pairs),
         estimator_version=estimator_version,

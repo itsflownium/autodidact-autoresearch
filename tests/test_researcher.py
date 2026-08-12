@@ -88,12 +88,12 @@ def _repository(tmp_path: Path) -> tuple[Path, str]:
 def _response(*, status: str = "proposed") -> dict[str, object]:
     proposal = {
         "change": "Reduce the learning rate.",
-        "expected_effect_bpb": -0.004,
-        "failure_signal": "Held-out BPB does not improve.",
+        "expected_effect": -0.004,
+        "failure_signal": "The protected objective does not improve.",
         "hypothesis": "A smaller step should reduce optimization noise.",
         "interaction_risk": "The warmup may need retuning.",
         "mechanism": "Take smaller updates after warmup.",
-        "minimum_useful_gain_bpb": 0.001,
+        "minimum_useful_gain": 0.001,
         "resource_risk": "No expected resource change.",
         "title": "Reduce learning rate",
     }
@@ -113,11 +113,12 @@ def _request(parent: str, *, request_id: str = "request-001") -> ResearchRequest
         program_text="# Research contract\nChange only train.py.",
         previous_results=(
             {
-                "gain_bpb": -0.002,
+                "objective_gain": -0.002,
                 "proposal": "Previous trial",
                 "verdict": "rejected",
             },
         ),
+        allowed_paths=("train.py",),
     )
 
 
@@ -163,7 +164,7 @@ print(RESPONSE)
 
     assert attempt.status is ResearchStatus.PROPOSED
     assert attempt.proposal is not None
-    assert attempt.proposal.minimum_useful_gain_bpb == pytest.approx(0.001)
+    assert attempt.proposal.minimum_useful_gain == pytest.approx(0.001)
     assert attempt.changed_paths == ("train.py",)
     assert attempt.diff_sha256 is not None
     assert attempt.usage.total_tokens == 165

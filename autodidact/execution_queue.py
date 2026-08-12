@@ -12,7 +12,7 @@ from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-EXECUTION_QUEUE_SCHEMA_VERSION = 1
+EXECUTION_QUEUE_SCHEMA_VERSION = 2
 DEFAULT_EXECUTION_QUEUE_PATH = Path("docs/proposals/execution-queue.json")
 QUEUE_ASSIGNMENT_MARKER = "AUTODIDACT_EXECUTION_QUEUE_ASSIGNMENT_V1"
 _ID_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
@@ -51,8 +51,8 @@ _PROPOSAL_FIELDS = (
     "hypothesis",
     "mechanism",
     "change",
-    "expected_effect_bpb",
-    "minimum_useful_gain_bpb",
+    "expected_effect",
+    "minimum_useful_gain",
     "resource_risk",
     "failure_signal",
     "interaction_risk",

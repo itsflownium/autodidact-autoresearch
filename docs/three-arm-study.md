@@ -1,45 +1,28 @@
 # Three-arm autoresearch study
 
-The study harness compares three autonomous research systems from the same initial Git parent under
-identical hard ceilings for proposals, researcher tokens, training tokens, wall time, and compute
-seconds.
+The study harness compares three decision architectures from one exact Git parent under shared hard
+ceilings for proposals, researcher tokens, target-training units, wall time, and compute time.
 
 | Arm | Keep or discard behavior | Evidence path |
 | --- | --- | --- |
-| `greedy` | Keep a patch when one fixed cheap paired comparison has positive observed BPB gain. | Karpathy-style immediate keep/discard, using the protected runner and ledger. |
-| `patch_rct` | Promote only after direct full-budget PatchRCT evidence passes its probability and resource gates. | Cheap, intermediate, and full paired stages with predetermined seeds. |
-| `patch_rct_bayesian` | Use PatchRCT for promotion, but use a calibrated learning-curve model to allocate full tests. | Forced labels first, then protected Bayesian allocation with deterministic audits. |
+| `greedy` | Keep after one fixed cheap pair has positive observed gain. | Immediate keep/discard control with the same protected runner. |
+| `patch_rct` | Promote only when direct full-stage evidence clears useful-effect and resource gates. | Cheap, intermediate, and full paired stages. |
+| `patch_rct_bayesian` | Use PatchRCT for promotion and a calibrated learning-curve model for test allocation. | Forced labels, prediction-guided allocation, and deterministic audits. |
 
-The greedy arm intentionally does not use PatchRCT's minimum-useful-effect probability to decide
-whether to keep a patch. That difference is the control treatment being measured. It still uses
-the same immutable dataset, protected evaluator, parent/candidate worktrees, parameter cap,
-resource checks, and evidence ledger, so failures and costs remain comparable.
+The greedy arm is the Karpathy-style control treatment. It still uses immutable target contracts,
+protected evaluation, matched parent/candidate worktrees, predetermined seeds, resource checks, and
+the evidence ledger. The intended difference is the decision rule, not access to data or compute.
 
 ## Isolation
 
-Each arm receives its own:
+Each arm receives its own ledger, campaign-state database, researcher transcripts, candidate
+workspaces, run artifacts, reward-model artifacts, and protected accepted Git ref. Every accepted ref
+starts at the same commit. Promotion in one arm cannot change another arm's parent.
 
-- append-only experiment ledger;
-- durable campaign state database;
-- researcher transcripts and candidate workspaces;
-- experiment and reward artifacts; and
-- accepted Git ref under `refs/autodidact/studies/STUDY_ID/ARM/accepted`.
-
-All three accepted refs initially point to the same exact commit. A promotion in one arm cannot
-change another arm's parent. The arm execution order is fixed by hashing the study ID, assignment
-seed, and arm name before outcomes exist.
-
-The study manifest is canonical JSON with a SHA-256 sidecar. It commits the initial parent, arm
-order, hard budgets, researcher/target configuration paths, calibration target, and the complete
-policy hash for every arm. It also pins SHA-256 hashes for the researcher configuration, target
-configuration, and research program. Runtime refuses to continue if any input or policy differs
-from that manifest.
+The canonical study manifest pins the parent, deterministic arm order, budgets, researcher config,
+target config, program, calibration target, and controller policy hashes. Runtime rejects drift.
 
 ## Initialize
-
-Prepare the researcher and target configurations first, then create a study. The 50-proposal pilot
-reserves 40 Bayesian-arm proposals for full-budget reward labels before prediction-guided
-allocation begins.
 
 ```bash
 uv run autodidact-study \
@@ -58,31 +41,27 @@ uv run autodidact-study \
   --reward-calibration-labels 40
 ```
 
-Initialization creates control state only. It does not invoke a researcher or train a model.
+Initialization creates control state only. It does not invoke a researcher or run a target. The
+training-limit option keeps its historical name, but a plugin receives target units through
+`{training_budget}` and declares their meaning in `rl.budget_unit` when applicable.
 
 ## Run and recover
-
-Advance each arm by at most one new proposal in its preassigned order:
 
 ```bash
 uv run autodidact-study \
   --repository-root . \
   --study-root artifacts/studies/pilot-001 \
   run --max-new-proposals-per-arm 1
-```
 
-The underlying orchestrator retains each operation, budget reservation, transcript, schedule, run,
-prediction, decision, and lineage before moving forward. Repeating the command resumes from those
-records instead of paying for a completed operation again.
-
-Inspect all arms without running another proposal:
-
-```bash
 uv run autodidact-study \
   --repository-root . \
   --study-root artifacts/studies/pilot-001 \
   status
 ```
 
-Study artifacts are ignored local runtime evidence. Compact reports and an explicitly redacted
-ledger export can be published later by the sealed reporting workflow.
+The orchestrator durably records each budget reservation, inference transcript, candidate commit,
+paired schedule, run, prediction, decision, and lineage before advancing. Repeating `run` resumes
+from those records rather than paying for a completed operation again.
+
+Study runtime artifacts remain local and ignored. Publish only the sealed report and an explicitly
+redacted evidence export.

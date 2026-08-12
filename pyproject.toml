@@ -1,15 +1,11 @@
 [project]
 name = "autodidact-autoresearch"
 version = "0.1.0"
-description = "Local-first autonomous language-model research with protected evaluation"
+description = "Model-agnostic autonomous ML research with protected paired evaluation"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 dependencies = [
-    "huggingface-hub>=0.34,<2",
     "numpy>=1.26,<3",
-    "tokenizers>=0.20,<1",
-    "torch>=2.4,<3",
-    "zstandard>=0.23,<1",
 ]
 
 [project.scripts]
@@ -18,11 +14,7 @@ autodidact-orchestrator = "autodidact.orchestrator:main"
 autodidact-researcher = "autodidact.researcher:main"
 autodidact-reward = "autodidact.reward:main"
 autodidact-sealed = "autodidact.sealed:main"
-autodidact-baseline = "autodidact.baseline:main"
-autodidact-calibrate = "autodidact.calibration:main"
 autodidact-controller = "autodidact.controller:main"
-autodidact-data = "autodidact.data.cli:main"
-autodidact-evaluate = "autodidact.evaluator:main"
 autodidact-interactions = "autodidact.interactions:main"
 autodidact-queue = "autodidact.execution_queue:main"
 autodidact-ledger = "autodidact.ledger:main"
@@ -30,7 +22,6 @@ autodidact-state = "autodidact.runstate:main"
 autodidact-study = "autodidact.study:main"
 autodidact-target = "autodidact.target:main"
 autodidact-runner = "autodidact.runner:main"
-autodidact-train = "train:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -39,16 +30,9 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["autodidact"]
 
-[tool.hatch.build.targets.wheel.force-include]
-"prepare.py" = "prepare.py"
-"train.py" = "train.py"
-
 [tool.hatch.build]
 include = [
     "autodidact/**/*.py",
-    "autodidact/data/policy.json",
-    "prepare.py",
-    "train.py",
 ]
 
 [dependency-groups]

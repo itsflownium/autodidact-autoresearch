@@ -13,7 +13,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from autodidact.data.integrity import canonical_json_bytes
+from autodidact.integrity import canonical_json_bytes
 from autodidact.ledger import DEFAULT_LEDGER_PATH, ExperimentLedger, LedgerError
 from autodidact.records import (
     CandidateRecord,
@@ -151,7 +151,9 @@ def build_interaction_audit_plan(
                 "later_promotion_count": later_promotions,
                 "promoted_commit": candidate.candidate_commit,
                 "promotion_effect_estimate_id": (None if effect is None else effect.estimate_id),
-                "promotion_mean_gain_bpb": (None if effect is None else effect.mean_gain_bpb),
+                "promotion_mean_objective_gain": (
+                    None if effect is None else effect.mean_objective_gain
+                ),
                 "requires_leave_one_out": requires_leave_one_out,
                 "reverse_patch_applicable": applicable,
                 "reverse_patch_error": applicability_error,

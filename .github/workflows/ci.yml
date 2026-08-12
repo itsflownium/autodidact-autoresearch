@@ -47,10 +47,7 @@ jobs:
         run: uv run pytest -q
 
       - name: Compile sources
-        run: uv run python -m compileall -q train.py prepare.py autodidact tests
-
-      - name: Inspect model contract
-        run: uv run train.py inspect
+        run: uv run python -m compileall -q autodidact tests
 
       - name: Build distributions
         run: uv build

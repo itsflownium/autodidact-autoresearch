@@ -30,7 +30,7 @@ def test_every_record_round_trips_through_a_json_envelope() -> None:
 
         assert record_from_envelope(decoded) == record
         assert decoded["record_id"] in decoded["payload"].values()
-        assert decoded["schema_version"] == 1
+        assert decoded["schema_version"] == 2
 
 
 def test_paired_and_effect_builders_recompute_protected_statistics() -> None:
@@ -39,7 +39,7 @@ def test_paired_and_effect_builders_recompute_protected_statistics() -> None:
     parent = records["parent_run"]
     candidate = records["candidate_run"]
     pair = records["paired"]
-    assert pair.gain_bpb == pytest.approx(0.005)
+    assert pair.objective_gain == pytest.approx(0.005)
     assert pair.training_throughput_delta == 1_000.0
     assert pair.peak_process_rss_delta_bytes == 20_000_000
 
@@ -56,7 +56,7 @@ def test_paired_and_effect_builders_recompute_protected_statistics() -> None:
         run_id="run-candidate-002",
         trial_id=second_trial.trial_id,
         seed=second_trial.seed,
-        validation_bpb=1.097,
+        objective_value=1.097,
         data_order_sha256=second_parent.data_order_sha256,
     )
     second_pair = build_paired_result(
@@ -71,12 +71,12 @@ def test_paired_and_effect_builders_recompute_protected_statistics() -> None:
         candidate_id=records["candidate"].candidate_id,
         stage=ExperimentStage.CHEAP,
         pairs=(pair, second_pair),
-        minimum_useful_gain_bpb=0.001,
+        minimum_useful_gain=0.001,
         probability_exceeds_minimum=0.95,
         estimator_version="paired-normal-v1",
     )
 
-    assert effect.mean_gain_bpb == pytest.approx(0.004)
+    assert effect.mean_objective_gain == pytest.approx(0.004)
     assert effect.sample_variance == pytest.approx(0.000002)
     assert effect.standard_error == pytest.approx(0.001)
     assert effect.seeds == (11, 23)
@@ -149,7 +149,7 @@ def test_success_and_failure_results_cannot_claim_incompatible_outcomes() -> Non
         replace(
             run,
             status=RunStatus.CRASHED,
-            validation_bpb=None,
+            objective_value=None,
             failure_reason=None,
         )
 
@@ -157,11 +157,11 @@ def test_success_and_failure_results_cannot_claim_incompatible_outcomes() -> Non
 def test_non_finite_and_forged_derived_values_are_rejected() -> None:
     records = evidence_records()
     with pytest.raises(RecordValidationError, match="must be finite"):
-        replace(records["proposal"], expected_effect_bpb=math.nan)
+        replace(records["proposal"], expected_effect=math.nan)
     with pytest.raises(RecordValidationError, match="must be finite"):
-        replace(records["decision"], minimum_useful_gain_bpb=math.inf)
+        replace(records["decision"], minimum_useful_gain=math.inf)
     with pytest.raises(RecordValidationError, match="must equal"):
-        replace(records["paired"], gain_bpb=1.0)
+        replace(records["paired"], objective_gain=1.0)
 
 
 def test_direct_enum_values_are_required() -> None:

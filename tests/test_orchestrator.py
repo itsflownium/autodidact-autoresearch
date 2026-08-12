@@ -10,7 +10,6 @@ import pytest
 
 from autodidact.checkpoints import file_sha256
 from autodidact.controller import DecisionMode, PatchRCTPolicy
-from autodidact.data.integrity import policy_sha256
 from autodidact.execution_queue import QUEUE_ASSIGNMENT_MARKER, ExecutionQueue
 from autodidact.ledger import ExperimentLedger, WriterRole
 from autodidact.orchestrator import (
@@ -90,12 +89,12 @@ response = {
     "failure_reason": None,
     "proposal": {
         "change": f"Enable synthetic patch {proposal_number}.",
-        "expected_effect_bpb": -0.05,
-        "failure_signal": "Paired BPB does not improve.",
-        "hypothesis": f"Synthetic patch {proposal_number} should improve BPB.",
+        "expected_effect": -0.05,
+        "failure_signal": "The paired objective does not improve.",
+        "hypothesis": f"Synthetic patch {proposal_number} should improve the objective.",
         "interaction_risk": "May interact with prior accepted patches.",
         "mechanism": "Exercise the complete autonomous campaign path.",
-        "minimum_useful_gain_bpb": 0.001,
+        "minimum_useful_gain": 0.001,
         "resource_risk": "No expected synthetic resource change.",
         "title": f"Synthetic patch {proposal_number}",
     },
@@ -119,8 +118,8 @@ def _digest(*parts: object) -> str:
 
 
 class SyntheticRunnerFactory:
-    def __init__(self, gain_bpb: float) -> None:
-        self.gain_bpb = gain_bpb
+    def __init__(self, objective_gain: float) -> None:
+        self.objective_gain = objective_gain
         self.registration_calls = 0
         self.run_calls: list[tuple[ExperimentStage, tuple[int, ...]]] = []
 
@@ -145,6 +144,8 @@ class SyntheticRunner:
             self.request.repository_root,
             parent_commit=proposal.parent_commit,
             candidate_commit=self.request.candidate_commit,
+            allowed_paths=("train.py",),
+            trainer_path="train.py",
         )
         trainer = subprocess.run(
             ["git", "show", f"{validation.candidate_commit}:train.py"],
@@ -160,8 +161,8 @@ class SyntheticRunner:
             diff_sha256=validation.diff_sha256,
             changed_paths=validation.changed_paths,
             trainer_sha256=hashlib.sha256(trainer).hexdigest(),
-            policy_sha256=policy_sha256(),
-            parameter_count=1_016_960,
+            policy_sha256=_digest("target-policy"),
+            parameter_count=2_000_000,
         )
         ledger.ensure(candidate, writer_role=WriterRole.CONTROLLER)
         return candidate
@@ -214,8 +215,8 @@ class SyntheticRunner:
             target_tokens=trial.token_budget,
             tokens_seen=trial.token_budget,
             evaluation_tokens=trial.eval_tokens or 128,
-            parameter_count=1_016_960,
-            validation_bpb=1.0 - self.factory.gain_bpb if candidate_arm else 1.0,
+            parameter_count=2_000_000,
+            objective_value=1.0 - self.factory.objective_gain if candidate_arm else 1.0,
             mean_train_loss=0.9 if candidate_arm else 1.0,
             training_tokens_per_second=10_000.0,
             evaluation_tokens_per_second=5_000.0,
@@ -345,8 +346,8 @@ def _policy(
         batch_size=2,
         eval_batch_size=2,
         timeout_seconds=10,
-        prior_standard_deviation_bpb=0.1,
-        seed_noise_standard_deviation_bpb=0.001,
+        prior_standard_deviation=0.1,
+        seed_noise_standard_deviation=0.001,
         max_peak_device_regression_fraction=None,
         use_downstream_allocation=use_downstream_allocation,
         allocation_audit_fraction=allocation_audit_fraction,
@@ -357,7 +358,7 @@ def _campaign(
     tmp_path: Path,
     *,
     max_proposals: int,
-    gain_bpb: float,
+    objective_gain: float,
     max_training_tokens: int = 100_000,
     reward_calibration_labels: int = 0,
     use_downstream_allocation: bool = False,
@@ -387,7 +388,7 @@ def _campaign(
         ),
     )
     output_root = tmp_path / "experiment-artifacts"
-    factory = SyntheticRunnerFactory(gain_bpb)
+    factory = SyntheticRunnerFactory(objective_gain)
     orchestrator = AutonomousResearchOrchestrator(
         OrchestratorConfig(
             repository_root=repository,
@@ -401,6 +402,21 @@ def _campaign(
             device="cpu",
             researcher_token_allowance=500,
             minimum_reward_labels=40,
+            target_config_path=tmp_path / "target.json",
+            trainer_path="train.py",
+            allowed_paths=("train.py",),
+            target_plugin_id="test.synthetic-target",
+            target_metric_name="verified_reward",
+            target_metric_direction="higher",
+            target_rl={
+                "algorithm_paths": ["train.py"],
+                "budget_unit": "rollouts",
+                "paradigm": "rlvr",
+                "reward_maximum": 1.0,
+                "reward_minimum": 0.0,
+                "reward_source": "verifier",
+                "schema_version": 1,
+            },
         ),
         state=state,
         ledger=ledger,
@@ -450,13 +466,13 @@ def _queued_repository(tmp_path: Path) -> tuple[Path, str, Path]:
         proposal = {
             "change": f"Set {slot} to true.",
             "diff_sha256": patch_sha256,
-            "expected_effect_bpb": -0.01,
+            "expected_effect": -0.01,
             "experimental_status": "queued_unmeasured",
-            "failure_signal": "Synthetic paired BPB does not improve.",
-            "hypothesis": f"Enabling {slot} should improve synthetic BPB.",
+            "failure_signal": "The protected objective does not improve.",
+            "hypothesis": f"Enabling {slot} should improve the synthetic objective.",
             "interaction_risk": "The other independent test slot may already be enabled.",
             "mechanism": "Exercise fixed-parent patch adaptation.",
-            "minimum_useful_gain_bpb": 0.001,
+            "minimum_useful_gain": 0.001,
             "parent_commit": parent,
             "patch_path": relative_patch,
             "proposal_number": number,
@@ -519,7 +535,7 @@ def _queued_repository(tmp_path: Path) -> tuple[Path, str, Path]:
                     "principles": ["Use deterministic proposal-number order."],
                     "tie_breaker": "Lower proposal number first.",
                 },
-                "schema_version": 1,
+                "schema_version": 2,
                 "source_banks": [manifest_relative],
             },
             indent=2,
@@ -611,6 +627,10 @@ def _queued_campaign(
             accepted_ref="refs/autodidact/test-queue-accepted",
             device="cpu",
             researcher_token_allowance=100,
+            target_config_path=tmp_path / "target.json",
+            trainer_path="train.py",
+            allowed_paths=("train.py",),
+            target_plugin_id="test.synthetic-target",
         ),
         state=state,
         ledger=ledger,
@@ -627,7 +647,7 @@ def test_campaign_resumes_across_calls_promotes_and_starts_from_new_parent(
     orchestrator, state, ledger, factory, repository = _campaign(
         tmp_path,
         max_proposals=2,
-        gain_bpb=0.05,
+        objective_gain=0.05,
     )
     initial_parent = ledger.current_parent()
 
@@ -740,6 +760,10 @@ def test_execution_queue_adapts_to_promoted_parent_and_replays_after_reopen(
             accepted_ref="refs/autodidact/test-queue-accepted",
             device="cpu",
             researcher_token_allowance=100,
+            target_config_path=tmp_path / "target.json",
+            trainer_path="train.py",
+            allowed_paths=("train.py",),
+            target_plugin_id="test.synthetic-target",
         ),
         state=reopened_state,
         ledger=reopened_ledger,
@@ -799,7 +823,7 @@ def test_bad_patch_is_rejected_without_advancing_parent(tmp_path: Path) -> None:
     orchestrator, state, ledger, factory, _repository_root = _campaign(
         tmp_path,
         max_proposals=1,
-        gain_bpb=-0.02,
+        objective_gain=-0.02,
     )
     parent = ledger.current_parent()
 
@@ -823,7 +847,7 @@ def test_calibration_campaign_collects_target_then_restores_early_rejection(
     orchestrator, state, ledger, factory, _repository_root = _campaign(
         tmp_path,
         max_proposals=3,
-        gain_bpb=-0.02,
+        objective_gain=-0.02,
         reward_calibration_labels=2,
     )
     parent = ledger.current_parent()
@@ -879,7 +903,7 @@ def test_calibration_then_prediction_allocation_stops_bad_patch_before_full(
     orchestrator, state, ledger, factory, _repository_root = _campaign(
         tmp_path,
         max_proposals=3,
-        gain_bpb=-0.02,
+        objective_gain=-0.02,
         reward_calibration_labels=2,
         use_downstream_allocation=True,
     )
@@ -917,7 +941,7 @@ def test_uncertain_patch_runs_each_next_predetermined_seed(tmp_path: Path) -> No
     orchestrator, state, ledger, factory, _repository_root = _campaign(
         tmp_path,
         max_proposals=1,
-        gain_bpb=0.001,
+        objective_gain=0.001,
     )
     parent = ledger.current_parent()
 
@@ -945,7 +969,7 @@ def test_training_budget_is_enforced_before_paired_runner_launch(tmp_path: Path)
     orchestrator, state, _ledger, factory, _repository_root = _campaign(
         tmp_path,
         max_proposals=1,
-        gain_bpb=0.05,
+        objective_gain=0.05,
         max_training_tokens=100,
     )
 
@@ -969,7 +993,7 @@ def test_pause_request_prevents_new_research_invocation(tmp_path: Path) -> None:
     orchestrator, state, ledger, factory, _repository_root = _campaign(
         tmp_path,
         max_proposals=1,
-        gain_bpb=0.05,
+        objective_gain=0.05,
     )
     parent = ledger.current_parent()
     state.request_pause("pause before the next proposal")
@@ -999,16 +1023,89 @@ def test_cli_initializes_and_reports_campaign_without_researcher_call(
         ),
         encoding="utf-8",
     )
+    control = repository / "control"
+    control.mkdir()
+    (control / "evaluate.py").write_text("# protected evaluator\n", encoding="utf-8")
+    plugin_path = control / "target-plugin.json"
+    plugin_path.write_text(
+        json.dumps(
+            {
+                "commands": {
+                    "evaluate": [
+                        "{python}",
+                        "{evaluator}",
+                        "evaluate",
+                        "--trainer",
+                        "{trainer}",
+                        "--checkpoint",
+                        "{checkpoint}",
+                        "--data-root",
+                        "{data_root}",
+                    ],
+                    "inspect": [
+                        "{python}",
+                        "{evaluator}",
+                        "inspect",
+                        "--trainer",
+                        "{trainer}",
+                        "--parameter-cap",
+                        "{parameter_cap}",
+                    ],
+                    "train": [
+                        "{python}",
+                        "{trainer}",
+                        "--data-root",
+                        "{public_data_root}",
+                        "--seed",
+                        "{seed}",
+                        "--rollouts",
+                        "{training_budget}",
+                        "--checkpoint",
+                        "{checkpoint}",
+                        "--metrics",
+                        "{metrics}",
+                    ],
+                },
+                "data_config_sha256": "1" * 64,
+                "editable_paths": ["train.py"],
+                "evaluator_path": "control/evaluate.py",
+                "metric": {
+                    "direction": "higher",
+                    "name": "verified_reward",
+                    "objective_offset": 1.0,
+                    "objective_scale": 1.0,
+                },
+                "plugin_id": "test.cli-rlvr",
+                "plugin_version": "1",
+                "rl": {
+                    "algorithm_paths": ["train.py"],
+                    "budget_unit": "rollouts",
+                    "paradigm": "rlvr",
+                    "reward_maximum": 1.0,
+                    "reward_minimum": 0.0,
+                    "reward_source": "verifier",
+                    "schema_version": 1,
+                },
+                "schema_version": 2,
+                "tokenizer_sha256": "2" * 64,
+                "trainer_path": "train.py",
+            }
+        ),
+        encoding="utf-8",
+    )
     target_config = repository / "artifacts" / "control" / "target.json"
     target_config.write_text(
         json.dumps(
             {
                 "data_root": str(tmp_path / "unused-data"),
                 "device": "cpu",
+                "estimated_accelerator_hour_usd": None,
                 "execution_location": "local",
-                "max_parameter_count": 1_050_000,
+                "max_parameter_count": 5_000_000,
                 "name": "CLI test target",
-                "schema_version": 2,
+                "plugin_spec_path": "control/target-plugin.json",
+                "public_data_root": str(tmp_path / "public-data"),
+                "schema_version": 3,
                 "trainer_path": "train.py",
             }
         ),
@@ -1093,6 +1190,7 @@ def test_cli_initializes_and_reports_campaign_without_researcher_call(
     }
     assert status["target"]["device"] == "cpu"
     assert status["target"]["name"] == "CLI test target"
+    assert status["target"]["rl"]["paradigm"] == "rlvr"
 
     target_config.write_text(target_config.read_text(encoding="utf-8") + "\n", encoding="utf-8")
     assert main([*resume_common, "status"]) == 2

@@ -21,6 +21,7 @@ from autodidact.study import (
     load_manifest,
     study_status,
 )
+from autodidact.target import TargetConfig
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -36,13 +37,85 @@ def _git(repository: Path, *arguments: str) -> str:
 
 def _repository(tmp_path: Path) -> tuple[Path, str]:
     repository = tmp_path / "repository"
-    repository.mkdir(parents=True)
+    (repository / "target").mkdir(parents=True)
+    (repository / "control").mkdir()
     _git(repository, "init", "-b", "main")
     _git(repository, "config", "user.name", "Test User")
     _git(repository, "config", "user.email", "test@example.com")
-    (repository / "train.py").write_text("MODEL = 'test'\n", encoding="utf-8")
-    (repository / "program.md").write_text("Change train.py only.\n", encoding="utf-8")
-    _git(repository, "add", "train.py", "program.md")
+    (repository / "target" / "train.py").write_text("MODEL = 'test'\n", encoding="utf-8")
+    (repository / "target" / "algorithm.py").write_text("ALGORITHM = 'custom'\n", encoding="utf-8")
+    (repository / "control" / "evaluate.py").write_text("# protected\n", encoding="utf-8")
+    (repository / "control" / "target-plugin.json").write_text(
+        json.dumps(
+            {
+                "commands": {
+                    "evaluate": [
+                        "{python}",
+                        "{evaluator}",
+                        "evaluate",
+                        "--trainer",
+                        "{trainer}",
+                        "--checkpoint",
+                        "{checkpoint}",
+                        "--data-root",
+                        "{data_root}",
+                    ],
+                    "inspect": [
+                        "{python}",
+                        "{evaluator}",
+                        "inspect",
+                        "--trainer",
+                        "{trainer}",
+                        "--parameter-cap",
+                        "{parameter_cap}",
+                    ],
+                    "train": [
+                        "{python}",
+                        "{trainer}",
+                        "train",
+                        "--data-root",
+                        "{public_data_root}",
+                        "--seed",
+                        "{seed}",
+                        "--rollouts",
+                        "{training_budget}",
+                        "--checkpoint",
+                        "{checkpoint}",
+                        "--metrics",
+                        "{metrics}",
+                    ],
+                },
+                "data_config_sha256": "1" * 64,
+                "editable_paths": ["target/train.py", "target/algorithm.py"],
+                "evaluator_path": "control/evaluate.py",
+                "metric": {
+                    "direction": "higher",
+                    "name": "verified_reward",
+                    "objective_offset": 1.0,
+                    "objective_scale": 1.0,
+                },
+                "plugin_id": "test.study-rlvr",
+                "plugin_version": "1",
+                "rl": {
+                    "algorithm_paths": ["target/algorithm.py"],
+                    "budget_unit": "rollouts",
+                    "paradigm": "rlvr",
+                    "reward_maximum": 1.0,
+                    "reward_minimum": 0.0,
+                    "reward_source": "verifier",
+                    "schema_version": 1,
+                },
+                "schema_version": 2,
+                "tokenizer_sha256": "2" * 64,
+                "trainer_path": "target/train.py",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (repository / "program.md").write_text(
+        "Improve the configured target objective.\n", encoding="utf-8"
+    )
+    _git(repository, "add", ".")
     _git(repository, "commit", "-m", "Add study parent")
     return repository, _git(repository, "rev-parse", "HEAD")
 
@@ -56,9 +129,33 @@ def _researcher_config(repository: Path) -> Path:
     return path
 
 
+def _target_config(repository: Path, tmp_path: Path) -> Path:
+    public = tmp_path / "public"
+    protected = tmp_path / "protected"
+    public.mkdir()
+    protected.mkdir()
+    path = repository / "target.json"
+    path.write_text(
+        json.dumps(
+            TargetConfig(
+                name="study target",
+                data_root=protected,
+                public_data_root=public,
+                plugin_spec_path=repository / "control" / "target-plugin.json",
+                trainer_path="target/train.py",
+                max_parameter_count=5_000_000,
+                device="cpu",
+            ).to_mapping()
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def _initialize(tmp_path: Path, *, assignment_seed: int = 17):
     repository, parent = _repository(tmp_path)
     researcher = _researcher_config(repository)
+    target = _target_config(repository, tmp_path)
     root = tmp_path / "study"
     limits = StudyLimits(
         max_proposals=50,
@@ -75,11 +172,8 @@ def _initialize(tmp_path: Path, *, assignment_seed: int = 17):
         limits=limits,
         reward_calibration_labels=40,
         researcher_config_path=str(researcher),
-        target_config_path=None,
+        target_config_path=str(target),
         program_path="program.md",
-        data_root="artifacts/data",
-        device="cpu",
-        estimated_accelerator_hour_usd=None,
     )
     return repository, parent, root, limits, manifest
 
@@ -124,14 +218,14 @@ def test_study_arm_order_and_policy_hashes_are_deterministic(tmp_path: Path) -> 
     assert (
         _arm_policy(
             StudyArm.GREEDY,
-            max_parameter_count=1_050_000,
+            max_parameter_count=5_000_000,
             minimum_reward_labels=40,
         ).decision_mode
         is DecisionMode.GREEDY
     )
     assert _arm_policy(
         StudyArm.PATCH_RCT_BAYESIAN,
-        max_parameter_count=1_050_000,
+        max_parameter_count=5_000_000,
         minimum_reward_labels=40,
     ).use_downstream_allocation
 
@@ -139,9 +233,10 @@ def test_study_arm_order_and_policy_hashes_are_deterministic(tmp_path: Path) -> 
 def test_study_rejects_budget_below_forced_calibration_minimum(tmp_path: Path) -> None:
     repository, _parent = _repository(tmp_path)
     researcher = _researcher_config(repository)
+    target = _target_config(repository, tmp_path)
     root = tmp_path / "underfunded-study"
 
-    with pytest.raises(StudyError, match="requires at least 4800000000"):
+    with pytest.raises(StudyError, match="requires at least 5920000000"):
         initialize_study(
             study_root=root,
             repository_root=repository,
@@ -151,16 +246,13 @@ def test_study_rejects_budget_below_forced_calibration_minimum(tmp_path: Path) -
                 max_proposals=50,
                 max_wall_seconds=10_000,
                 max_researcher_tokens=500_000,
-                max_training_tokens=4_799_999_999,
+                max_training_tokens=5_919_999_999,
                 max_compute_seconds=100_000,
             ),
             reward_calibration_labels=40,
             researcher_config_path=str(researcher),
-            target_config_path=None,
+            target_config_path=str(target),
             program_path="program.md",
-            data_root="artifacts/data",
-            device="cpu",
-            estimated_accelerator_hour_usd=None,
         )
 
     assert not root.exists()

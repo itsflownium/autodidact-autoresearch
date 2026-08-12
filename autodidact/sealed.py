@@ -21,8 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from autodidact.checkpoints import file_sha256
-from autodidact.data.config import default_output_root
-from autodidact.data.integrity import canonical_json_bytes, verify_dataset
+from autodidact.integrity import canonical_json_bytes
 from autodidact.ledger import ExperimentLedger, LedgerError
 from autodidact.records import (
     CandidateRecord,
@@ -31,16 +30,21 @@ from autodidact.records import (
     LineageRecord,
     PatchProposal,
 )
+from autodidact.rl import (
+    RLContractError,
+    validate_evaluation_diagnostics,
+    validate_training_diagnostics,
+)
 from autodidact.runner import (
     ProcessOutcome,
-    prepare_public_data_view,
     run_process,
     sanitized_environment,
 )
 from autodidact.runstate import RepositoryLock, RunStateError
 from autodidact.target import TargetConfig, TargetError
+from autodidact.target_plugins import TargetPluginError, TargetPluginSpec, resolve_repository_path
 
-SEALED_SCHEMA_VERSION = 1
+SEALED_SCHEMA_VERSION = 2
 DEFAULT_SEALED_ROOT = Path("artifacts/sealed")
 _NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-_")
 _COMMIT_LENGTHS = {40, 64}
@@ -84,7 +88,7 @@ class FrozenGeneration:
     commit: str
     candidate_id: str | None
     decision_id: str | None
-    minimum_useful_gain_bpb: float | None
+    minimum_useful_gain: float | None
 
     def __post_init__(self) -> None:
         if type(self.generation) is not int or self.generation < 0:
@@ -98,7 +102,7 @@ class FrozenGeneration:
                     self.parent_commit,
                     self.candidate_id,
                     self.decision_id,
-                    self.minimum_useful_gain_bpb,
+                    self.minimum_useful_gain,
                 )
             ):
                 raise SealedError("generation zero cannot identify a promotion")
@@ -109,7 +113,7 @@ class FrozenGeneration:
             raise SealedError("promoted generation requires a candidate ID")
         if not isinstance(self.decision_id, str) or not self.decision_id:
             raise SealedError("promoted generation requires a decision ID")
-        gain = self.minimum_useful_gain_bpb
+        gain = self.minimum_useful_gain
         if not isinstance(gain, (int, float)) or not math.isfinite(gain) or gain <= 0:
             raise SealedError("promoted generation requires a positive useful-gain threshold")
 
@@ -204,7 +208,9 @@ class SealedPlan:
     device: str
     parameter_cap: int
     data_root: str
-    public_manifest_sha256: str
+    public_data_root: str
+    plugin: dict[str, Any]
+    target_contract_sha256: str
     evaluator_sha256: str
     runner_sha256: str
 
@@ -235,13 +241,22 @@ class SealedPlan:
                 raise SealedError(f"{name} is invalid")
         if self.assignment_seed > 2**32 - 1:
             raise SealedError("assignment_seed exceeds 32 bits")
-        for name in ("device", "data_root"):
+        for name in ("device", "data_root", "public_data_root"):
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip() or "\x00" in value:
                 raise SealedError(f"{name} must be nonempty portable text")
-        for name in ("public_manifest_sha256", "evaluator_sha256", "runner_sha256"):
+        for name in ("target_contract_sha256", "evaluator_sha256", "runner_sha256"):
             if not _valid_sha256(getattr(self, name)):
                 raise SealedError(f"{name} is invalid")
+        try:
+            plugin = TargetPluginSpec.from_mapping(self.plugin)
+        except TargetPluginError as error:
+            raise SealedError(str(error)) from error
+        expected_contract = hashlib.sha256(canonical_json_bytes(plugin.to_mapping())).hexdigest()
+        if expected_contract != self.target_contract_sha256:
+            raise SealedError("sealed target plugin differs from its contract hash")
+        if Path(self.public_data_root).resolve() == Path(self.data_root).resolve():
+            raise SealedError("sealed public and protected data roots must differ")
 
     def to_mapping(self) -> dict[str, Any]:
         return {
@@ -255,12 +270,14 @@ class SealedPlan:
             "initial_parent_commit": self.initial_parent_commit,
             "parameter_cap": self.parameter_cap,
             "plan_id": self.plan_id,
-            "public_manifest_sha256": self.public_manifest_sha256,
+            "plugin": self.plugin,
+            "public_data_root": self.public_data_root,
             "runner_sha256": self.runner_sha256,
             "schema_version": SEALED_SCHEMA_VERSION,
             "seeds": list(self.seeds),
             "timeout_seconds": self.timeout_seconds,
             "token_budget": self.token_budget,
+            "target_contract_sha256": self.target_contract_sha256,
         }
 
     @classmethod
@@ -278,12 +295,14 @@ class SealedPlan:
             "initial_parent_commit",
             "parameter_cap",
             "plan_id",
-            "public_manifest_sha256",
+            "plugin",
+            "public_data_root",
             "runner_sha256",
             "schema_version",
             "seeds",
             "timeout_seconds",
             "token_budget",
+            "target_contract_sha256",
         }
         if set(value) != expected:
             raise SealedError("sealed plan keys are invalid")
@@ -300,7 +319,9 @@ class SealedPlan:
             device=value["device"],
             parameter_cap=value["parameter_cap"],
             data_root=value["data_root"],
-            public_manifest_sha256=value["public_manifest_sha256"],
+            public_data_root=value["public_data_root"],
+            plugin=value["plugin"],
+            target_contract_sha256=value["target_contract_sha256"],
             evaluator_sha256=value["evaluator_sha256"],
             runner_sha256=value["runner_sha256"],
         )
@@ -324,7 +345,13 @@ def _git(repository: Path, *arguments: str, check: bool = True) -> str:
     return completed.stdout.strip()
 
 
-def _freeze_arm(repository: Path, name: str, ledger_path: Path) -> FrozenArm:
+def _freeze_arm(
+    repository: Path,
+    name: str,
+    ledger_path: Path,
+    *,
+    trainer_path: str,
+) -> FrozenArm:
     if not _valid_name(name):
         raise SealedError(f"invalid arm name: {name}")
     ledger = ExperimentLedger.open(ledger_path, read_only=True)
@@ -350,7 +377,7 @@ def _freeze_arm(repository: Path, name: str, ledger_path: Path) -> FrozenArm:
             commit=summary["initial_parent_commit"],
             candidate_id=None,
             decision_id=None,
-            minimum_useful_gain_bpb=None,
+            minimum_useful_gain=None,
         )
     ]
     lineages = sorted(
@@ -376,15 +403,15 @@ def _freeze_arm(repository: Path, name: str, ledger_path: Path) -> FrozenArm:
                 commit=lineage.candidate_commit,
                 candidate_id=lineage.candidate_id,
                 decision_id=lineage.decision_id,
-                minimum_useful_gain_bpb=proposal_event.minimum_useful_gain_bpb,
+                minimum_useful_gain=proposal_event.minimum_useful_gain,
             )
         )
     if generations[-1].commit != summary["current_parent_commit"]:
         raise SealedError(f"{name} frozen lineage does not end at the ledger parent")
     for generation in generations:
         _git(repository, "cat-file", "-e", f"{generation.commit}^{{commit}}")
-        if _git(repository, "cat-file", "-t", f"{generation.commit}:train.py") != "blob":
-            raise SealedError(f"{name} generation {generation.generation} lacks train.py")
+        if _git(repository, "cat-file", "-t", f"{generation.commit}:{trainer_path}") != "blob":
+            raise SealedError(f"{name} generation {generation.generation} lacks {trainer_path}")
     return FrozenArm(
         name=name,
         ledger_path=str(ledger_path),
@@ -407,7 +434,9 @@ def _plan_digest_payload(
     device: str,
     parameter_cap: int,
     data_root: str,
-    public_manifest_sha256: str,
+    public_data_root: str,
+    plugin: dict[str, Any],
+    target_contract_sha256: str,
     evaluator_sha256: str,
     runner_sha256: str,
 ) -> dict[str, Any]:
@@ -420,11 +449,13 @@ def _plan_digest_payload(
         "eval_batch_size": eval_batch_size,
         "evaluator_sha256": evaluator_sha256,
         "parameter_cap": parameter_cap,
-        "public_manifest_sha256": public_manifest_sha256,
+        "plugin": plugin,
+        "public_data_root": public_data_root,
         "runner_sha256": runner_sha256,
         "seeds": list(seeds),
         "timeout_seconds": timeout_seconds,
         "token_budget": token_budget,
+        "target_contract_sha256": target_contract_sha256,
     }
 
 
@@ -439,9 +470,7 @@ def create_plan(
     batch_size: int,
     eval_batch_size: int,
     timeout_seconds: int,
-    data_root: Path,
-    device: str,
-    parameter_cap: int,
+    target_config_path: Path,
 ) -> SealedPlan:
     repository = repository_root.expanduser().resolve()
     root = sealed_root.expanduser().resolve()
@@ -449,16 +478,30 @@ def create_plan(
         raise SealedError(f"sealed root already exists: {root}")
     if not arm_ledgers:
         raise SealedError("sealed plan requires at least one arm ledger")
+    target = TargetConfig.from_path(target_config_path)
+    plugin = target.load_plugin(repository)
     with RepositoryLock(repository, campaign_id="sealed-freeze"):
         arms = tuple(
-            _freeze_arm(repository, name, path.expanduser().resolve()) for name, path in arm_ledgers
+            _freeze_arm(
+                repository,
+                name,
+                path.expanduser().resolve(),
+                trainer_path=plugin.trainer_path,
+            )
+            for name, path in arm_ledgers
         )
     initial = arms[0].generations[0].commit
     if any(arm.generations[0].commit != initial for arm in arms):
         raise SealedError("all sealed arms must share one initial parent")
-    verify_dataset(data_root, scope="public")
-    public_manifest = data_root.resolve() / "public" / "manifest.json"
-    evaluator_path = Path(__file__).resolve().with_name("evaluator.py")
+    data_root = target.resolved_data_root(repository)
+    public_data_root = target.resolved_public_data_root(repository)
+    if public_data_root is None or not public_data_root.is_dir():
+        raise SealedError("target public_data_root is missing")
+    if not data_root.is_dir() or data_root == public_data_root:
+        raise SealedError("target protected data_root is missing or not isolated")
+    evaluator_path = resolve_repository_path(repository, plugin.evaluator_path)
+    plugin_mapping = plugin.to_mapping()
+    target_contract_sha256 = hashlib.sha256(canonical_json_bytes(plugin_mapping)).hexdigest()
     runner_path = Path(__file__).resolve()
     payload = _plan_digest_payload(
         arms=arms,
@@ -468,10 +511,12 @@ def create_plan(
         batch_size=batch_size,
         eval_batch_size=eval_batch_size,
         timeout_seconds=timeout_seconds,
-        device=device,
-        parameter_cap=parameter_cap,
+        device=target.device,
+        parameter_cap=target.max_parameter_count,
         data_root=str(data_root.expanduser().resolve()),
-        public_manifest_sha256=file_sha256(public_manifest),
+        public_data_root=str(public_data_root),
+        plugin=plugin_mapping,
+        target_contract_sha256=target_contract_sha256,
         evaluator_sha256=file_sha256(evaluator_path),
         runner_sha256=file_sha256(runner_path),
     )
@@ -485,10 +530,12 @@ def create_plan(
         batch_size=batch_size,
         eval_batch_size=eval_batch_size,
         timeout_seconds=timeout_seconds,
-        device=device,
-        parameter_cap=parameter_cap,
+        device=target.device,
+        parameter_cap=target.max_parameter_count,
         data_root=str(data_root.expanduser().resolve()),
-        public_manifest_sha256=payload["public_manifest_sha256"],
+        public_data_root=str(public_data_root),
+        plugin=plugin_mapping,
+        target_contract_sha256=target_contract_sha256,
         evaluator_sha256=payload["evaluator_sha256"],
         runner_sha256=payload["runner_sha256"],
     )
@@ -530,13 +577,16 @@ def load_plan(sealed_root: Path) -> SealedPlan:
 def _verify_frozen_inputs(repository: Path, plan: SealedPlan) -> None:
     if file_sha256(Path(__file__).resolve()) != plan.runner_sha256:
         raise SealedError("sealed runner changed after plan creation")
-    evaluator_path = Path(__file__).resolve().with_name("evaluator.py")
+    plugin = TargetPluginSpec.from_mapping(plan.plugin)
+    evaluator_path = resolve_repository_path(repository, plugin.evaluator_path)
     if file_sha256(evaluator_path) != plan.evaluator_sha256:
         raise SealedError("protected evaluator changed after plan creation")
-    if file_sha256(Path(plan.data_root) / "public" / "manifest.json") != (
-        plan.public_manifest_sha256
+    if hashlib.sha256(canonical_json_bytes(plugin.to_mapping())).hexdigest() != (
+        plan.target_contract_sha256
     ):
-        raise SealedError("public dataset manifest changed after plan creation")
+        raise SealedError("target plugin changed after plan creation")
+    if not Path(plan.public_data_root).is_dir() or not Path(plan.data_root).is_dir():
+        raise SealedError("sealed target data roots are unavailable")
     for arm in plan.arms:
         ledger = ExperimentLedger.open(Path(arm.ledger_path), read_only=True)
         summary = ledger.summary()
@@ -636,7 +686,13 @@ def _require_success(outcome: ProcessOutcome, *, phase: str, stderr_path: Path) 
 
 
 @contextmanager
-def _single_worktree(repository: Path, worktree_parent: Path, commit: str) -> Iterator[Path]:
+def _single_worktree(
+    repository: Path,
+    worktree_parent: Path,
+    commit: str,
+    *,
+    trainer_path: str,
+) -> Iterator[Path]:
     worktree_parent.mkdir(parents=True, exist_ok=True)
     holder = Path(tempfile.mkdtemp(prefix=f"sealed-{commit[:12]}-", dir=worktree_parent))
     root = holder / "checkout"
@@ -644,9 +700,9 @@ def _single_worktree(repository: Path, worktree_parent: Path, commit: str) -> It
     try:
         _git(repository, "worktree", "add", "--detach", str(root), commit)
         added = True
-        trainer = root / "train.py"
+        trainer = resolve_repository_path(root, trainer_path)
         if not trainer.is_file() or trainer.is_symlink():
-            raise SealedError("frozen commit has an invalid train.py")
+            raise SealedError(f"frozen commit has an invalid {trainer_path}")
         yield root
     finally:
         if added:
@@ -673,10 +729,10 @@ def _run_contract(plan: SealedPlan, commit: str, seed: int, trainer_sha256: str)
         "commit": commit,
         "parameter_cap": plan.parameter_cap,
         "plan_id": plan.plan_id,
-        "public_manifest_sha256": plan.public_manifest_sha256,
         "schema_version": SEALED_SCHEMA_VERSION,
         "seed": seed,
         "split": "sealed_final",
+        "target_contract_sha256": plan.target_contract_sha256,
         "token_budget": plan.token_budget,
         "trainer_sha256": trainer_sha256,
     }
@@ -733,32 +789,59 @@ def _validate_result(
     inspection = result["inspection"]
     if (
         not isinstance(inspection, dict)
-        or inspection.get("event") != "protected_inspection"
+        or inspection.get("event") != "target_inspection"
         or inspection.get("trainer_sha256") != contract["trainer_sha256"]
         or type(inspection.get("parameter_count")) is not int
         or not 0 < inspection["parameter_count"] <= plan.parameter_cap
     ):
         raise SealedError("sealed protected inspection is invalid")
     evaluation = result["evaluation"]
+    plugin = TargetPluginSpec.from_mapping(plan.plugin)
     if (
         not isinstance(evaluation, dict)
-        or evaluation.get("event") != "protected_evaluation"
-        or evaluation.get("split") != "sealed_final"
+        or evaluation.get("event") != "target_evaluation"
         or evaluation.get("checkpoint_sha256") != result["checkpoint_sha256"]
         or evaluation.get("trainer_sha256") != contract["trainer_sha256"]
         or evaluation.get("parameter_count") != inspection["parameter_count"]
-        or not isinstance(evaluation.get("validation_bpb"), (int, float))
-        or not math.isfinite(evaluation["validation_bpb"])
+        or evaluation.get("metric_name") != plugin.metric.name
+        or evaluation.get("metric_direction") != plugin.metric.direction.value
+        or not isinstance(evaluation.get("objective_value"), (int, float))
+        or not math.isfinite(evaluation["objective_value"])
     ):
         raise SealedError("sealed protected evaluation is invalid")
+    try:
+        expected_objective = plugin.metric.canonical_objective(evaluation.get("metric_value"))
+    except TargetPluginError as error:
+        raise SealedError(str(error)) from error
+    if not math.isclose(
+        float(evaluation["objective_value"]), expected_objective, rel_tol=0.0, abs_tol=1e-12
+    ):
+        raise SealedError("sealed evaluation objective transform is invalid")
     training = result["training_summary"]
     if (
         not isinstance(training, dict)
-        or training.get("event") != "summary"
-        or training.get("tokens_seen") != plan.token_budget
+        or training.get("event") != "target_training_summary"
+        or training.get("units_seen") != plan.token_budget
         or training.get("parameter_count") != inspection["parameter_count"]
     ):
         raise SealedError("sealed training summary is invalid")
+    if plugin.rl is not None:
+        expected_training_contract = {
+            "budget_unit": plugin.rl.budget_unit,
+            "training_paradigm": plugin.rl.paradigm.value,
+        }
+        if any(training.get(key) != value for key, value in expected_training_contract.items()):
+            raise SealedError("sealed RL training changed the frozen RL contract")
+        if (
+            evaluation.get("training_paradigm") != plugin.rl.paradigm.value
+            or evaluation.get("reward_source") != plugin.rl.reward_source.value
+        ):
+            raise SealedError("sealed RL evaluation changed the frozen reward contract")
+        try:
+            validate_training_diagnostics(plugin.rl, training)
+            validate_evaluation_diagnostics(plugin.rl, evaluation)
+        except RLContractError as error:
+            raise SealedError(str(error)) from error
     processes = result["processes"]
     if not isinstance(processes, dict) or set(processes) != {
         "evaluation",
@@ -786,9 +869,17 @@ def _execute_run(
     seed: int,
 ) -> dict[str, Any]:
     run_root = _run_root(sealed_root, commit, seed)
-    evaluator_path = Path(__file__).resolve().with_name("evaluator.py")
-    with _single_worktree(repository, sealed_root / ".control" / "worktrees", commit) as worktree:
-        trainer = worktree / "train.py"
+    plugin = TargetPluginSpec.from_mapping(plan.plugin)
+    with _single_worktree(
+        repository,
+        sealed_root / ".control" / "worktrees",
+        commit,
+        trainer_path=plugin.trainer_path,
+    ) as worktree:
+        trainer = resolve_repository_path(worktree, plugin.trainer_path)
+        evaluator_path = resolve_repository_path(worktree, plugin.evaluator_path)
+        if file_sha256(evaluator_path) != plan.evaluator_sha256:
+            raise SealedError("protected evaluator differs in a frozen worktree")
         trainer_hash = file_sha256(trainer)
         contract = _run_contract(plan, commit, seed, trainer_hash)
         existing_contract = run_root / "contract.json"
@@ -805,16 +896,16 @@ def _execute_run(
         environment = sanitized_environment(seed, repository)
         inspect_stdout = run_root / "inspect.jsonl"
         inspect_stderr = run_root / "inspect.stderr.log"
+        common_values: dict[str, object] = {
+            "device": plan.device,
+            "evaluator": evaluator_path,
+            "parameter_cap": plan.parameter_cap,
+            "python": sys.executable,
+            "repository_root": worktree,
+            "trainer": trainer,
+        }
         inspection_outcome = run_process(
-            [
-                sys.executable,
-                str(evaluator_path),
-                "inspect",
-                "--trainer",
-                str(trainer),
-                "--parameter-cap",
-                str(plan.parameter_cap),
-            ],
+            plugin.render_command("inspect", common_values),
             cwd=worktree,
             environment=environment,
             stdout_path=inspect_stdout,
@@ -826,7 +917,7 @@ def _execute_run(
             phase="inspection",
             stderr_path=inspect_stderr,
         )
-        inspection = _last_json(inspect_stdout, event="protected_inspection")
+        inspection = _last_json(inspect_stdout, event="target_inspection")
         if inspection.get("trainer_sha256") != trainer_hash:
             raise SealedError("sealed inspection trainer hash mismatch")
 
@@ -834,34 +925,23 @@ def _execute_run(
         metrics = run_root / "metrics.jsonl"
         train_stdout = run_root / "training.stdout.log"
         train_stderr = run_root / "training.stderr.log"
-        training_command = [
-            sys.executable,
-            str(trainer),
-            "train",
-            "--mode",
-            "full",
-            "--data-root",
-            str(public_data_root),
-            "--device",
-            plan.device,
-            "--seed",
-            str(seed),
-            "--token-budget",
-            str(plan.token_budget),
-            "--batch-size",
-            str(plan.batch_size),
-            "--eval-batch-size",
-            str(plan.eval_batch_size),
-            "--checkpoint-out",
-            str(checkpoint),
-            "--metrics-file",
-            str(metrics),
-            "--skip-eval",
-            "--no-generate",
-            "--deterministic",
-        ]
         if checkpoint.is_file():
-            training_command.extend(["--resume", str(checkpoint)])
+            checkpoint.unlink()
+        training_command = plugin.render_command(
+            "train",
+            {
+                **common_values,
+                "batch_size": plan.batch_size,
+                "checkpoint": checkpoint,
+                "eval_batch_size": plan.eval_batch_size,
+                "metrics": metrics,
+                "public_data_root": public_data_root,
+                "seed": seed,
+                "stage": "sealed_final",
+                "training_budget": plan.token_budget,
+                "token_budget": plan.token_budget,
+            },
+        )
         training_outcome = run_process(
             training_command,
             cwd=worktree,
@@ -871,32 +951,26 @@ def _execute_run(
             timeout_seconds=plan.timeout_seconds,
         )
         _require_success(training_outcome, phase="training", stderr_path=train_stderr)
-        training_summary = _last_json(metrics, event="summary")
-        if training_summary.get("tokens_seen") != plan.token_budget:
+        training_summary = _last_json(metrics, event="target_training_summary")
+        if training_summary.get("units_seen") != plan.token_budget:
             raise SealedError("sealed training did not consume its exact token budget")
 
         evaluation_stdout = run_root / "evaluation.jsonl"
         evaluation_stderr = run_root / "evaluation.stderr.log"
         evaluation_outcome = run_process(
-            [
-                sys.executable,
-                str(evaluator_path),
+            plugin.render_command(
                 "evaluate",
-                "--trainer",
-                str(trainer),
-                "--checkpoint",
-                str(checkpoint),
-                "--data-root",
-                plan.data_root,
-                "--split",
-                "sealed_final",
-                "--batch-size",
-                str(plan.eval_batch_size),
-                "--device",
-                plan.device,
-                "--parameter-cap",
-                str(plan.parameter_cap),
-            ],
+                {
+                    **common_values,
+                    "batch_size": plan.eval_batch_size,
+                    "checkpoint": checkpoint,
+                    "data_root": plan.data_root,
+                    "eval_tokens": 0,
+                    "seed": seed,
+                    "split": "sealed_final",
+                    "stage": "sealed_final",
+                },
+            ),
             cwd=worktree,
             environment=environment,
             stdout_path=evaluation_stdout,
@@ -908,11 +982,17 @@ def _execute_run(
             phase="evaluation",
             stderr_path=evaluation_stderr,
         )
-        evaluation = _last_json(evaluation_stdout, event="protected_evaluation")
-        if evaluation.get("split") != "sealed_final" or evaluation.get(
-            "checkpoint_sha256"
-        ) != file_sha256(checkpoint):
+        evaluation = _last_json(evaluation_stdout, event="target_evaluation")
+        if (
+            evaluation.get("checkpoint_sha256") != file_sha256(checkpoint)
+            or evaluation.get("metric_name") != plugin.metric.name
+            or evaluation.get("metric_direction") != plugin.metric.direction.value
+        ):
             raise SealedError("sealed evaluation contract mismatch")
+        evaluation = {
+            **evaluation,
+            "objective_value": plugin.metric.canonical_objective(evaluation.get("metric_value")),
+        }
         if file_sha256(trainer) != trainer_hash or not _worktree_clean(worktree):
             raise SealedError("frozen worktree changed during sealed execution")
         result = {
@@ -946,10 +1026,7 @@ def run_sealed_plan(
     plan = load_plan(root)
     with RepositoryLock(repository, campaign_id=plan.plan_id):
         _verify_frozen_inputs(repository, plan)
-        verify_dataset(Path(plan.data_root), scope="all")
-        public_data_root = prepare_public_data_view(
-            Path(plan.data_root), root / ".control" / "public-data"
-        )
+        public_data_root = Path(plan.public_data_root)
         results = []
         for commit, seed in _run_specs(plan):
             results.append(
@@ -1040,14 +1117,14 @@ def build_report(
         generations = []
         for generation in arm.generations:
             values = [
-                float(results[(generation.commit, seed)]["evaluation"]["validation_bpb"])
+                float(results[(generation.commit, seed)]["evaluation"]["objective_value"])
                 for seed in plan.seeds
             ]
             generations.append(
                 {
                     "commit": generation.commit,
                     "generation": generation.generation,
-                    "sealed_bpb": _summary(values),
+                    "sealed_objective": _summary(values),
                 }
             )
         transitions = []
@@ -1057,12 +1134,12 @@ def build_report(
             current = arm.generations[index]
             previous = arm.generations[index - 1]
             gains = [
-                float(results[(previous.commit, seed)]["evaluation"]["validation_bpb"])
-                - float(results[(current.commit, seed)]["evaluation"]["validation_bpb"])
+                float(results[(previous.commit, seed)]["evaluation"]["objective_value"])
+                - float(results[(current.commit, seed)]["evaluation"]["objective_value"])
                 for seed in plan.seeds
             ]
             gain = _summary(gains)
-            minimum = float(current.minimum_useful_gain_bpb or 0.0)
+            minimum = float(current.minimum_useful_gain or 0.0)
             if float(gain["mean"]) <= 0.0:
                 classification = "false_promotion"
                 false_promotions += 1
@@ -1077,17 +1154,17 @@ def build_report(
                     "classification": classification,
                     "decision_id": current.decision_id,
                     "from_commit": previous.commit,
-                    "gain_bpb": gain,
+                    "objective_gain": gain,
                     "generation": current.generation,
-                    "minimum_useful_gain_bpb": minimum,
+                    "minimum_useful_gain": minimum,
                     "to_commit": current.commit,
                 }
             )
         baseline = arm.generations[0]
         final = arm.generations[-1]
         final_gains = [
-            float(results[(baseline.commit, seed)]["evaluation"]["validation_bpb"])
-            - float(results[(final.commit, seed)]["evaluation"]["validation_bpb"])
+            float(results[(baseline.commit, seed)]["evaluation"]["objective_value"])
+            - float(results[(final.commit, seed)]["evaluation"]["objective_value"])
             for seed in plan.seeds
         ]
         promotions = len(transitions)
@@ -1109,7 +1186,7 @@ def build_report(
             ),
             "false_promotion_count": false_promotions,
             "false_promotion_rate": (None if promotions == 0 else false_promotions / promotions),
-            "final_gain_bpb": _summary(final_gains),
+            "final_objective_gain": _summary(final_gains),
             "final_parent_commit": final.commit,
             "generations": generations,
             "promotion_count": promotions,
@@ -1150,7 +1227,10 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         "## Arm summary",
         "",
-        "| Arm | Promotions | Useful confirmed | False promotions | False rate | Final gain BPB |",
+        (
+            "| Arm | Promotions | Useful confirmed | False promotions | False rate "
+            "| Final objective gain |"
+        ),
         "| --- | ---: | ---: | ---: | ---: | ---: |",
     ]
     for name, arm in report["arms"].items():
@@ -1159,7 +1239,7 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"| {name} | {arm['promotion_count']} | {arm['useful_confirmed_count']} | "
             f"{arm['false_promotion_count']} | "
             f"{'n/a' if false_rate is None else f'{false_rate:.3f}'} | "
-            f"{arm['final_gain_bpb']['mean']:.6f} |"
+            f"{arm['final_objective_gain']['mean']:.6f} |"
         )
     lines.extend(["", "## Promotion confirmation", ""])
     for name, arm in report["arms"].items():
@@ -1169,16 +1249,19 @@ def render_markdown(report: dict[str, Any]) -> str:
             continue
         lines.extend(
             [
-                "| Generation | Classification | Mean gain BPB | 95% interval | Minimum useful |",
+                (
+                    "| Generation | Classification | Mean objective gain | 95% interval "
+                    "| Minimum useful |"
+                ),
                 "| ---: | --- | ---: | --- | ---: |",
             ]
         )
         for transition in arm["transitions"]:
-            gain = transition["gain_bpb"]
+            gain = transition["objective_gain"]
             lines.append(
                 f"| {transition['generation']} | {transition['classification']} | "
                 f"{gain['mean']:.6f} | [{gain['lower_95']:.6f}, {gain['upper_95']:.6f}] | "
-                f"{transition['minimum_useful_gain_bpb']:.6f} |"
+                f"{transition['minimum_useful_gain']:.6f} |"
             )
         lines.append("")
     lines.extend(
@@ -1202,17 +1285,17 @@ def render_csv(report: dict[str, Any]) -> str:
             "arm",
             "generation",
             "classification",
-            "mean_gain_bpb",
-            "lower_95_bpb",
-            "upper_95_bpb",
-            "minimum_useful_gain_bpb",
+            "mean_objective_gain",
+            "lower_95",
+            "upper_95",
+            "minimum_useful_gain",
             "from_commit",
             "to_commit",
         ]
     ]
     for name, arm in report["arms"].items():
         for transition in arm["transitions"]:
-            gain = transition["gain_bpb"]
+            gain = transition["objective_gain"]
             rows.append(
                 [
                     name,
@@ -1221,7 +1304,7 @@ def render_csv(report: dict[str, Any]) -> str:
                     gain["mean"],
                     gain["lower_95"],
                     gain["upper_95"],
-                    transition["minimum_useful_gain_bpb"],
+                    transition["minimum_useful_gain"],
                     transition["from_commit"],
                     transition["to_commit"],
                 ]
@@ -1240,7 +1323,7 @@ def render_svg(report: dict[str, Any]) -> str:
     plot_width = width - left - right
     plot_height = height - top - bottom
     points = [
-        float(generation["sealed_bpb"]["mean"])
+        float(generation["sealed_objective"]["mean"])
         for arm in report["arms"].values()
         for generation in arm["generations"]
     ]
@@ -1270,7 +1353,7 @@ def render_svg(report: dict[str, Any]) -> str:
         f'viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#ffffff"/>',
         '<text x="48" y="28" font-family="sans-serif" font-size="20" '
-        'font-weight="600">Sealed BPB by accepted generation</text>',
+        'font-weight="600">Sealed objective by accepted generation</text>',
         f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top + plot_height}" stroke="#222"/>',
         f'<line x1="{left}" y1="{top + plot_height}" x2="{left + plot_width}" '
         f'y2="{top + plot_height}" stroke="#222"/>',
@@ -1289,7 +1372,7 @@ def render_svg(report: dict[str, Any]) -> str:
     for index, (name, arm) in enumerate(report["arms"].items()):
         color = colors[index % len(colors)]
         coordinates = " ".join(
-            f"{x(int(item['generation'])):.2f},{y(float(item['sealed_bpb']['mean'])):.2f}"
+            f"{x(int(item['generation'])):.2f},{y(float(item['sealed_objective']['mean'])):.2f}"
             for item in arm["generations"]
         )
         elements.append(
@@ -1298,7 +1381,7 @@ def render_svg(report: dict[str, Any]) -> str:
         for item in arm["generations"]:
             elements.append(
                 f'<circle cx="{x(int(item["generation"])):.2f}" '
-                f'cy="{y(float(item["sealed_bpb"]["mean"])):.2f}" r="4" fill="{color}"/>'
+                f'cy="{y(float(item["sealed_objective"]["mean"])):.2f}" r="4" fill="{color}"/>'
             )
         legend_y = top + index * 24
         elements.extend(
@@ -1316,7 +1399,7 @@ def render_svg(report: dict[str, Any]) -> str:
             'font-family="sans-serif" font-size="14">Accepted generation</text>',
             f'<text x="20" y="{top + plot_height / 2}" text-anchor="middle" '
             'transform="rotate(-90 20 258)" font-family="sans-serif" '
-            'font-size="14">Sealed BPB (lower is better)</text>',
+            'font-size="14">Canonical objective (lower is better)</text>',
             "</svg>",
         ]
     )
@@ -1389,14 +1472,11 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--arm", type=_arm_spec, action="append", required=True)
     plan.add_argument("--seeds", type=int, nargs="+", required=True)
     plan.add_argument("--assignment-seed", type=int, required=True)
-    plan.add_argument("--token-budget", type=int, default=20_000_000)
+    plan.add_argument("--token-budget", type=int, required=True)
     plan.add_argument("--batch-size", type=int, default=64)
     plan.add_argument("--eval-batch-size", type=int, default=64)
     plan.add_argument("--timeout-seconds", type=int, default=7_200)
-    plan.add_argument("--data-root", type=_path, default=default_output_root())
-    plan.add_argument("--device", default="auto")
-    plan.add_argument("--parameter-cap", type=int, default=1_050_000)
-    plan.add_argument("--target-config", type=_path)
+    plan.add_argument("--target-config", type=_path, required=True)
     commands.add_parser("run", help="execute every missing frozen sealed run")
     commands.add_parser("report", help="build reports from retained sealed results")
     commands.add_parser("status", help="show sealed run and report completion")
@@ -1407,14 +1487,6 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         if args.command == "plan":
-            data_root = args.data_root
-            device = args.device
-            parameter_cap = args.parameter_cap
-            if args.target_config is not None:
-                target = TargetConfig.from_path(args.target_config)
-                data_root = target.resolved_data_root(args.repository_root.resolve())
-                device = target.device
-                parameter_cap = target.max_parameter_count
             plan = create_plan(
                 repository_root=args.repository_root,
                 sealed_root=args.sealed_root,
@@ -1425,9 +1497,7 @@ def main(argv: list[str] | None = None) -> int:
                 batch_size=args.batch_size,
                 eval_batch_size=args.eval_batch_size,
                 timeout_seconds=args.timeout_seconds,
-                data_root=data_root,
-                device=device,
-                parameter_cap=parameter_cap,
+                target_config_path=args.target_config,
             )
             payload = {"plan": plan.to_mapping(), "status": sealed_status(args.sealed_root)}
         elif args.command == "run":
@@ -1445,6 +1515,7 @@ def main(argv: list[str] | None = None) -> int:
         RunStateError,
         SealedError,
         TargetError,
+        TargetPluginError,
         ValueError,
     ) as error:
         print(f"error: {error}", file=sys.stderr)
