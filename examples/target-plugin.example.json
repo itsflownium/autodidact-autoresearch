@@ -1,0 +1,63 @@
+{
+  "commands": {
+    "evaluate": [
+      "{python}",
+      "{evaluator}",
+      "evaluate",
+      "--trainer",
+      "{trainer}",
+      "--checkpoint",
+      "{checkpoint}",
+      "--protected-root",
+      "{data_root}",
+      "--split",
+      "{split}",
+      "--maximum-units",
+      "{eval_tokens}"
+    ],
+    "inspect": [
+      "{python}",
+      "{evaluator}",
+      "inspect",
+      "--trainer",
+      "{trainer}",
+      "--parameter-cap",
+      "{parameter_cap}"
+    ],
+    "train": [
+      "{python}",
+      "{trainer}",
+      "train",
+      "--public-root",
+      "{public_data_root}",
+      "--device",
+      "{device}",
+      "--seed",
+      "{seed}",
+      "--budget",
+      "{training_budget}",
+      "--checkpoint",
+      "{checkpoint}",
+      "--metrics",
+      "{metrics}"
+    ]
+  },
+  "data_config_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "editable_paths": [
+    "model/train.py",
+    "model/model.py"
+  ],
+  "evaluator_path": "control/evaluate.py",
+  "metric": {
+    "direction": "lower",
+    "name": "validation_loss",
+    "objective_offset": 0.0,
+    "objective_scale": 1.0
+  },
+  "plugin_id": "example.generic-target",
+  "plugin_version": "1.0.0",
+  "rl": null,
+  "schema_version": 2,
+  "tokenizer_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+  "trainer_path": "model/train.py"
+}

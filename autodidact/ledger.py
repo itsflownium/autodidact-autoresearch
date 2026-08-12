@@ -24,7 +24,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
-from autodidact.data.integrity import canonical_json_bytes
+from autodidact.integrity import canonical_json_bytes
 from autodidact.records import (
     RECORD_SCHEMA_VERSION,
     AllocationAction,
@@ -90,11 +90,11 @@ RESULTS_TSV_COLUMNS = (
     "status",
     "stage",
     "paired_seeds",
-    "mean_gain_bpb",
-    "minimum_useful_gain_bpb",
+    "mean_objective_gain",
+    "minimum_useful_gain",
     "probability_exceeds_minimum",
-    "parent_bpb_mean",
-    "candidate_bpb_mean",
+    "parent_objective_mean",
+    "candidate_objective_mean",
     "throughput_delta_mean",
     "peak_rss_delta_bytes_mean",
     "constraints_passed",
@@ -1390,7 +1390,7 @@ class ExperimentLedger:
         if isinstance(record, EffectEstimate):
             candidate = cls._require_record(connection, record.candidate_id, CandidateRecord)
             proposal = cls._require_record(connection, candidate.proposal_id, PatchProposal)
-            if record.minimum_useful_gain_bpb != proposal.minimum_useful_gain_bpb:
+            if record.minimum_useful_gain != proposal.minimum_useful_gain:
                 raise LedgerStateError("effect estimate minimum differs from proposal contract")
             pairs = tuple(
                 cls._require_record(connection, pair_id, PairedResult)
@@ -1407,7 +1407,7 @@ class ExperimentLedger:
                 candidate_id=record.candidate_id,
                 stage=record.stage,
                 pairs=pairs,
-                minimum_useful_gain_bpb=record.minimum_useful_gain_bpb,
+                minimum_useful_gain=record.minimum_useful_gain,
                 probability_exceeds_minimum=record.probability_exceeds_minimum,
                 estimator_version=record.estimator_version,
             )
@@ -1418,7 +1418,7 @@ class ExperimentLedger:
         if isinstance(record, DownstreamPrediction):
             candidate = cls._require_record(connection, record.candidate_id, CandidateRecord)
             proposal = cls._require_record(connection, candidate.proposal_id, PatchProposal)
-            if record.minimum_useful_gain_bpb != proposal.minimum_useful_gain_bpb:
+            if record.minimum_useful_gain != proposal.minimum_useful_gain:
                 raise LedgerStateError("prediction minimum differs from proposal contract")
             trials = tuple(
                 cls._require_record(connection, trial_id, TrialSpec)
@@ -1656,7 +1656,7 @@ class ExperimentLedger:
             or not effect.constraints_passed
         ):
             raise LedgerStateError("allocation requires safe matching intermediate evidence")
-        if effect.minimum_useful_gain_bpb != proposal.minimum_useful_gain_bpb:
+        if effect.minimum_useful_gain != proposal.minimum_useful_gain:
             raise LedgerStateError("allocation effect differs from proposal contract")
 
         pairs = [
@@ -1699,7 +1699,7 @@ class ExperimentLedger:
         }
         if set(prediction.source_trial_ids) != early_trial_ids:
             raise LedgerStateError("allocation prediction omits current early evidence")
-        if prediction.minimum_useful_gain_bpb != proposal.minimum_useful_gain_bpb:
+        if prediction.minimum_useful_gain != proposal.minimum_useful_gain:
             raise LedgerStateError("allocation prediction differs from proposal contract")
         if prediction.full_budget_label_count < record.minimum_label_count:
             raise LedgerStateError("allocation prediction is not sufficiently calibrated")
@@ -1838,11 +1838,11 @@ class ExperimentLedger:
             effect = cls._require_record(connection, record.effect_estimate_id, EffectEstimate)
             if effect.candidate_id != record.candidate_id or effect.stage is not record.stage:
                 raise LedgerStateError("decision effect estimate differs from candidate or stage")
-            if effect.minimum_useful_gain_bpb != proposal.minimum_useful_gain_bpb:
+            if effect.minimum_useful_gain != proposal.minimum_useful_gain:
                 raise LedgerStateError("decision effect differs from proposal contract")
             if record.constraints_passed != effect.constraints_passed:
                 raise LedgerStateError("decision constraints differ from effect estimate")
-        if record.minimum_useful_gain_bpb != proposal.minimum_useful_gain_bpb:
+        if record.minimum_useful_gain != proposal.minimum_useful_gain:
             raise LedgerStateError("decision minimum effect differs from proposal contract")
         if record.downstream_prediction_id is not None:
             prediction = cls._require_record(
@@ -1854,7 +1854,7 @@ class ExperimentLedger:
                 raise LedgerStateError(
                     "decision downstream prediction belongs to another candidate"
                 )
-            if prediction.minimum_useful_gain_bpb != proposal.minimum_useful_gain_bpb:
+            if prediction.minimum_useful_gain != proposal.minimum_useful_gain:
                 raise LedgerStateError(
                     "decision downstream prediction differs from proposal contract"
                 )
@@ -2034,20 +2034,20 @@ class ExperimentLedger:
                 )
                 points.append(
                     {
-                        "candidate_bpb_mean": (
-                            statistics.fmean(item.candidate_bpb for item in candidate_pairs)
+                        "candidate_objective_mean": (
+                            statistics.fmean(item.candidate_objective for item in candidate_pairs)
                             if candidate_pairs
                             else None
                         ),
                         "candidate_id": candidate.candidate_id,
                         "event_sequence": event.sequence,
                         "experiment_index": index,
-                        "mean_gain_bpb": (
-                            None if latest_estimate is None else latest_estimate.mean_gain_bpb
+                        "mean_objective_gain": (
+                            None if latest_estimate is None else latest_estimate.mean_objective_gain
                         ),
                         "paired_seed_count": len(candidate_pairs),
-                        "parent_bpb_mean": (
-                            statistics.fmean(item.parent_bpb for item in candidate_pairs)
+                        "parent_objective_mean": (
+                            statistics.fmean(item.parent_objective for item in candidate_pairs)
                             if candidate_pairs
                             else None
                         ),
@@ -2118,20 +2118,20 @@ class ExperimentLedger:
                     "status": "running" if decision is None else decision.verdict.value,
                     "stage": "" if stage is None else stage.value,
                     "paired_seeds": ",".join(str(item.seed) for item in effect_pairs),
-                    "mean_gain_bpb": None if effect is None else effect.mean_gain_bpb,
-                    "minimum_useful_gain_bpb": proposal.minimum_useful_gain_bpb,
+                    "mean_objective_gain": None if effect is None else effect.mean_objective_gain,
+                    "minimum_useful_gain": proposal.minimum_useful_gain,
                     "probability_exceeds_minimum": (
                         None if effect is None else effect.probability_exceeds_minimum
                     ),
-                    "parent_bpb_mean": (
+                    "parent_objective_mean": (
                         None
                         if not effect_pairs
-                        else statistics.fmean(item.parent_bpb for item in effect_pairs)
+                        else statistics.fmean(item.parent_objective for item in effect_pairs)
                     ),
-                    "candidate_bpb_mean": (
+                    "candidate_objective_mean": (
                         None
                         if not effect_pairs
-                        else statistics.fmean(item.candidate_bpb for item in effect_pairs)
+                        else statistics.fmean(item.candidate_objective for item in effect_pairs)
                     ),
                     "throughput_delta_mean": (
                         None

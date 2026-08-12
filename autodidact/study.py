@@ -22,8 +22,7 @@ from autodidact.controller import (
     PatchRCTPolicy,
     synchronize_accepted_ref,
 )
-from autodidact.data.config import default_output_root
-from autodidact.data.integrity import canonical_json_bytes
+from autodidact.integrity import canonical_json_bytes
 from autodidact.ledger import ExperimentLedger, LedgerError
 from autodidact.orchestrator import (
     AutonomousResearchOrchestrator,
@@ -39,7 +38,7 @@ from autodidact.runner import RunnerError
 from autodidact.runstate import CampaignLimits, CampaignStore, RunStateError
 from autodidact.target import TargetConfig, TargetError
 
-STUDY_SCHEMA_VERSION = 1
+STUDY_SCHEMA_VERSION = 2
 DEFAULT_STUDY_ROOT = Path("artifacts/studies/three-arm")
 _STUDY_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{2,63}$")
 _COMMIT_PATTERN = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
@@ -121,8 +120,8 @@ class StudyManifest:
     reward_calibration_labels: int
     researcher_config_path: str
     researcher_config_sha256: str
-    target_config_path: str | None
-    target_config_sha256: str | None
+    target_config_path: str
+    target_config_sha256: str
     program_path: str
     program_sha256: str
     data_root: str
@@ -145,25 +144,23 @@ class StudyManifest:
             or self.reward_calibration_labels > self.limits.max_proposals
         ):
             raise StudyError("reward calibration labels must fit inside the proposal budget")
-        for name in ("researcher_config_path", "program_path", "data_root", "device"):
+        for name in (
+            "researcher_config_path",
+            "target_config_path",
+            "program_path",
+            "data_root",
+            "device",
+        ):
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip() or "\x00" in value:
                 raise StudyError(f"{name} must be nonempty portable text")
-        if self.target_config_path is not None and (
-            not isinstance(self.target_config_path, str)
-            or not self.target_config_path.strip()
-            or "\x00" in self.target_config_path
+        for name in (
+            "researcher_config_sha256",
+            "target_config_sha256",
+            "program_sha256",
         ):
-            raise StudyError("target_config_path must be null or nonempty portable text")
-        if (self.target_config_path is None) != (self.target_config_sha256 is None):
-            raise StudyError("target config path and hash must be set together")
-        for name in ("researcher_config_sha256", "program_sha256"):
             if not _SHA256_PATTERN.fullmatch(getattr(self, name)):
                 raise StudyError(f"{name} must be a lowercase SHA-256 digest")
-        if self.target_config_sha256 is not None and not _SHA256_PATTERN.fullmatch(
-            self.target_config_sha256
-        ):
-            raise StudyError("target_config_sha256 must be a lowercase SHA-256 digest")
         price = self.estimated_accelerator_hour_usd
         if price is not None and (
             not isinstance(price, (int, float)) or not math.isfinite(price) or price < 0
@@ -290,10 +287,9 @@ def _verify_pinned_inputs(repository: Path, manifest: StudyManifest) -> None:
         raise StudyError("researcher configuration changed after study initialization")
     if _file_sha256(program_path) != manifest.program_sha256:
         raise StudyError("research program changed after study initialization")
-    if manifest.target_config_path is not None:
-        target_path = _resolve(repository, manifest.target_config_path)
-        if _file_sha256(target_path) != manifest.target_config_sha256:
-            raise StudyError("target configuration changed after study initialization")
+    target_path = _resolve(repository, manifest.target_config_path)
+    if _file_sha256(target_path) != manifest.target_config_sha256:
+        raise StudyError("target configuration changed after study initialization")
 
 
 def _arm_policy(
@@ -348,11 +344,8 @@ def initialize_study(
     limits: StudyLimits,
     reward_calibration_labels: int,
     researcher_config_path: str,
-    target_config_path: str | None,
+    target_config_path: str,
     program_path: str,
-    data_root: str,
-    device: str,
-    estimated_accelerator_hour_usd: float | None,
 ) -> StudyManifest:
     repository = repository_root.expanduser().resolve()
     root = study_root.expanduser().resolve()
@@ -363,10 +356,10 @@ def initialize_study(
     ResearcherConfig.from_path(researcher_path)
     if not program.is_file():
         raise StudyError(f"research program does not exist: {program}")
-    target_path = None if target_config_path is None else _resolve(repository, target_config_path)
-    target = None if target_path is None else TargetConfig.from_path(target_path)
-    plugin = None if target is None else target.load_plugin(repository)
-    max_parameters = 1_050_000 if target is None else target.max_parameter_count
+    target_path = _resolve(repository, target_config_path)
+    target = TargetConfig.from_path(target_path)
+    target.load_plugin(repository)
+    max_parameters = target.max_parameter_count
     bayesian_policy = _arm_policy(
         StudyArm.PATCH_RCT_BAYESIAN,
         max_parameter_count=max_parameters,
@@ -375,7 +368,7 @@ def initialize_study(
     minimum_calibration_tokens = _minimum_calibration_training_tokens(
         reward_calibration_labels,
         bayesian_policy,
-        checkpoint_continuation=plugin is None,
+        checkpoint_continuation=False,
     )
     if limits.max_training_tokens < minimum_calibration_tokens:
         raise StudyError(
@@ -404,12 +397,12 @@ def initialize_study(
         researcher_config_path=researcher_config_path,
         researcher_config_sha256=_file_sha256(researcher_path),
         target_config_path=target_config_path,
-        target_config_sha256=(None if target_path is None else _file_sha256(target_path)),
+        target_config_sha256=_file_sha256(target_path),
         program_path=program_path,
         program_sha256=_file_sha256(program),
-        data_root=data_root,
-        device=device,
-        estimated_accelerator_hour_usd=estimated_accelerator_hour_usd,
+        data_root=str(target.resolved_data_root(repository)),
+        device=target.device,
+        estimated_accelerator_hour_usd=target.estimated_accelerator_hour_usd,
         policy_sha256=policies,
     )
     root.parent.mkdir(parents=True, exist_ok=True)
@@ -505,12 +498,10 @@ def run_study(
     repository = repository_root.expanduser().resolve()
     manifest = load_manifest(root)
     _verify_pinned_inputs(repository, manifest)
-    target = (
-        None
-        if manifest.target_config_path is None
-        else TargetConfig.from_path(_resolve(repository, manifest.target_config_path))
-    )
-    max_parameters = 1_050_000 if target is None else target.max_parameter_count
+    target_path = _resolve(repository, manifest.target_config_path)
+    target = TargetConfig.from_path(target_path)
+    plugin = target.load_plugin(repository)
+    max_parameters = target.max_parameter_count
     expected_policies = dict(manifest.policy_sha256)
     outcomes: dict[str, Any] = {}
     for arm in manifest.arm_order:
@@ -527,17 +518,11 @@ def run_study(
         researcher_config = ResearcherConfig.from_path(
             _resolve(repository, manifest.researcher_config_path)
         )
-        data_root = _resolve(repository, manifest.data_root)
-        device = manifest.device
-        target_name = "configured study target"
-        execution_location = "local"
-        estimated_cost = manifest.estimated_accelerator_hour_usd
-        if target is not None:
-            data_root = target.resolved_data_root(repository)
-            device = target.device
-            target_name = target.name
-            execution_location = target.execution_location.value
-            estimated_cost = target.estimated_accelerator_hour_usd
+        data_root = target.resolved_data_root(repository)
+        device = target.device
+        target_name = target.name
+        execution_location = target.execution_location.value
+        estimated_cost = target.estimated_accelerator_hour_usd
         orchestrator = AutonomousResearchOrchestrator(
             OrchestratorConfig(
                 repository_root=repository,
@@ -555,6 +540,13 @@ def run_study(
                 target_name=target_name,
                 target_execution_location=execution_location,
                 accepted_ref=_accepted_ref(manifest.study_id, arm),
+                target_config_path=target_path,
+                trainer_path=plugin.trainer_path,
+                allowed_paths=plugin.editable_paths,
+                target_plugin_id=plugin.plugin_id,
+                target_metric_name=plugin.metric.name,
+                target_metric_direction=plugin.metric.direction.value,
+                target_rl=None if plugin.rl is None else plugin.rl.to_mapping(),
             ),
             state=state,
             ledger=ledger,
@@ -583,11 +575,8 @@ def build_parser() -> argparse.ArgumentParser:
     initialize.add_argument("--study-id", required=True)
     initialize.add_argument("--assignment-seed", type=int, required=True)
     initialize.add_argument("--researcher-config", required=True)
-    initialize.add_argument("--target-config")
+    initialize.add_argument("--target-config", required=True)
     initialize.add_argument("--program", default="program.md")
-    initialize.add_argument("--data-root", default=str(default_output_root()))
-    initialize.add_argument("--device", default="auto")
-    initialize.add_argument("--estimated-accelerator-hour-usd", type=float)
     initialize.add_argument("--max-proposals", type=int, required=True)
     initialize.add_argument("--max-wall-seconds", type=float, required=True)
     initialize.add_argument("--max-researcher-tokens", type=int, required=True)
@@ -620,9 +609,6 @@ def main(argv: list[str] | None = None) -> int:
                 researcher_config_path=args.researcher_config,
                 target_config_path=args.target_config,
                 program_path=args.program,
-                data_root=args.data_root,
-                device=args.device,
-                estimated_accelerator_hour_usd=args.estimated_accelerator_hour_usd,
             )
             payload = {
                 "manifest": manifest.to_mapping(),

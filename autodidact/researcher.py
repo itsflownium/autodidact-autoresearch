@@ -14,17 +14,13 @@ import sys
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from enum import StrEnum
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Protocol
 
-from autodidact.data.integrity import (
-    ProtectedPathError,
-    assert_research_paths_allowed,
-    canonical_json_bytes,
-)
+from autodidact.integrity import ProtectedPathError, canonical_json_bytes, normalize_repository_path
 from autodidact.records import PatchProposal
 
-RESEARCHER_SCHEMA_VERSION = 1
+RESEARCHER_SCHEMA_VERSION = 2
 RESEARCHER_CONFIG_SCHEMA_VERSION = 1
 DEFAULT_RESEARCHER_TOKEN_ALLOWANCE = 1_000_000
 DEFAULT_CONFIG_PATH = Path("artifacts/control/researcher.json")
@@ -52,8 +48,8 @@ _PROPOSAL_KEYS = frozenset(
         "hypothesis",
         "mechanism",
         "change",
-        "expected_effect_bpb",
-        "minimum_useful_gain_bpb",
+        "expected_effect",
+        "minimum_useful_gain",
         "resource_risk",
         "failure_signal",
         "interaction_risk",
@@ -211,8 +207,8 @@ class ProposalDraft:
     hypothesis: str
     mechanism: str
     change: str
-    expected_effect_bpb: float
-    minimum_useful_gain_bpb: float
+    expected_effect: float
+    minimum_useful_gain: float
     resource_risk: str
     failure_signal: str
     interaction_risk: str
@@ -228,16 +224,16 @@ class ProposalDraft:
             "interaction_risk",
         ):
             _required_text(name, getattr(self, name))
-        if not isinstance(self.expected_effect_bpb, (int, float)) or not math.isfinite(
-            self.expected_effect_bpb
+        if not isinstance(self.expected_effect, (int, float)) or not math.isfinite(
+            self.expected_effect
         ):
-            raise ResearcherError("expected_effect_bpb must be finite")
+            raise ResearcherError("expected_effect must be finite")
         if (
-            not isinstance(self.minimum_useful_gain_bpb, (int, float))
-            or not math.isfinite(self.minimum_useful_gain_bpb)
-            or self.minimum_useful_gain_bpb <= 0.0
+            not isinstance(self.minimum_useful_gain, (int, float))
+            or not math.isfinite(self.minimum_useful_gain)
+            or self.minimum_useful_gain <= 0.0
         ):
-            raise ResearcherError("minimum_useful_gain_bpb must be finite and positive")
+            raise ResearcherError("minimum_useful_gain must be finite and positive")
 
     @classmethod
     def from_mapping(cls, value: Any) -> ProposalDraft:
@@ -320,7 +316,7 @@ class ResearchRequest:
     program_text: str
     previous_results: tuple[dict[str, Any], ...]
     maximum_total_tokens: int = DEFAULT_RESEARCHER_TOKEN_ALLOWANCE
-    allowed_paths: tuple[str, ...] = ("train.py",)
+    allowed_paths: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not _ID_PATTERN.fullmatch(self.request_id):
@@ -342,18 +338,11 @@ class ResearchRequest:
             raise ResearcherError("previous_results is too large")
         if not self.allowed_paths or len(set(self.allowed_paths)) != len(self.allowed_paths):
             raise ResearcherError("allowed_paths must be a nonempty unique sequence")
-        if self.allowed_paths == ("train.py",):
-            try:
-                assert_research_paths_allowed(list(self.allowed_paths))
-            except (ProtectedPathError, ValueError) as error:
-                raise ResearcherError(str(error)) from error
-        else:
+        try:
             for value in self.allowed_paths:
-                if not isinstance(value, str):
-                    raise ResearcherError("allowed_paths must contain portable text")
-                path = PurePosixPath(value.replace("\\", "/"))
-                if path.is_absolute() or ".." in path.parts or path.as_posix() in {"", "."}:
-                    raise ResearcherError("allowed_paths must be safe repository-relative paths")
+                normalize_repository_path(value, field="allowed path")
+        except ProtectedPathError as error:
+            raise ResearcherError(str(error)) from error
 
     def prompt(self) -> str:
         payload = {

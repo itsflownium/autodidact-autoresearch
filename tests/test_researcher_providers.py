@@ -62,6 +62,7 @@ def _request(parent: str, *, maximum_total_tokens: int = 10_000) -> ResearchRequ
         program_text="Change only train.py.",
         previous_results=(),
         maximum_total_tokens=maximum_total_tokens,
+        allowed_paths=("train.py",),
     )
 
 
@@ -70,12 +71,12 @@ def _response() -> dict[str, object]:
         "failure_reason": None,
         "proposal": {
             "change": "Reduce the learning rate.",
-            "expected_effect_bpb": 0.004,
-            "failure_signal": "Held-out BPB does not improve.",
+            "expected_effect": 0.004,
+            "failure_signal": "The protected objective does not improve.",
             "hypothesis": "A smaller step should reduce optimization noise.",
             "interaction_risk": "Warmup may need retuning.",
             "mechanism": "Take smaller updates after warmup.",
-            "minimum_useful_gain_bpb": 0.001,
+            "minimum_useful_gain": 0.001,
             "resource_risk": "No expected resource change.",
             "title": "Reduce learning rate",
         },
@@ -394,7 +395,7 @@ def test_response_json_schema_is_closed_and_requires_every_field() -> None:
     assert set(schema["required"]) == {"status", "proposal", "failure_reason", "usage"}
     proposal = schema["properties"]["proposal"]["anyOf"][0]
     assert proposal["additionalProperties"] is False
-    assert proposal["properties"]["minimum_useful_gain_bpb"] == {"type": "number"}
+    assert proposal["properties"]["minimum_useful_gain"] == {"type": "number"}
 
 
 def test_setup_and_doctor_write_private_native_config(

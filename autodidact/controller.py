@@ -14,7 +14,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from autodidact.data.integrity import canonical_json_bytes
+from autodidact.integrity import canonical_json_bytes
 from autodidact.ledger import ExperimentLedger, LedgerError, WriterRole
 from autodidact.records import (
     AllocationAction,
@@ -38,7 +38,7 @@ from autodidact.records import (
     record_to_envelope,
 )
 
-CONTROLLER_SCHEMA_VERSION = 1
+CONTROLLER_SCHEMA_VERSION = 2
 DEFAULT_LEDGER_PATH = Path("artifacts/ledger/experiments.sqlite3")
 DEFAULT_ACCEPTED_REF = "refs/autodidact/accepted"
 SCHEDULER_VERSION = "patchrct-sequential-v1"
@@ -67,9 +67,9 @@ class DecisionMode(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class PosteriorEstimate:
-    mean_gain_bpb: float
-    standard_deviation_bpb: float
-    observation_standard_deviation_bpb: float
+    mean_objective_gain: float
+    standard_deviation: float
+    observation_standard_deviation: float
     probability_exceeds_minimum: float
 
 
@@ -89,13 +89,13 @@ class PatchRCTPolicy:
     batch_size: int = 64
     eval_batch_size: int = 64
     timeout_seconds: int = 7_200
-    prior_mean_gain_bpb: float = 0.0
-    prior_standard_deviation_bpb: float = 0.01
-    seed_noise_standard_deviation_bpb: float = 0.004654
+    prior_mean_gain: float = 0.0
+    prior_standard_deviation: float = 0.01
+    seed_noise_standard_deviation: float = 0.004654
     rejection_probability: float = 0.10
     continuation_probability: float = 0.80
     promotion_probability: float = 0.95
-    max_parameter_count: int = 1_050_000
+    max_parameter_count: int = 2**63 - 1
     max_peak_process_rss_bytes: int | None = None
     max_peak_device_bytes: int | None = None
     min_training_tokens_per_second: float | None = None
@@ -155,16 +155,16 @@ class PatchRCTPolicy:
             if value is not None and value <= 0:
                 raise ControllerError("evaluation budgets must be positive or None")
         for name in (
-            "prior_mean_gain_bpb",
-            "prior_standard_deviation_bpb",
-            "seed_noise_standard_deviation_bpb",
+            "prior_mean_gain",
+            "prior_standard_deviation",
+            "seed_noise_standard_deviation",
         ):
             if not math.isfinite(getattr(self, name)):
                 raise ControllerError(f"{name} must be finite")
-        if self.prior_standard_deviation_bpb <= 0.0:
-            raise ControllerError("prior_standard_deviation_bpb must be positive")
-        if self.seed_noise_standard_deviation_bpb <= 0.0:
-            raise ControllerError("seed_noise_standard_deviation_bpb must be positive")
+        if self.prior_standard_deviation <= 0.0:
+            raise ControllerError("prior_standard_deviation must be positive")
+        if self.seed_noise_standard_deviation <= 0.0:
+            raise ControllerError("seed_noise_standard_deviation must be positive")
         probabilities = (
             self.rejection_probability,
             self.continuation_probability,
@@ -247,31 +247,31 @@ class PatchRCTPolicy:
 def useful_gain_posterior(
     gains: tuple[float, ...],
     *,
-    minimum_useful_gain_bpb: float,
+    minimum_useful_gain: float,
     policy: PatchRCTPolicy,
 ) -> PosteriorEstimate:
     if not gains or any(not math.isfinite(gain) for gain in gains):
         raise ControllerError("posterior requires finite paired gains")
     empirical_variance = statistics.variance(gains) if len(gains) > 1 else 0.0
     observation_variance = max(
-        policy.seed_noise_standard_deviation_bpb**2,
+        policy.seed_noise_standard_deviation**2,
         empirical_variance,
     )
-    prior_variance = policy.prior_standard_deviation_bpb**2
+    prior_variance = policy.prior_standard_deviation**2
     posterior_variance = 1.0 / (1.0 / prior_variance + len(gains) / observation_variance)
     posterior_mean = posterior_variance * (
-        policy.prior_mean_gain_bpb / prior_variance + sum(gains) / observation_variance
+        policy.prior_mean_gain / prior_variance + sum(gains) / observation_variance
     )
     posterior_standard_deviation = math.sqrt(posterior_variance)
     distribution = statistics.NormalDist(
         mu=posterior_mean,
         sigma=posterior_standard_deviation,
     )
-    probability = 1.0 - distribution.cdf(minimum_useful_gain_bpb)
+    probability = 1.0 - distribution.cdf(minimum_useful_gain)
     return PosteriorEstimate(
-        mean_gain_bpb=posterior_mean,
-        standard_deviation_bpb=posterior_standard_deviation,
-        observation_standard_deviation_bpb=math.sqrt(observation_variance),
+        mean_objective_gain=posterior_mean,
+        standard_deviation=posterior_standard_deviation,
+        observation_standard_deviation=math.sqrt(observation_variance),
         probability_exceeds_minimum=min(1.0, max(0.0, probability)),
     )
 
@@ -526,8 +526,8 @@ class PatchRCTController:
         pairs: tuple[PairedResult, ...],
     ) -> EffectEstimate:
         posterior = useful_gain_posterior(
-            tuple(pair.gain_bpb for pair in pairs),
-            minimum_useful_gain_bpb=proposal.minimum_useful_gain_bpb,
+            tuple(pair.objective_gain for pair in pairs),
+            minimum_useful_gain=proposal.minimum_useful_gain,
             policy=self.policy,
         )
         estimate = build_effect_estimate(
@@ -541,7 +541,7 @@ class PatchRCTController:
             candidate_id=candidate.candidate_id,
             stage=stage,
             pairs=pairs,
-            minimum_useful_gain_bpb=proposal.minimum_useful_gain_bpb,
+            minimum_useful_gain=proposal.minimum_useful_gain,
             probability_exceeds_minimum=posterior.probability_exceeds_minimum,
             estimator_version=f"{ESTIMATOR_VERSION}:{self.policy.sha256()[:16]}",
         )
@@ -578,7 +578,7 @@ class PatchRCTController:
             downstream_prediction_id=(
                 None if downstream_prediction is None else downstream_prediction.prediction_id
             ),
-            minimum_useful_gain_bpb=proposal.minimum_useful_gain_bpb,
+            minimum_useful_gain=proposal.minimum_useful_gain,
             probability_threshold=probability_threshold,
             constraints_passed=constraints_passed,
             reasons=reasons,
@@ -1052,14 +1052,14 @@ class PatchRCTController:
         if self.policy.decision_mode is DecisionMode.GREEDY:
             if stage is not ExperimentStage.CHEAP or len(pairs) != 1:
                 raise ControllerError("greedy mode requires exactly one completed cheap pair")
-            if effect.mean_gain_bpb > 0.0:
+            if effect.mean_objective_gain > 0.0:
                 return self._promote(
                     candidate,
                     proposal,
                     effect,
                     stage=stage,
                     probability_threshold=0.0,
-                    reason="greedy keep/discard retained a positive observed BPB gain",
+                    reason="greedy keep/discard retained a positive observed objective gain",
                 )
             return self._reject(
                 candidate,
@@ -1067,7 +1067,7 @@ class PatchRCTController:
                 stage,
                 effect=effect,
                 constraints_passed=True,
-                reasons=("greedy keep/discard did not observe a positive BPB gain",),
+                reasons=("greedy keep/discard did not observe a positive objective gain",),
                 probability_threshold=0.0,
             )
         probability = effect.probability_exceeds_minimum
@@ -1083,14 +1083,14 @@ class PatchRCTController:
         if scout_active and stage is ExperimentStage.CHEAP:
             if len(pairs) != 1:
                 raise ControllerError("scout_patch_rct mode requires one completed cheap pair")
-            if effect.mean_gain_bpb <= 0.0:
+            if effect.mean_objective_gain <= 0.0:
                 return self._reject(
                     candidate,
                     proposal,
                     stage,
                     effect=effect,
                     constraints_passed=True,
-                    reasons=("cheap scout did not observe a positive BPB gain",),
+                    reasons=("cheap scout did not observe a positive objective gain",),
                     probability_threshold=0.0,
                 )
             return self._escalate(
@@ -1196,7 +1196,7 @@ class PatchRCTController:
                 if not effects
                 else {
                     "estimate_id": effects[-1].estimate_id,
-                    "mean_gain_bpb": effects[-1].mean_gain_bpb,
+                    "mean_objective_gain": effects[-1].mean_objective_gain,
                     "probability_exceeds_minimum": (effects[-1].probability_exceeds_minimum),
                     "stage": effects[-1].stage.value,
                 }

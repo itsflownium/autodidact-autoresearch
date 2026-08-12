@@ -74,8 +74,8 @@ def _label(index: int, signal: float) -> FullBudgetLabel:
         label_id=f"label-synthetic-{index:03d}",
         candidate_id=f"candidate-synthetic-{index:03d}",
         full_trial_ids=(f"trial-full-{index:03d}",),
-        mean_full_gain_bpb=0.001 + 0.8 * signal,
-        sample_variance_bpb=0.000001,
+        mean_full_objective_gain=0.001 + 0.8 * signal,
+        sample_variance=0.000001,
         constraints_passed=True,
         captured_event_sequence=1_000 + index,
     )
@@ -181,7 +181,7 @@ def _append_pair(
         seed=seed,
         target_tokens=budget,
         tokens_seen=budget,
-        validation_bpb=parent.validation_bpb - gain,
+        objective_value=parent.objective_value - gain,
         data_order_sha256=order_hash,
     )
     parent_manifest = _manifest(
@@ -232,14 +232,14 @@ def test_bayesian_calibration_learns_signal_uncertainty_and_diagnostics(
     model = calibrate_model(features, labels, minimum_label_count=40)
     predicted = model.predict(
         _feature(999, 0.005),
-        minimum_useful_gain_bpb=0.001,
+        minimum_useful_gain=0.001,
     )
 
     assert model.calibrated is True
     assert model.label_count == 45
-    assert model.calibration_rmse_bpb is not None
-    assert model.calibration_rmse_bpb < 0.002
-    assert model.calibration_mean_absolute_error_bpb is not None
+    assert model.calibration_rmse is not None
+    assert model.calibration_rmse < 0.002
+    assert model.calibration_mean_absolute_error is not None
     assert model.calibration_interval_coverage_90 is not None
     assert 0.0 <= model.calibration_interval_coverage_90 <= 1.0
     assert predicted.mean == pytest.approx(0.005, abs=0.002)
@@ -258,7 +258,7 @@ def test_underfilled_model_requires_full_labels_for_calibration() -> None:
     features = [_feature(index, index * 0.001) for index in range(5)]
     labels = [_label(index, index * 0.001) for index in range(5)]
     model = calibrate_model(features, labels)
-    distribution = model.predict(features[-1], minimum_useful_gain_bpb=0.001)
+    distribution = model.predict(features[-1], minimum_useful_gain=0.001)
 
     assert model.calibrated is False
     assert recommendation(model, distribution) == "run_full_for_calibration"
@@ -319,7 +319,7 @@ def test_feature_extraction_verifies_artifacts_and_captures_learning_curves(
     assert values["cheap_pair_count"] == 1.0
     assert values["intermediate_pair_count"] == 0.0
     assert values["latest_budget_fraction"] == 0.1
-    assert values["mean_gain_bpb"] == pytest.approx(0.005)
+    assert values["mean_objective_gain"] == pytest.approx(0.005)
     assert values["mean_train_loss_delta"] == pytest.approx(0.1)
     assert values["mean_loss_slope_delta"] == pytest.approx(0.0)
     assert values["mean_loss_area_delta"] == pytest.approx(0.1)
@@ -352,8 +352,8 @@ def test_full_budget_label_aggregates_completed_full_pairs(tmp_path: Path) -> No
 
     label = build_full_budget_label(ledger, candidate_id)
 
-    assert label.mean_full_gain_bpb == pytest.approx(0.003)
-    assert label.sample_variance_bpb == pytest.approx(0.000002)
+    assert label.mean_full_objective_gain == pytest.approx(0.003)
+    assert label.sample_variance == pytest.approx(0.000002)
     assert len(label.full_trial_ids) == 2
     assert label.constraints_passed is True
 
@@ -427,7 +427,7 @@ def test_calibration_cli_writes_a_versioned_model(
     payload = json.loads(capsys.readouterr().out)
     assert payload["calibrated"] is True
     assert payload["label_count"] == 5
-    assert payload["calibration_rmse_bpb"] is not None
+    assert payload["calibration_rmse"] is not None
     assert isinstance(load_model(model_path), BayesianRewardModel)
 
 

@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from autodidact.data.integrity import canonical_json_bytes
+from autodidact.integrity import canonical_json_bytes
 from autodidact.researcher import (
     CommandResearcherAdapter,
     InvocationResult,
@@ -70,8 +70,8 @@ def response_json_schema() -> dict[str, Any]:
     }
     proposal_properties.update(
         {
-            "expected_effect_bpb": {"type": "number"},
-            "minimum_useful_gain_bpb": {"type": "number"},
+            "expected_effect": {"type": "number"},
+            "minimum_useful_gain": {"type": "number"},
         }
     )
     return {
@@ -459,7 +459,8 @@ class ClaudeCodeResearcherAdapter(NativeResearcherAdapter):
             "Edit",
             "Bash(git diff *)",
             "Bash(git status *)",
-            "Bash(uv run train.py inspect *)",
+            "Bash(uv run *)",
+            "Bash(python *)",
         ]
         if self.config.model is not None:
             command.extend(["--model", self.config.model])

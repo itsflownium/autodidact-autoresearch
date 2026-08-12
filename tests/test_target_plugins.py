@@ -99,6 +99,49 @@ def _plugin_mapping() -> dict[str, object]:
     }
 
 
+def _rlvr_plugin_mapping() -> dict[str, object]:
+    mapping = _plugin_mapping()
+    mapping["editable_paths"] = [
+        "model/train.py",
+        "model/layers.py",
+        "model/algorithm.py",
+    ]
+    mapping["metric"] = {
+        "direction": "higher",
+        "name": "verified_reward",
+        "objective_offset": 1.0,
+        "objective_scale": 1.0,
+    }
+    commands = dict(mapping["commands"])
+    commands["train"] = [
+        "{python}",
+        "{trainer}",
+        "train",
+        "--data-root",
+        "{public_data_root}",
+        "--seed",
+        "{seed}",
+        "--rollouts",
+        "{training_budget}",
+        "--checkpoint",
+        "{checkpoint}",
+        "--metrics",
+        "{metrics}",
+    ]
+    mapping["commands"] = commands
+    mapping["rl"] = {
+        "algorithm_paths": ["model/algorithm.py"],
+        "budget_unit": "rollouts",
+        "paradigm": "rlvr",
+        "reward_maximum": 1.0,
+        "reward_minimum": 0.0,
+        "reward_source": "verifier",
+        "schema_version": 1,
+    }
+    mapping["schema_version"] = 2
+    return mapping
+
+
 def _argument(command: list[str], name: str) -> str:
     return command[command.index(name) + 1]
 
@@ -119,6 +162,16 @@ def test_plugin_contract_is_strict_shell_free_and_normalizes_higher_metrics() ->
     editable_evaluator["editable_paths"] = ["model/train.py", "control/evaluate.py"]
     with pytest.raises(TargetPluginError, match="protected evaluator"):
         TargetPluginSpec.from_mapping(editable_evaluator)
+
+    rlvr = TargetPluginSpec.from_mapping(_rlvr_plugin_mapping())
+    assert rlvr.rl is not None
+    assert rlvr.rl.algorithm_paths == ("model/algorithm.py",)
+    assert "algorithm" not in rlvr.rl.to_mapping()
+
+    protected_algorithm = _rlvr_plugin_mapping()
+    protected_algorithm["editable_paths"] = ["model/train.py", "model/layers.py"]
+    with pytest.raises(TargetPluginError, match="algorithm_paths"):
+        TargetPluginSpec.from_mapping(protected_algorithm)
 
 
 def test_external_plugins_can_raise_the_built_in_parameter_cap(tmp_path: Path) -> None:
@@ -205,6 +258,7 @@ def _repository(tmp_path: Path) -> tuple[Path, str, str, Path]:
     _git(repository, "config", "user.email", "test@example.com")
     (repository / "model" / "train.py").write_text("MODEL = 'example'\n", encoding="utf-8")
     (repository / "model" / "layers.py").write_text("WIDTH = 8\n", encoding="utf-8")
+    (repository / "model" / "algorithm.py").write_text("ALGORITHM = 'initial'\n", encoding="utf-8")
     (repository / "control" / "evaluate.py").write_text(
         "# protected evaluator adapter\n", encoding="utf-8"
     )
@@ -223,9 +277,10 @@ def _repository(tmp_path: Path) -> tuple[Path, str, str, Path]:
 
 
 class ExternalTargetProcesses:
-    def __init__(self, *, public_root: Path, protected_root: Path) -> None:
+    def __init__(self, *, public_root: Path, protected_root: Path, rlvr: bool = False) -> None:
         self.public_root = public_root.resolve()
         self.protected_root = protected_root.resolve()
+        self.rlvr = rlvr
         self.training_commands: list[list[str]] = []
 
     def __call__(
@@ -265,7 +320,8 @@ class ExternalTargetProcesses:
             assert Path(_argument(command, "--data-root")).resolve() == self.public_root
             assert str(self.protected_root) not in command
             seed = int(_argument(command, "--seed"))
-            budget = int(_argument(command, "--target-units"))
+            budget_argument = "--rollouts" if self.rlvr else "--target-units"
+            budget = int(_argument(command, budget_argument))
             checkpoint = Path(_argument(command, "--checkpoint"))
             metrics = Path(_argument(command, "--metrics"))
             checkpoint.parent.mkdir(parents=True, exist_ok=True)
@@ -277,6 +333,18 @@ class ExternalTargetProcesses:
                 "target_units": budget,
                 "tokenizer_sha256": TOKENIZER_HASH,
             }
+            if self.rlvr:
+                common.update({"budget_unit": "rollouts", "training_paradigm": "rlvr"})
+            diagnostics = (
+                {
+                    "algorithm_id": "researcher-custom-policy-v3",
+                    "mean_train_reward": 0.55,
+                    "rollout_valid_fraction": 0.98,
+                    "train_reward_standard_deviation": 0.2,
+                }
+                if self.rlvr
+                else {}
+            )
             events = [
                 {"event": "target_training_config", **common},
                 {
@@ -285,6 +353,7 @@ class ExternalTargetProcesses:
                     "data_order_sha256": hashlib.sha256(f"order-{seed}".encode()).hexdigest(),
                     "mean_train_loss": 0.4,
                     "units_seen": budget,
+                    **diagnostics,
                 },
             ]
             metrics.write_text(
@@ -294,27 +363,36 @@ class ExternalTargetProcesses:
         if operation == "evaluate":
             assert Path(_argument(command, "--data-root")).resolve() == self.protected_root
             checkpoint = Path(_argument(command, "--checkpoint"))
-            improved = "IMPROVED" in (cwd / "model" / "layers.py").read_text(encoding="utf-8")
+            if self.rlvr:
+                improved = "researcher-custom-policy-v3" in (
+                    cwd / "model" / "algorithm.py"
+                ).read_text(encoding="utf-8")
+            else:
+                improved = "IMPROVED" in (cwd / "model" / "layers.py").read_text(encoding="utf-8")
             units = int(_argument(command, "--maximum-units"))
-            stdout_path.write_text(
-                json.dumps(
+            evaluation = {
+                "checkpoint_sha256": file_sha256(checkpoint),
+                "evaluation_seconds": 0.25,
+                "evaluation_units": units,
+                "evaluation_units_per_second": units / 0.25,
+                "event": "target_evaluation",
+                "metric_direction": "higher",
+                "metric_name": "verified_reward" if self.rlvr else "validation_accuracy",
+                "metric_value": 0.8 if improved else 0.7,
+                "parameter_count": 1_500_000,
+                "peak_process_rss_bytes": 12_000_000,
+                "trainer_sha256": file_sha256(trainer),
+            }
+            if self.rlvr:
+                evaluation.update(
                     {
-                        "checkpoint_sha256": file_sha256(checkpoint),
-                        "evaluation_seconds": 0.25,
-                        "evaluation_units": units,
-                        "evaluation_units_per_second": units / 0.25,
-                        "event": "target_evaluation",
-                        "metric_direction": "higher",
-                        "metric_name": "validation_accuracy",
-                        "metric_value": 0.8 if improved else 0.7,
-                        "parameter_count": 1_500_000,
-                        "peak_process_rss_bytes": 12_000_000,
-                        "trainer_sha256": file_sha256(trainer),
+                        "reward_source": "verifier",
+                        "reward_standard_deviation": 0.1,
+                        "training_paradigm": "rlvr",
+                        "verifier_coverage": 1.0,
                     }
                 )
-                + "\n",
-                encoding="utf-8",
-            )
+            stdout_path.write_text(json.dumps(evaluation) + "\n", encoding="utf-8")
             return ProcessOutcome(0, 0.25, 12_000_000)
         raise AssertionError(f"unexpected target command: {command}")
 
@@ -348,8 +426,8 @@ def test_external_target_runs_paired_evidence_without_exposing_protected_data(
             hypothesis="The change improves protected accuracy.",
             mechanism="Exercise the external target contract.",
             change="Change an allowed model component.",
-            expected_effect_bpb=0.1,
-            minimum_useful_gain_bpb=0.01,
+            expected_effect=0.1,
+            minimum_useful_gain=0.01,
             resource_risk="No expected resource change.",
             failure_signal="Accuracy does not improve.",
             interaction_risk="No known interaction.",
@@ -382,9 +460,9 @@ def test_external_target_runs_paired_evidence_without_exposing_protected_data(
 
     result = PairedExperimentRunner(request, process_runner=processes).run()
 
-    assert result["runs"][0]["gain_bpb"] == pytest.approx(0.1)
+    assert result["runs"][0]["objective_gain"] == pytest.approx(0.1)
     runs = [event.record for event in ledger.events() if isinstance(event.record, RunResult)]
-    assert sorted(run.validation_bpb for run in runs) == pytest.approx([0.2, 0.3])
+    assert sorted(run.objective_value for run in runs) == pytest.approx([0.2, 0.3])
     assert len(processes.training_commands) == 2
     validation = validate_candidate_patch(
         repository,
@@ -414,3 +492,87 @@ def test_external_target_runs_paired_evidence_without_exposing_protected_data(
             allowed_paths=("model/train.py", "model/layers.py"),
             trainer_path="model/train.py",
         )
+
+
+def test_rlvr_target_records_agent_selected_algorithm_without_hardcoding_it(
+    tmp_path: Path,
+) -> None:
+    repository, _initial, parent, plugin_path = _repository(tmp_path)
+    plugin_path.write_text(json.dumps(_rlvr_plugin_mapping()), encoding="utf-8")
+    (repository / "model" / "algorithm.py").write_text(
+        "ALGORITHM = 'researcher-custom-policy-v3'\n", encoding="utf-8"
+    )
+    _git(repository, "add", "model/algorithm.py")
+    _git(repository, "commit", "-m", "Research a custom policy algorithm")
+    candidate = _git(repository, "rev-parse", "HEAD")
+    public_root = tmp_path / "rl-public"
+    protected_root = tmp_path / "rl-protected"
+    public_root.mkdir()
+    protected_root.mkdir()
+    target_path = tmp_path / "rl-target.json"
+    target_path.write_text(
+        json.dumps(
+            TargetConfig(
+                name="custom RLVR target",
+                data_root=protected_root,
+                public_data_root=public_root,
+                plugin_spec_path=plugin_path,
+                trainer_path="model/train.py",
+                max_parameter_count=2_000_000,
+                device="cpu",
+            ).to_mapping()
+        ),
+        encoding="utf-8",
+    )
+    ledger_path = tmp_path / "rl-ledger.sqlite3"
+    ledger = ExperimentLedger.create(ledger_path, initial_parent_commit=parent)
+    ledger.append(
+        PatchProposal(
+            proposal_id="proposal-rlvr-001",
+            parent_commit=parent,
+            title="Try custom policy updates",
+            hypothesis="Custom credit assignment improves verified reward.",
+            mechanism="Replace the editable policy optimization algorithm.",
+            change="Implement a target-specific policy gradient variant.",
+            expected_effect=0.1,
+            minimum_useful_gain=0.01,
+            resource_risk="May alter rollout throughput.",
+            failure_signal="Verified reward does not improve.",
+            interaction_risk="May interact with reward normalization.",
+        ),
+        writer_role=WriterRole.RESEARCH_AGENT,
+    )
+    request = ExperimentRequest(
+        repository_root=repository,
+        ledger_path=ledger_path,
+        data_root=protected_root,
+        output_root=tmp_path / "rl-experiments",
+        proposal_id="proposal-rlvr-001",
+        candidate_commit=candidate,
+        stage=ExperimentStage.CHEAP,
+        seeds=(7,),
+        assignment_seed=11,
+        token_budget=64,
+        eval_tokens=32,
+        batch_size=2,
+        eval_batch_size=2,
+        timeout_seconds=30,
+        device="cpu",
+        limits=ResourceLimits(timeout_seconds=30, max_parameter_count=2_000_000),
+        target_config_path=target_path,
+    )
+
+    result = PairedExperimentRunner(
+        request,
+        process_runner=ExternalTargetProcesses(
+            public_root=public_root,
+            protected_root=protected_root,
+            rlvr=True,
+        ),
+    ).run()
+
+    assert result["runs"][0]["objective_gain"] == pytest.approx(0.1)
+    runs = [event.record for event in ledger.events() if isinstance(event.record, RunResult)]
+    assert {run.algorithm_id for run in runs} == {"researcher-custom-policy-v3"}
+    assert all(run.training_paradigm == "rlvr" for run in runs)
+    assert all(run.verifier_coverage == 1.0 for run in runs)

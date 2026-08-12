@@ -20,7 +20,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from autodidact.data.integrity import canonical_json_bytes
+from autodidact.integrity import canonical_json_bytes
 
 RUN_STATE_SCHEMA_VERSION = 1
 APPLICATION_ID = 0x41555352

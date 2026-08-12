@@ -1,170 +1,184 @@
-# Autodidact configuration
+# Configuration
 
-Autodidact configures two different models. Keep them separate:
+Autodidact separates the **researcher** from the **target**. The researcher is the coding agent
+that authors one patch. The target is the model, environment, training process, data or tasks, and
+metric being improved. Either side can change without silently changing the other.
 
-- The **researcher model** is the model used by Codex, Claude Code, or Hermes Agent to propose and
-  implement changes.
-- The **target model** is the model trained and measured by the paired autoresearch experiments.
+The source distribution contains only the autoresearch control plane. It does not contain a
+TinyStories model, a one-million-parameter model, a dataset, a checkpoint, or a default RL
+algorithm.
 
-Autodidact does not bundle or preload a trained 1M-parameter checkpoint into the research loop.
-Every trajectory begins from the target described by `train.py` under the same declared seed, token
-budget, data contract, and device. Built-in 2M and 6M stages preserve and continue the checkpoint
-toward 20M; they are not independent retraining runs.
+## Researcher configuration
 
-## Target model
-
-The included 1,016,960-parameter TinyStories transformer is the cheap default target and benchmark
-parent. It is not preloaded into the loop and it is not a requirement for other campaigns. Every
-paired trajectory constructs and trains the selected target from its declared parent commit. An
-identical protected parent result can be reused across candidates until the accepted parent or any
-training, data, evaluator, environment, batching, or resource contract changes.
-
-There are two target modes:
-
-- **Built-in:** `train.py`, TinyStories BPB, and a 1,050,000-parameter cap. Existing schema-version-1
-  target files remain readable.
-- **Plugin:** user-selected trainer files, dataset contract, metric, evaluator, and parameter cap.
-  The 1,050,000 limit does not apply to a plugin target. Schema-version-1 plugins support protected
-  parent-result reuse; checkpoint continuation currently requires the built-in trainer contract.
-
-`autodidact-target doctor` constructs and counts the selected model without training it. The paired
-runner receives the same target file, hashes its control contract, and refuses incompatible drift.
-
-Create the ignored local target configuration for a laptop:
+Create `artifacts/control/researcher.json` with a native adapter:
 
 ```bash
-uv run autodidact-target init \
-  --name my-transformer \
-  --data-root artifacts/data/tinystories-v1 \
-  --device auto \
-  --max-parameter-count 1050000
-
-uv run autodidact-target doctor --repository-root .
-```
-
-`auto` selects the best locally available device supported by the trainer. Use `cpu`, `mps`, or
-`cuda` to require one explicitly.
-
-For an H100, clone or mount the repository and prepared data on the GPU host or container, then
-create the target config and run the orchestrator there:
-
-```bash
-uv run autodidact-target init \
-  --name my-transformer-h100 \
-  --data-root /workspace/data/tinystories-v1 \
-  --device cuda \
-  --execution-location gpu_host \
-  --max-parameter-count 1050000 \
-  --estimated-accelerator-hour-usd 3.25
-
-uv run autodidact-orchestrator \
-  --target-config artifacts/control/target.json \
-  --researcher-config artifacts/control/researcher.json \
-  initialize \
-  --campaign-id gpu-campaign-001 \
-  --max-proposals 60 \
-  --max-wall-seconds 604800 \
-  --max-researcher-tokens 60000000 \
-  --max-training-tokens 9000000000 \
-  --max-compute-seconds 604800
-
-uv run autodidact-orchestrator run
-```
-
-Initialization hashes and persists the researcher configuration, target configuration,
-`program.md`, decision mode, and optional execution queue. Later `run` and `status` commands reload
-those exact files and reject drift before inference or training. Create a new campaign rather than
-editing the pinned target when moving between laptop and GPU configurations.
-
-The user configures the GPU runtime, drivers, storage mount, and credentials. Autodidact does not
-store cloud credentials or upload checkpoints. Running the orchestrator on the GPU host keeps the
-protected evaluator, immutable data, parent arm, and candidate arm in one auditable environment.
-
-For another model or task, create a target plugin and point the target configuration at it:
-
-```bash
-uv run autodidact-target init \
-  --name my-classifier \
-  --trainer-path model/train.py \
-  --plugin-spec control/target-plugin.json \
-  --public-data-root /datasets/my-task/public \
-  --data-root /datasets/my-task/evaluator-only \
-  --device auto \
-  --max-parameter-count 50000000
-
-uv run autodidact-target doctor --repository-root .
-```
-
-Training sees only `public_data_root`; only the protected evaluator command receives `data_root`.
-Commands are structured argument arrays executed without shell interpolation. The plugin declares
-the exact research-editable paths, while its evaluator and contract remain protected. See
-[`target-plugins.md`](target-plugins.md) for the complete schema, event protocol, and metric mapping.
-
-## Researcher model
-
-Choose the proposal agent and its model independently of the target:
-
-```bash
+# Codex
 uv run autodidact-agent bootstrap \
   --provider codex \
-  --model RESEARCHER_MODEL_ID \
+  --model YOUR_CODEX_MODEL \
   --reasoning-effort high \
   --fix
 
+# Claude Code
 uv run autodidact-agent bootstrap \
   --provider claude-code \
-  --model RESEARCHER_MODEL_ID \
+  --model YOUR_CLAUDE_MODEL \
   --reasoning-effort high \
   --max-turns 40 \
-  --max-budget-usd 5 \
   --fix
 
+# Hermes Agent
 uv run autodidact-agent bootstrap \
   --provider hermes-agent \
-  --backend-provider BACKEND_ID \
-  --model RESEARCHER_MODEL_ID \
+  --backend-provider YOUR_BACKEND \
+  --model YOUR_RESEARCHER_MODEL \
   --fix
 ```
 
-To change the researcher model, rerun the command with the new model and `--force`. The selected
-model ID is stored in `artifacts/control/researcher.json`; credentials remain in the provider CLI's
-own credential store.
+The configured agent receives the research program, prior public evidence, target summary, and an
+exact editable-path allowlist. It works in an isolated candidate worktree. The same target works
+with all three adapters.
 
-```bash
-uv run autodidact-agent bootstrap \
-  --provider codex \
-  --model NEW_RESEARCHER_MODEL_ID \
-  --reasoning-effort high \
-  --force \
-  --fix
-```
-
-Bootstrap and doctor perform only version and help-capability probes. They do not spend inference
-tokens. Before every real proposal, the adapter repeats those checks and refuses to call the model
-if required flags have disappeared.
+Change the researcher by running bootstrap again with `--force`. This starts no training and does
+not change the target contract. Credentials stay in the provider's own CLI configuration.
 
 ```bash
 uv run autodidact-agent doctor --fix
 ```
 
-`--fix` can select another compatible executable, restrict config permissions, run documented npm
-installation or provider upgrade commands, and then probe again. It never executes a shell string.
-A missing Hermes installation is reported with the official installer URL instead of automatically
-executing a downloaded script.
+Doctor probes the executable and required flags before inference. `--fix` attempts known local
+installation and permission repairs, then probes again. It cannot guarantee compatibility with
+future third-party CLI releases, but it fails with a specific diagnostic before spending an
+inference call.
 
-CLI compatibility and model availability are different checks. Help output can prove that an
-installed CLI supports Autodidact's invocation contract, but an authenticated provider may still
-reject an unavailable or misspelled model ID. That provider error is retained in the research
-transcript; Autodidact cannot safely replace the user's chosen model with a different billed model.
+## Target configuration
 
-## Configuration files
+The target is described by a local target JSON file and a protected plugin JSON file. The target
+files may describe any parameter count and any supported device because the repository has no
+built-in target.
 
-Both files are local runtime control artifacts and should remain outside Git history:
+```bash
+uv run autodidact-target init \
+  --name my-target \
+  --trainer-path policy/train.py \
+  --plugin-spec control/target-plugin.json \
+  --public-data-root /datasets/my-target/public \
+  --data-root /datasets/my-target/protected \
+  --device cuda \
+  --execution-location gpu_host \
+  --estimated-accelerator-hour-usd 1.50 \
+  --max-parameter-count 8000000000
 
-| File | Purpose |
+uv run autodidact-target doctor \
+  --config artifacts/control/target.json \
+  --repository-root .
+```
+
+Target fields:
+
+| Field | Meaning |
 | --- | --- |
-| `artifacts/control/researcher.json` | Proposal-agent CLI, model, budgets, and timeout |
-| `artifacts/control/target.json` | Target name, data root, device, parameter cap, and cost estimate |
+| `trainer_path` | Repository-relative entry point that the researcher may edit |
+| `plugin_spec_path` | Protected command, metric, path, and optional RL contract |
+| `public_data_root` | Data, tasks, or environment inputs visible during training |
+| `data_root` | Separate protected inputs visible only to evaluation |
+| `device` | Opaque device name passed to the target commands |
+| `execution_location` | Audit label: `local` or `gpu_host` |
+| `max_parameter_count` | Hard cap checked by protected inspection |
+| `estimated_accelerator_hour_usd` | Optional accounting rate, never a cloud credential |
 
-Neither file contains API keys. Provider authentication stays with the provider CLI, and GPU/cloud
-authentication stays with the user's host environment.
+The public and protected roots must exist and must differ. Use separate permissions or mounts when
+the threat model requires the researcher process to be unable to read the protected root.
+
+For a local GPU, set the device string expected by the trainer, such as `cuda`. For a remote GPU,
+clone or mount the target repository and data on that host, install Autodidact there, and run the
+orchestrator there. Autodidact invokes the configured command locally; it does not provision a VM,
+upload data, or establish SSH sessions.
+
+## Custom RL algorithms
+
+RL is configured in the plugin, not in the researcher adapter. The protected `rl` object declares
+only experimental invariants:
+
+- `paradigm`: `rl` or `rlvr`;
+- `reward_source`: `environment`, `reward_model`, `verifier`, or `hybrid`;
+- `budget_unit`: the unit consumed exactly by training;
+- `reward_minimum` and `reward_maximum`; and
+- `algorithm_paths`: files that contain the mutable algorithm.
+
+Every algorithm path must also be in `editable_paths`. Therefore the selected researcher can
+implement or replace the algorithm as a normal proposal. There is no algorithm enum and no forced
+GRPO implementation. The protected trainer must emit an `algorithm_id` describing what actually
+ran, so evidence remains attributable after the agent changes it.
+
+Reward semantics, verifier code, protected tasks, metric transforms, and budgets remain outside the
+editable allowlist. This lets an agent research the learning algorithm without letting it redefine
+success.
+
+## Campaign configuration
+
+Initialize once, then use the same control files for every `run` or `status` command:
+
+```bash
+uv run autodidact-orchestrator \
+  --repository-root . \
+  --researcher-config artifacts/control/researcher.json \
+  --target-config artifacts/control/target.json \
+  --program program.md \
+  --decision-mode patch_rct \
+  initialize \
+  --campaign-id pilot-001 \
+  --max-proposals 20 \
+  --max-wall-seconds 86400 \
+  --max-researcher-tokens 20000000 \
+  --max-training-tokens 400000000 \
+  --max-compute-seconds 86400
+
+uv run autodidact-orchestrator \
+  --repository-root . \
+  --researcher-config artifacts/control/researcher.json \
+  --target-config artifacts/control/target.json \
+  run --max-new-proposals 1
+```
+
+`max-researcher-tokens` limits coding-agent usage. `max-training-tokens` is the historical internal
+name for the campaign's target-training units; an RL plugin receives each stage value through
+`{training_budget}` and reports its declared `budget_unit`.
+
+Initialization pins hashes of the program, researcher config, target config, optional queue, and
+campaign limits. Recovery rejects drift. To change a researcher, target, metric, data contract, or
+device, initialize a new campaign rather than editing a running campaign's pinned files.
+
+## Optional downstream allocation
+
+```bash
+uv run autodidact-orchestrator \
+  --researcher-config artifacts/control/researcher.json \
+  --target-config artifacts/control/target.json \
+  initialize \
+  --campaign-id calibrated-001 \
+  --max-proposals 60 \
+  --max-wall-seconds 604800 \
+  --max-researcher-tokens 60000000 \
+  --max-training-tokens 9000000000 \
+  --max-compute-seconds 604800 \
+  --reward-calibration-labels 40 \
+  --use-downstream-allocation
+```
+
+The calibration phase collects early features plus direct full-stage labels. Once ready, a Bayesian
+learning-curve model helps allocate later full tests. It never replaces protected evaluation or the
+PatchRCT promotion decision.
+
+## Local control files
+
+| Path | Purpose |
+| --- | --- |
+| `artifacts/control/researcher.json` | Researcher CLI, selected model, and inference limits |
+| `artifacts/control/target.json` | Target plugin, roots, device, cap, and cost label |
+| `artifacts/state/campaign.sqlite3` | Recoverable campaign state |
+| `artifacts/ledger/experiments.sqlite3` | Append-only experiment evidence |
+
+These files contain no API keys but can reveal local paths and experiment history. Keep them out of
+the source repository unless explicitly redacted for publication.

@@ -11,9 +11,11 @@ from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from autodidact.data.integrity import canonical_json_bytes
+from autodidact.integrity import canonical_json_bytes
+from autodidact.rl import RLContractError, RLTargetContract
 
-PLUGIN_SCHEMA_VERSION = 1
+PLUGIN_SCHEMA_VERSION = 2
+SUPPORTED_PLUGIN_SCHEMA_VERSIONS = frozenset({1, PLUGIN_SCHEMA_VERSION})
 _SHA256_LENGTH = 64
 _TOP_LEVEL_KEYS = frozenset(
     {
@@ -24,6 +26,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "metric",
         "plugin_id",
         "plugin_version",
+        "rl",
         "schema_version",
         "tokenizer_sha256",
         "trainer_path",
@@ -32,7 +35,7 @@ _TOP_LEVEL_KEYS = frozenset(
 _COMMAND_KEYS = frozenset({"evaluate", "inspect", "train"})
 _METRIC_KEYS = frozenset({"direction", "name", "objective_offset", "objective_scale"})
 _COMMON_PLACEHOLDERS = frozenset(
-    {"evaluator", "parameter_cap", "python", "repository_root", "trainer"}
+    {"device", "evaluator", "parameter_cap", "python", "repository_root", "trainer"}
 )
 _TRAIN_PLACEHOLDERS = _COMMON_PLACEHOLDERS | frozenset(
     {
@@ -44,6 +47,7 @@ _TRAIN_PLACEHOLDERS = _COMMON_PLACEHOLDERS | frozenset(
         "public_data_root",
         "seed",
         "stage",
+        "training_budget",
         "token_budget",
     }
 )
@@ -137,7 +141,6 @@ def _command_template(value: Any, *, name: str) -> tuple[str, ...]:
             "public_data_root",
             "python",
             "seed",
-            "token_budget",
             "trainer",
         },
         "evaluate": {"checkpoint", "data_root", "evaluator", "python", "trainer"},
@@ -145,6 +148,11 @@ def _command_template(value: Any, *, name: str) -> tuple[str, ...]:
     missing = required - placeholders
     if missing:
         raise TargetPluginError(f"commands.{name} is missing placeholders: {sorted(missing)}")
+    if name == "train" and not {"training_budget", "token_budget"}.intersection(placeholders):
+        raise TargetPluginError(
+            "commands.train must use the training_budget placeholder "
+            "(legacy token_budget is also accepted)"
+        )
     expected_prefix = {
         "inspect": ("{python}", "{evaluator}"),
         "train": ("{python}", "{trainer}"),
@@ -211,6 +219,7 @@ class TargetPluginSpec:
     evaluate_command: tuple[str, ...]
     data_config_sha256: str
     tokenizer_sha256: str
+    rl: RLTargetContract | None = None
 
     def __post_init__(self) -> None:
         identities = (("plugin_id", self.plugin_id), ("plugin_version", self.plugin_version))
@@ -228,6 +237,15 @@ class TargetPluginSpec:
             raise TargetPluginError("editable_paths must include trainer_path")
         if evaluator in editable:
             raise TargetPluginError("the protected evaluator cannot be research-editable")
+        if self.rl is not None:
+            missing_algorithm_paths = sorted(set(self.rl.algorithm_paths) - set(editable))
+            if missing_algorithm_paths:
+                raise TargetPluginError(
+                    "rl.algorithm_paths must be included in editable_paths: "
+                    + ", ".join(missing_algorithm_paths)
+                )
+            if self.metric.direction is not MetricDirection.HIGHER:
+                raise TargetPluginError("RL and RLVR targets require a higher-is-better reward")
         object.__setattr__(self, "trainer_path", trainer)
         object.__setattr__(self, "evaluator_path", evaluator)
         object.__setattr__(self, "editable_paths", editable)
@@ -236,32 +254,49 @@ class TargetPluginSpec:
 
     @classmethod
     def from_mapping(cls, value: Any) -> TargetPluginSpec:
-        mapping = _strict_keys(value, _TOP_LEVEL_KEYS, field="target plugin")
-        if mapping["schema_version"] != PLUGIN_SCHEMA_VERSION:
+        if not isinstance(value, dict):
+            raise TargetPluginError("target plugin must be an object")
+        schema_version = value.get("schema_version")
+        if schema_version not in SUPPORTED_PLUGIN_SCHEMA_VERSIONS:
             raise TargetPluginError("target plugin schema version is unsupported")
+        expected_keys = (
+            _TOP_LEVEL_KEYS if schema_version == PLUGIN_SCHEMA_VERSION else _TOP_LEVEL_KEYS - {"rl"}
+        )
+        mapping = _strict_keys(value, expected_keys, field="target plugin")
         commands = _strict_keys(mapping["commands"], _COMMAND_KEYS, field="commands")
         metric = _strict_keys(mapping["metric"], _METRIC_KEYS, field="metric")
         editable = mapping["editable_paths"]
         if not isinstance(editable, list):
             raise TargetPluginError("editable_paths must be an array")
-        return cls(
-            plugin_id=mapping["plugin_id"],
-            plugin_version=mapping["plugin_version"],
-            trainer_path=mapping["trainer_path"],
-            evaluator_path=mapping["evaluator_path"],
-            editable_paths=tuple(editable),
-            metric=MetricContract(
-                name=metric["name"],
-                direction=metric["direction"],
-                objective_offset=metric["objective_offset"],
-                objective_scale=metric["objective_scale"],
-            ),
-            inspect_command=_command_template(commands["inspect"], name="inspect"),
-            train_command=_command_template(commands["train"], name="train"),
-            evaluate_command=_command_template(commands["evaluate"], name="evaluate"),
-            data_config_sha256=_sha256(mapping["data_config_sha256"], field="data_config_sha256"),
-            tokenizer_sha256=_sha256(mapping["tokenizer_sha256"], field="tokenizer_sha256"),
-        )
+        try:
+            rl = (
+                None
+                if schema_version == 1 or mapping["rl"] is None
+                else RLTargetContract.from_mapping(mapping["rl"])
+            )
+            return cls(
+                plugin_id=mapping["plugin_id"],
+                plugin_version=mapping["plugin_version"],
+                trainer_path=mapping["trainer_path"],
+                evaluator_path=mapping["evaluator_path"],
+                editable_paths=tuple(editable),
+                metric=MetricContract(
+                    name=metric["name"],
+                    direction=metric["direction"],
+                    objective_offset=metric["objective_offset"],
+                    objective_scale=metric["objective_scale"],
+                ),
+                inspect_command=_command_template(commands["inspect"], name="inspect"),
+                train_command=_command_template(commands["train"], name="train"),
+                evaluate_command=_command_template(commands["evaluate"], name="evaluate"),
+                data_config_sha256=_sha256(
+                    mapping["data_config_sha256"], field="data_config_sha256"
+                ),
+                tokenizer_sha256=_sha256(mapping["tokenizer_sha256"], field="tokenizer_sha256"),
+                rl=rl,
+            )
+        except RLContractError as error:
+            raise TargetPluginError(str(error)) from error
 
     @classmethod
     def from_path(cls, path: Path) -> TargetPluginSpec:
@@ -291,6 +326,7 @@ class TargetPluginSpec:
             },
             "plugin_id": self.plugin_id,
             "plugin_version": self.plugin_version,
+            "rl": None if self.rl is None else self.rl.to_mapping(),
             "schema_version": PLUGIN_SCHEMA_VERSION,
             "tokenizer_sha256": self.tokenizer_sha256,
             "trainer_path": self.trainer_path,

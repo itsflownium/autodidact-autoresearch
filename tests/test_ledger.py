@@ -65,13 +65,13 @@ def test_complete_lifecycle_is_reconstructable_from_immutable_events(tmp_path: P
     }
     assert points == [
         {
-            "candidate_bpb_mean": 1.095,
+            "candidate_objective_mean": 1.095,
             "candidate_id": "candidate-001",
             "event_sequence": 2,
             "experiment_index": 1,
-            "mean_gain_bpb": pytest.approx(0.005),
+            "mean_objective_gain": pytest.approx(0.005),
             "paired_seed_count": 1,
-            "parent_bpb_mean": 1.1,
+            "parent_objective_mean": 1.1,
             "promoted_parent_commit": CANDIDATE_COMMIT,
             "stage": "cheap",
             "status": "promote",
@@ -94,7 +94,7 @@ def test_results_tsv_is_a_readable_view_of_verified_evidence(tmp_path: Path) -> 
     assert rows[0]["status"] == "promote"
     assert rows[0]["stage"] == "cheap"
     assert rows[0]["paired_seeds"] == "11"
-    assert float(rows[0]["mean_gain_bpb"]) == pytest.approx(0.005)
+    assert float(rows[0]["mean_objective_gain"]) == pytest.approx(0.005)
     assert rows[0]["constraints_passed"] == "true"
     assert rows[0]["title"] == "Tune warmup"
 
@@ -278,11 +278,11 @@ def test_estimates_and_predictions_must_follow_predeclared_evidence(tmp_path: Pa
     ledger = create_ledger(tmp_path)
     ledger.append_many(lifecycle_entries()[:10])
 
-    forged_effect = replace(records["effect"], mean_gain_bpb=0.5)
+    forged_effect = replace(records["effect"], mean_objective_gain=0.5)
     with pytest.raises(LedgerStateError, match="statistics"):
         ledger.append(forged_effect, writer_role=WriterRole.EVALUATOR)
 
-    wrong_minimum = replace(records["effect"], minimum_useful_gain_bpb=0.002)
+    wrong_minimum = replace(records["effect"], minimum_useful_gain=0.002)
     with pytest.raises(LedgerStateError, match="proposal contract"):
         ledger.append(wrong_minimum, writer_role=WriterRole.EVALUATOR)
 
@@ -475,5 +475,5 @@ def test_prediction_target_must_be_later_than_source_stage(tmp_path: Path) -> No
 
 def test_resource_limit_values_remain_versioned_in_trial_records() -> None:
     limits = ResourceLimits(timeout_seconds=30)
-    assert limits.max_parameter_count == 1_050_000
+    assert limits.max_parameter_count == 2**63 - 1
     assert limits.max_peak_process_rss_bytes is None

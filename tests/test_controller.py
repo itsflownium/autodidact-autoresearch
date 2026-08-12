@@ -91,11 +91,11 @@ def _setup(
         proposal_id="proposal-controller-001",
         parent_commit=parent_commit,
         title="Controller candidate",
-        hypothesis="The treatment should produce useful paired BPB gain.",
+        hypothesis="The treatment should produce a useful paired objective gain.",
         mechanism="Exercise sequential PatchRCT evidence decisions.",
         change="Change train.py only.",
-        expected_effect_bpb=0.01,
-        minimum_useful_gain_bpb=0.001,
+        expected_effect=0.01,
+        minimum_useful_gain=0.001,
         resource_risk="No expected resource regression.",
         failure_signal="Useful-gain probability remains low.",
         interaction_risk="No known interaction.",
@@ -109,7 +109,7 @@ def _setup(
         changed_paths=("train.py",),
         trainer_sha256=digest("2"),
         policy_sha256=digest("3"),
-        parameter_count=1_016_960,
+        parameter_count=2_000_000,
     )
     ledger.append_many(
         (
@@ -196,7 +196,7 @@ def _complete_schedule(
             target_tokens=schedule.token_budget,
             tokens_seen=schedule.token_budget,
             evaluation_tokens=evaluation_tokens,
-            validation_bpb=parent.validation_bpb - gains.get(seed, 0.0),
+            objective_value=parent.objective_value - gains.get(seed, 0.0),
             data_order_sha256=order_hash,
         )
         entries: list[tuple[object, WriterRole]] = [
@@ -210,7 +210,7 @@ def _complete_schedule(
                 status=RunStatus.OOM,
                 tokens_seen=schedule.token_budget // 2,
                 evaluation_tokens=0,
-                validation_bpb=None,
+                objective_value=None,
                 training_tokens_per_second=None,
                 evaluation_tokens_per_second=None,
                 evaluation_seconds=None,
@@ -274,11 +274,11 @@ def _append_prediction(
         source_trial_ids=source_trial_ids,
         source_stages=source_stages,
         target_stage=ExperimentStage.FULL,
-        expected_gain_bpb=0.01 if probability >= 0.5 else -0.01,
+        expected_objective_gain=0.01 if probability >= 0.5 else -0.01,
         predictive_standard_deviation=0.005,
-        interval_lower_bpb=-0.02,
-        interval_upper_bpb=0.02,
-        minimum_useful_gain_bpb=proposal.minimum_useful_gain_bpb,
+        interval_lower=-0.02,
+        interval_upper=0.02,
+        minimum_useful_gain=proposal.minimum_useful_gain,
         probability_exceeds_minimum=probability,
         model_version="test-bayesian-reward-v1",
         full_budget_label_count=label_count,
@@ -292,11 +292,11 @@ def _complete_allocation_early_stages(
     controller: PatchRCTController,
     candidate: CandidateRecord,
     *,
-    gain_bpb: float = -0.01,
+    objective_gain: float = -0.01,
 ) -> None:
     controller.initialize(candidate.candidate_id)
     cheap = _latest_schedule(ledger, ExperimentStage.CHEAP)
-    _complete_schedule(ledger, candidate, cheap, {11: gain_bpb})
+    _complete_schedule(ledger, candidate, cheap, {11: objective_gain})
     action = controller.advance(candidate.candidate_id)
     assert action["stage"] == ExperimentStage.INTERMEDIATE.value
     intermediate = _latest_schedule(ledger, ExperimentStage.INTERMEDIATE)
@@ -304,7 +304,7 @@ def _complete_allocation_early_stages(
         ledger,
         candidate,
         intermediate,
-        {seed: gain_bpb for seed in intermediate.seeds},
+        {seed: objective_gain for seed in intermediate.seeds},
     )
 
 
@@ -322,17 +322,15 @@ def _latest_schedule(
 
 def test_posterior_probability_increases_with_stronger_and_repeated_gains() -> None:
     policy = PatchRCTPolicy()
-    low = useful_gain_posterior((-0.01,), minimum_useful_gain_bpb=0.001, policy=policy)
-    neutral = useful_gain_posterior((0.0,), minimum_useful_gain_bpb=0.001, policy=policy)
-    strong = useful_gain_posterior((0.01,), minimum_useful_gain_bpb=0.001, policy=policy)
-    repeated = useful_gain_posterior(
-        (0.01, 0.01, 0.01), minimum_useful_gain_bpb=0.001, policy=policy
-    )
+    low = useful_gain_posterior((-0.01,), minimum_useful_gain=0.001, policy=policy)
+    neutral = useful_gain_posterior((0.0,), minimum_useful_gain=0.001, policy=policy)
+    strong = useful_gain_posterior((0.01,), minimum_useful_gain=0.001, policy=policy)
+    repeated = useful_gain_posterior((0.01, 0.01, 0.01), minimum_useful_gain=0.001, policy=policy)
 
     assert low.probability_exceeds_minimum < neutral.probability_exceeds_minimum
     assert neutral.probability_exceeds_minimum < strong.probability_exceeds_minimum
     assert repeated.probability_exceeds_minimum > strong.probability_exceeds_minimum
-    assert repeated.standard_deviation_bpb < strong.standard_deviation_bpb
+    assert repeated.standard_deviation < strong.standard_deviation
 
 
 def test_greedy_mode_keeps_one_positive_cheap_result_and_advances_lineage(
@@ -819,7 +817,7 @@ def test_ledger_rejects_effect_free_decision_without_failed_run(tmp_path: Path) 
         verdict=DecisionVerdict.REJECT,
         effect_estimate_id=None,
         downstream_prediction_id=None,
-        minimum_useful_gain_bpb=proposal.minimum_useful_gain_bpb,
+        minimum_useful_gain=proposal.minimum_useful_gain,
         probability_threshold=0.8,
         constraints_passed=False,
         reasons=("unproved failure",),

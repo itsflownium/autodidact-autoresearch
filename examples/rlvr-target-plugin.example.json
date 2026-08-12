@@ -1,0 +1,76 @@
+{
+  "commands": {
+    "evaluate": [
+      "{python}",
+      "{evaluator}",
+      "evaluate",
+      "--trainer",
+      "{trainer}",
+      "--checkpoint",
+      "{checkpoint}",
+      "--protected-root",
+      "{data_root}",
+      "--device",
+      "{device}",
+      "--split",
+      "{split}",
+      "--maximum-units",
+      "{eval_tokens}"
+    ],
+    "inspect": [
+      "{python}",
+      "{evaluator}",
+      "inspect",
+      "--trainer",
+      "{trainer}",
+      "--parameter-cap",
+      "{parameter_cap}"
+    ],
+    "train": [
+      "{python}",
+      "{trainer}",
+      "train",
+      "--public-root",
+      "{public_data_root}",
+      "--device",
+      "{device}",
+      "--seed",
+      "{seed}",
+      "--budget",
+      "{training_budget}",
+      "--checkpoint",
+      "{checkpoint}",
+      "--metrics",
+      "{metrics}"
+    ]
+  },
+  "data_config_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "editable_paths": [
+    "policy/train.py",
+    "policy/algorithm.py",
+    "policy/model.py"
+  ],
+  "evaluator_path": "control/evaluate.py",
+  "metric": {
+    "direction": "higher",
+    "name": "verified_reward",
+    "objective_offset": 1.0,
+    "objective_scale": 1.0
+  },
+  "plugin_id": "example.rlvr-target",
+  "plugin_version": "1.0.0",
+  "rl": {
+    "algorithm_paths": [
+      "policy/algorithm.py"
+    ],
+    "budget_unit": "tokens",
+    "paradigm": "rlvr",
+    "reward_maximum": 1.0,
+    "reward_minimum": 0.0,
+    "reward_source": "verifier",
+    "schema_version": 1
+  },
+  "schema_version": 2,
+  "tokenizer_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+  "trainer_path": "policy/train.py"
+}

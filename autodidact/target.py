@@ -14,10 +14,7 @@ from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-import torch
-
 from autodidact.checkpoints import file_sha256
-from autodidact.evaluator import EvaluationError, inspect_trainer
 from autodidact.records import DEFAULT_PARAMETER_CAP
 from autodidact.target_plugins import (
     TargetPluginError,
@@ -25,8 +22,8 @@ from autodidact.target_plugins import (
     resolve_repository_path,
 )
 
-TARGET_SCHEMA_VERSION = 2
-SUPPORTED_TARGET_SCHEMA_VERSIONS = frozenset({1, TARGET_SCHEMA_VERSION})
+TARGET_SCHEMA_VERSION = 3
+SUPPORTED_TARGET_SCHEMA_VERSIONS = frozenset({2, TARGET_SCHEMA_VERSION})
 DEFAULT_TARGET_CONFIG_PATH = Path("artifacts/control/target.json")
 _TARGET_KEYS = frozenset(
     {
@@ -78,25 +75,21 @@ class TargetConfig:
         if trainer.is_absolute() or ".." in trainer.parts or trainer.as_posix() in {"", "."}:
             raise TargetError("trainer_path must be a safe repository-relative path")
         if self.plugin_spec_path is None and trainer.as_posix() != "train.py":
-            raise TargetError("the built-in target requires trainer_path to be train.py")
+            raise TargetError("target configuration requires a plugin_spec_path")
         if not isinstance(self.device, str) or not self.device.strip() or len(self.device) > 64:
             raise TargetError("device must be nonempty portable text")
         if type(self.max_parameter_count) is not int or self.max_parameter_count <= 0:
             raise TargetError("max_parameter_count must be a positive integer")
-        if self.plugin_spec_path is None and self.max_parameter_count > DEFAULT_PARAMETER_CAP:
-            raise TargetError(
-                f"the built-in target caps models at {DEFAULT_PARAMETER_CAP} parameters"
-            )
         for field in ("plugin_spec_path", "public_data_root"):
             value = getattr(self, field)
             if value is not None and not isinstance(value, Path):
                 if not isinstance(value, str):
                     raise TargetError(f"{field} must be a filesystem path")
                 object.__setattr__(self, field, Path(value))
-        if self.plugin_spec_path is not None and self.public_data_root is None:
-            raise TargetError("external target plugins require public_data_root")
-        if self.plugin_spec_path is None and self.public_data_root is not None:
-            raise TargetError("public_data_root is only valid with an external target plugin")
+        if self.plugin_spec_path is None:
+            raise TargetError("target configuration requires a plugin_spec_path")
+        if self.public_data_root is None:
+            raise TargetError("target configuration requires public_data_root")
         try:
             location = ExecutionLocation(self.execution_location)
         except (TypeError, ValueError) as error:
@@ -118,7 +111,14 @@ class TargetConfig:
         schema_version = value.get("schema_version")
         if schema_version not in SUPPORTED_TARGET_SCHEMA_VERSIONS:
             raise TargetError("target configuration schema version is unsupported")
-        required = {"name", "data_root"}
+        required = {
+            "data_root",
+            "max_parameter_count",
+            "name",
+            "plugin_spec_path",
+            "public_data_root",
+            "trainer_path",
+        }
         missing = required - value.keys()
         if missing:
             raise TargetError(f"target configuration is missing keys: {sorted(missing)}")
@@ -127,11 +127,6 @@ class TargetConfig:
             raise TargetError("target data_root must be a string")
         plugin_spec = value.get("plugin_spec_path")
         public_data = value.get("public_data_root")
-        if schema_version == 1 and {
-            "plugin_spec_path",
-            "public_data_root",
-        }.intersection(value):
-            raise TargetError("target schema version 1 cannot configure plugins")
         if plugin_spec is not None and not isinstance(plugin_spec, str):
             raise TargetError("plugin_spec_path must be a string")
         if public_data is not None and not isinstance(public_data, str):
@@ -140,8 +135,8 @@ class TargetConfig:
             name=value["name"],
             data_root=Path(data_root),
             device=value.get("device", "auto"),
-            trainer_path=value.get("trainer_path", "train.py"),
-            max_parameter_count=value.get("max_parameter_count", DEFAULT_PARAMETER_CAP),
+            trainer_path=value["trainer_path"],
+            max_parameter_count=value["max_parameter_count"],
             execution_location=value.get("execution_location", ExecutionLocation.LOCAL),
             estimated_accelerator_hour_usd=value.get("estimated_accelerator_hour_usd"),
             plugin_spec_path=None if plugin_spec is None else Path(plugin_spec),
@@ -189,10 +184,9 @@ class TargetConfig:
         path = self.plugin_spec_path.expanduser()
         return path.resolve() if path.is_absolute() else (repository_root / path).resolve()
 
-    def load_plugin(self, repository_root: Path) -> TargetPluginSpec | None:
+    def load_plugin(self, repository_root: Path) -> TargetPluginSpec:
         path = self.resolved_plugin_spec_path(repository_root)
-        if path is None:
-            return None
+        assert path is not None
         plugin = TargetPluginSpec.from_path(path)
         repository = repository_root.resolve()
         if path.is_relative_to(repository):
@@ -206,27 +200,6 @@ class TargetConfig:
         if public is None or public == full:
             raise TargetError("external target public and protected data roots must be distinct")
         return plugin
-
-
-def _resolve_device(requested: str) -> str:
-    normalized = requested.lower()
-    if normalized == "auto":
-        if torch.cuda.is_available():
-            return "cuda"
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return "mps"
-        return "cpu"
-    try:
-        device = torch.device(normalized)
-    except RuntimeError as error:
-        raise TargetError(f"invalid target device: {requested}") from error
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise TargetError("CUDA was requested but is unavailable on this host")
-    if device.type == "mps" and not (
-        hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
-    ):
-        raise TargetError("MPS was requested but is unavailable on this host")
-    return str(device)
 
 
 def _write_config(path: Path, config: TargetConfig, *, force: bool) -> None:
@@ -260,10 +233,10 @@ def build_parser() -> argparse.ArgumentParser:
     initialize.add_argument("--config", type=_path, default=DEFAULT_TARGET_CONFIG_PATH)
     initialize.add_argument("--data-root", type=_path, required=True)
     initialize.add_argument("--device", default="auto")
-    initialize.add_argument("--trainer-path", default="train.py")
-    initialize.add_argument("--plugin-spec", type=_path)
-    initialize.add_argument("--public-data-root", type=_path)
-    initialize.add_argument("--max-parameter-count", type=int, default=DEFAULT_PARAMETER_CAP)
+    initialize.add_argument("--trainer-path", required=True)
+    initialize.add_argument("--plugin-spec", type=_path, required=True)
+    initialize.add_argument("--public-data-root", type=_path, required=True)
+    initialize.add_argument("--max-parameter-count", type=int, required=True)
     initialize.add_argument(
         "--execution-location",
         type=ExecutionLocation,
@@ -305,64 +278,57 @@ def main(argv: list[str] | None = None) -> int:
                 repository = args.repository_root.resolve()
                 plugin = config.load_plugin(repository)
                 trainer = resolve_repository_path(repository, config.trainer_path)
-                if plugin is None:
-                    inspection = inspect_trainer(
-                        trainer,
-                        parameter_cap=config.max_parameter_count,
+                evaluator = resolve_repository_path(repository, plugin.evaluator_path)
+                command = plugin.render_command(
+                    "inspect",
+                    {
+                        "device": config.device,
+                        "evaluator": evaluator,
+                        "parameter_cap": config.max_parameter_count,
+                        "python": sys.executable,
+                        "repository_root": repository,
+                        "trainer": trainer,
+                    },
+                )
+                completed = subprocess.run(
+                    command,
+                    cwd=repository,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if completed.returncode != 0:
+                    raise TargetError(
+                        "target inspection failed: "
+                        + (completed.stderr.strip() or f"exit code {completed.returncode}")
                     )
-                else:
-                    evaluator = resolve_repository_path(repository, plugin.evaluator_path)
-                    command = plugin.render_command(
-                        "inspect",
-                        {
-                            "evaluator": evaluator,
-                            "parameter_cap": config.max_parameter_count,
-                            "python": sys.executable,
-                            "repository_root": repository,
-                            "trainer": trainer,
-                        },
-                    )
-                    completed = subprocess.run(
-                        command,
-                        cwd=repository,
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                    )
-                    if completed.returncode != 0:
-                        raise TargetError(
-                            "external target inspection failed: "
-                            + (completed.stderr.strip() or f"exit code {completed.returncode}")
-                        )
-                    lines = [line for line in completed.stdout.splitlines() if line.strip()]
-                    if not lines:
-                        raise TargetError("external target inspection emitted no JSON")
-                    try:
-                        inspection = json.loads(lines[-1])
-                    except json.JSONDecodeError as error:
-                        raise TargetError(
-                            "external target inspection emitted invalid JSON"
-                        ) from error
-                    if (
-                        not isinstance(inspection, dict)
-                        or inspection.get("event") != "target_inspection"
-                        or type(inspection.get("parameter_count")) is not int
-                        or inspection["parameter_count"] <= 0
-                        or inspection["parameter_count"] > config.max_parameter_count
-                        or inspection.get("trainer_sha256") != file_sha256(trainer)
-                    ):
-                        raise TargetError("external target inspection contract mismatch")
+                lines = [line for line in completed.stdout.splitlines() if line.strip()]
+                if not lines:
+                    raise TargetError("target inspection emitted no JSON")
+                try:
+                    inspection = json.loads(lines[-1])
+                except json.JSONDecodeError as error:
+                    raise TargetError("target inspection emitted invalid JSON") from error
+                if (
+                    not isinstance(inspection, dict)
+                    or inspection.get("event") != "target_inspection"
+                    or type(inspection.get("parameter_count")) is not int
+                    or inspection["parameter_count"] <= 0
+                    or inspection["parameter_count"] > config.max_parameter_count
+                    or inspection.get("trainer_sha256") != file_sha256(trainer)
+                ):
+                    raise TargetError("target inspection contract mismatch")
                 payload = {
                     **payload,
                     "data_root": str(config.resolved_data_root(repository)),
                     "inspection": inspection,
-                    "plugin": None if plugin is None else plugin.to_mapping(),
+                    "plugin": plugin.to_mapping(),
                     "ready": True,
-                    "resolved_device": _resolve_device(config.device),
+                    "requested_device": config.device,
                 }
         print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
         return 0
-    except (EvaluationError, OSError, TargetError, TargetPluginError, ValueError) as error:
+    except (OSError, TargetError, TargetPluginError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
 

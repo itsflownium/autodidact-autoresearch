@@ -16,7 +16,7 @@ from typing import Any
 import numpy as np
 
 from autodidact.checkpoints import file_sha256
-from autodidact.data.integrity import canonical_json_bytes
+from autodidact.integrity import canonical_json_bytes
 from autodidact.ledger import ExperimentLedger, LedgerError, WriterRole
 from autodidact.records import (
     ArtifactManifest,
@@ -31,7 +31,7 @@ from autodidact.records import (
     TrialSpec,
 )
 
-REWARD_SCHEMA_VERSION = 1
+REWARD_SCHEMA_VERSION = 2
 EXTRACTOR_VERSION = "learning-curve-v1"
 MODEL_VERSION = "bayesian-linear-nig-v1"
 DEFAULT_LEDGER_PATH = Path("artifacts/ledger/experiments.sqlite3")
@@ -46,8 +46,8 @@ FEATURE_NAMES = (
     "cheap_pair_count",
     "intermediate_pair_count",
     "latest_budget_fraction",
-    "mean_gain_bpb",
-    "latest_gain_bpb",
+    "mean_objective_gain",
+    "latest_objective_gain",
     "gain_slope_per_million_tokens",
     "gain_sample_standard_deviation",
     "mean_train_loss_delta",
@@ -143,8 +143,8 @@ class FullBudgetLabel:
     label_id: str
     candidate_id: str
     full_trial_ids: tuple[str, ...]
-    mean_full_gain_bpb: float
-    sample_variance_bpb: float
+    mean_full_objective_gain: float
+    sample_variance: float
     constraints_passed: bool
     captured_event_sequence: int
     schema_version: int = REWARD_SCHEMA_VERSION
@@ -154,9 +154,9 @@ class FullBudgetLabel:
             raise RewardError("label identity and full trials cannot be empty")
         if len(set(self.full_trial_ids)) != len(self.full_trial_ids):
             raise RewardError("full label trial IDs must be unique")
-        if not math.isfinite(self.mean_full_gain_bpb):
+        if not math.isfinite(self.mean_full_objective_gain):
             raise RewardError("full label gain must be finite")
-        if not math.isfinite(self.sample_variance_bpb) or self.sample_variance_bpb < 0.0:
+        if not math.isfinite(self.sample_variance) or self.sample_variance < 0.0:
             raise RewardError("full label variance must be finite and nonnegative")
         if type(self.constraints_passed) is not bool:
             raise RewardError("constraints_passed must be boolean")
@@ -176,8 +176,8 @@ class FullBudgetLabel:
             label_id=str(value["label_id"]),
             candidate_id=str(value["candidate_id"]),
             full_trial_ids=tuple(str(item) for item in value["full_trial_ids"]),
-            mean_full_gain_bpb=float(value["mean_full_gain_bpb"]),
-            sample_variance_bpb=float(value["sample_variance_bpb"]),
+            mean_full_objective_gain=float(value["mean_full_objective_gain"]),
+            sample_variance=float(value["sample_variance"]),
             constraints_passed=value["constraints_passed"],
             captured_event_sequence=int(value["captured_event_sequence"]),
             schema_version=int(value["schema_version"]),
@@ -207,8 +207,8 @@ class BayesianRewardModel:
     minimum_label_count: int
     training_feature_ids: tuple[str, ...]
     training_label_ids: tuple[str, ...]
-    calibration_rmse_bpb: float | None = None
-    calibration_mean_absolute_error_bpb: float | None = None
+    calibration_rmse: float | None = None
+    calibration_mean_absolute_error: float | None = None
     calibration_interval_coverage_90: float | None = None
     model_version: str = MODEL_VERSION
     schema_version: int = REWARD_SCHEMA_VERSION
@@ -246,14 +246,14 @@ class BayesianRewardModel:
         ):
             raise RewardError("model training evidence counts differ")
         for name in (
-            "calibration_rmse_bpb",
-            "calibration_mean_absolute_error_bpb",
+            "calibration_rmse",
+            "calibration_mean_absolute_error",
             "calibration_interval_coverage_90",
         ):
             value = getattr(self, name)
             if value is not None and not math.isfinite(value):
                 raise RewardError(f"{name} must be finite when provided")
-        for name in ("calibration_rmse_bpb", "calibration_mean_absolute_error_bpb"):
+        for name in ("calibration_rmse", "calibration_mean_absolute_error"):
             value = getattr(self, name)
             if value is not None and value < 0.0:
                 raise RewardError(f"{name} cannot be negative")
@@ -287,15 +287,13 @@ class BayesianRewardModel:
             minimum_label_count=int(value["minimum_label_count"]),
             training_feature_ids=tuple(str(item) for item in value["training_feature_ids"]),
             training_label_ids=tuple(str(item) for item in value["training_label_ids"]),
-            calibration_rmse_bpb=(
-                None
-                if value.get("calibration_rmse_bpb") is None
-                else float(value["calibration_rmse_bpb"])
+            calibration_rmse=(
+                None if value.get("calibration_rmse") is None else float(value["calibration_rmse"])
             ),
-            calibration_mean_absolute_error_bpb=(
+            calibration_mean_absolute_error=(
                 None
-                if value.get("calibration_mean_absolute_error_bpb") is None
-                else float(value["calibration_mean_absolute_error_bpb"])
+                if value.get("calibration_mean_absolute_error") is None
+                else float(value["calibration_mean_absolute_error"])
             ),
             calibration_interval_coverage_90=(
                 None
@@ -313,7 +311,7 @@ class BayesianRewardModel:
         self,
         features: LearningCurveFeatures,
         *,
-        minimum_useful_gain_bpb: float,
+        minimum_useful_gain: float,
         interval_mass: float = 0.90,
     ) -> PredictiveDistribution:
         if features.feature_names != self.feature_names:
@@ -340,7 +338,7 @@ class BayesianRewardModel:
         standard_deviation = predictive_scale * math.sqrt(
             degrees_of_freedom / (degrees_of_freedom - 2.0)
         )
-        standardized_minimum = (minimum_useful_gain_bpb - location) / predictive_scale
+        standardized_minimum = (minimum_useful_gain - location) / predictive_scale
         probability = 1.0 - student_t_cdf(standardized_minimum, degrees_of_freedom)
         tail = (1.0 - interval_mass) / 2.0
         lower_quantile = student_t_quantile(tail, degrees_of_freedom)
@@ -676,7 +674,7 @@ def extract_learning_curve_features(
             candidate_run.peak_process_rss_bytes / max(parent.peak_process_rss_bytes, 1)
         )
         parameter_ratios.append(candidate_run.parameter_count / parent.parameter_count)
-        gains.append(pair.gain_bpb)
+        gains.append(pair.objective_gain)
         budgets_millions.append(trial.token_budget / 1_000_000.0)
     candidate_runs = [
         event.record
@@ -772,7 +770,7 @@ def build_full_budget_label(
     if not pair_events:
         raise RewardError("candidate has no completed full-budget paired labels")
     pairs = [event.record for event in pair_events]
-    gains = [pair.gain_bpb for pair in pairs]
+    gains = [pair.objective_gain for pair in pairs]
     variance = statistics.variance(gains) if len(gains) > 1 else 0.0
     label_hash = hashlib.sha256(
         canonical_json_bytes(
@@ -787,8 +785,8 @@ def build_full_budget_label(
         label_id=f"label-{label_hash[:24]}",
         candidate_id=candidate_id,
         full_trial_ids=tuple(pair.trial_id for pair in pairs),
-        mean_full_gain_bpb=statistics.fmean(gains),
-        sample_variance_bpb=variance,
+        mean_full_objective_gain=statistics.fmean(gains),
+        sample_variance=variance,
         constraints_passed=all(pair.constraints_passed for pair in pairs),
         captured_event_sequence=max(event.sequence for event in pair_events),
     )
@@ -801,14 +799,14 @@ def calibrate_model(
     minimum_label_count: int = DEFAULT_MINIMUM_LABELS,
     prior_precision: float = 1.0,
     prior_shape: float = 2.0,
-    prior_noise_standard_deviation_bpb: float = 0.005,
+    prior_noise_standard_deviation: float = 0.005,
     _compute_diagnostics: bool = True,
 ) -> BayesianRewardModel:
     if minimum_label_count <= 0:
         raise RewardError("minimum_label_count must be positive")
     if prior_precision <= 0.0 or prior_shape <= 1.0:
         raise RewardError("Bayesian prior parameters are invalid")
-    if prior_noise_standard_deviation_bpb <= 0.0:
+    if prior_noise_standard_deviation <= 0.0:
         raise RewardError("prior noise standard deviation must be positive")
     latest_features: dict[str, LearningCurveFeatures] = {}
     for feature in features:
@@ -829,7 +827,9 @@ def calibrate_model(
         if feature.captured_event_sequence >= label.captured_event_sequence:
             raise RewardError("calibration feature snapshot must precede its full-budget label")
     raw = np.asarray([feature.feature_values for feature in selected_features], dtype=np.float64)
-    targets = np.asarray([label.mean_full_gain_bpb for label in selected_labels], dtype=np.float64)
+    targets = np.asarray(
+        [label.mean_full_objective_gain for label in selected_labels], dtype=np.float64
+    )
     means = raw.mean(axis=0)
     scales = raw.std(axis=0, ddof=1) if len(raw) > 1 else np.ones(raw.shape[1])
     scales = np.where(scales > 1e-12, scales, 1.0)
@@ -841,7 +841,7 @@ def calibrate_model(
     posterior_precision = prior_matrix + design.T @ design
     posterior_mean = np.linalg.solve(posterior_precision, design.T @ targets)
     posterior_shape = prior_shape + len(raw) / 2.0
-    prior_scale = (prior_shape - 1.0) * prior_noise_standard_deviation_bpb**2
+    prior_scale = (prior_shape - 1.0) * prior_noise_standard_deviation**2
     posterior_scale = prior_scale + 0.5 * float(
         targets @ targets - posterior_mean @ posterior_precision @ posterior_mean
     )
@@ -879,20 +879,22 @@ def calibrate_model(
             minimum_label_count=minimum_label_count,
             prior_precision=prior_precision,
             prior_shape=prior_shape,
-            prior_noise_standard_deviation_bpb=prior_noise_standard_deviation_bpb,
+            prior_noise_standard_deviation=prior_noise_standard_deviation,
             _compute_diagnostics=False,
         )
-        distribution = fold_model.predict(feature, minimum_useful_gain_bpb=0.0)
+        distribution = fold_model.predict(feature, minimum_useful_gain=0.0)
         predictions.append(distribution.mean)
-        actual.append(label.mean_full_gain_bpb)
+        actual.append(label.mean_full_objective_gain)
         covered.append(
-            distribution.interval_lower <= label.mean_full_gain_bpb <= distribution.interval_upper
+            distribution.interval_lower
+            <= label.mean_full_objective_gain
+            <= distribution.interval_upper
         )
     errors = [prediction - target for prediction, target in zip(predictions, actual, strict=True)]
     return replace(
         model,
-        calibration_rmse_bpb=math.sqrt(statistics.fmean(error * error for error in errors)),
-        calibration_mean_absolute_error_bpb=statistics.fmean(abs(error) for error in errors),
+        calibration_rmse=math.sqrt(statistics.fmean(error * error for error in errors)),
+        calibration_mean_absolute_error=statistics.fmean(abs(error) for error in errors),
         calibration_interval_coverage_90=(sum(covered) / len(covered)),
     )
 
@@ -935,7 +937,7 @@ def build_downstream_prediction(
     proposal = proposal_event.record
     distribution = model.predict(
         features,
-        minimum_useful_gain_bpb=proposal.minimum_useful_gain_bpb,
+        minimum_useful_gain=proposal.minimum_useful_gain,
     )
     model_hash = model.sha256()
     prediction = DownstreamPrediction(
@@ -949,11 +951,11 @@ def build_downstream_prediction(
         source_trial_ids=features.source_trial_ids,
         source_stages=features.source_stages,
         target_stage=ExperimentStage.FULL,
-        expected_gain_bpb=distribution.mean,
+        expected_objective_gain=distribution.mean,
         predictive_standard_deviation=distribution.standard_deviation,
-        interval_lower_bpb=distribution.interval_lower,
-        interval_upper_bpb=distribution.interval_upper,
-        minimum_useful_gain_bpb=proposal.minimum_useful_gain_bpb,
+        interval_lower=distribution.interval_lower,
+        interval_upper=distribution.interval_upper,
+        minimum_useful_gain=proposal.minimum_useful_gain,
         probability_exceeds_minimum=distribution.probability_exceeds_minimum,
         model_version=f"{MODEL_VERSION}:{model_hash[:16]}",
         full_budget_label_count=model.label_count,
@@ -1028,8 +1030,8 @@ def main(argv: list[str] | None = None) -> int:
             save_model(args.output, model)
             payload: dict[str, Any] = {
                 "calibration_interval_coverage_90": (model.calibration_interval_coverage_90),
-                "calibration_mean_absolute_error_bpb": (model.calibration_mean_absolute_error_bpb),
-                "calibration_rmse_bpb": model.calibration_rmse_bpb,
+                "calibration_mean_absolute_error": (model.calibration_mean_absolute_error),
+                "calibration_rmse": model.calibration_rmse,
                 "calibrated": model.calibrated,
                 "label_count": model.label_count,
                 "minimum_label_count": model.minimum_label_count,
@@ -1070,10 +1072,10 @@ def main(argv: list[str] | None = None) -> int:
                 payload = {
                     "calibrated": model.calibrated,
                     "candidate_id": args.candidate_id,
-                    "expected_full_gain_bpb": distribution.mean,
+                    "expected_full_objective_gain": distribution.mean,
                     "full_budget_label_count": model.label_count,
-                    "interval_lower_bpb": distribution.interval_lower,
-                    "interval_upper_bpb": distribution.interval_upper,
+                    "interval_lower": distribution.interval_lower,
+                    "interval_upper": distribution.interval_upper,
                     "prediction_id": prediction.prediction_id,
                     "probability_exceeds_minimum": (distribution.probability_exceeds_minimum),
                     "recommendation": allocation,
