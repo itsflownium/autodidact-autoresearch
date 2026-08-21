@@ -10,6 +10,24 @@ researcher can be Codex, Claude Code, Hermes Agent, or a custom command adapter.
 
 Project site: [researchautodidact.vercel.app](https://researchautodidact.vercel.app/)
 
+## What users configure
+
+Autodidact separates the coding agent from the model being researched. Selecting a model for
+Codex, Claude Code, or Hermes Agent does not select or download the target model.
+
+| Layer | Configured by | What can be selected |
+| --- | --- | --- |
+| Researcher | `autodidact-agent bootstrap` | Agent provider, researcher model, reasoning effort, and inference limits |
+| Target | Target code, plugin JSON, and `autodidact-target init` | Model/trainer files, data or tasks, device, parameter cap, commands, and protected metric |
+| RL/RLVR | Plugin `rl` contract | Paradigm, reward source and range, budget unit, verifier contract, and agent-editable algorithm files |
+| Compute | Target commands and target config | CPU, MPS, local CUDA GPU, or a user-managed GPU host |
+
+The user supplies the initial target implementation and protected evaluator. After that setup, the
+configured researcher may change every file declared in `editable_paths`. Put model architecture,
+trainer, rollout, and algorithm files in that list only when they are intended research surfaces.
+Autodidact keeps the evaluator, verifier, protected inputs, seeds, budgets, and promotion decision
+outside the agent's edit boundary.
+
 ## What it controls
 
 ```mermaid
@@ -47,6 +65,11 @@ run but does not restrict its value.
 The protected contract still prevents the researcher from changing reward semantics, the verifier,
 held-out tasks, seed assignment, or promotion thresholds. For RLVR, the reward source must include a
 verifier, and protected evaluation must report verifier coverage and reward variance.
+
+The agent does not configure RL by changing Autodidact itself. The target owner first declares the
+RL contract and allowed files in the target plugin. Every configured researcher receives the same
+contract and edit scope, so changing from Codex to Claude Code or Hermes Agent does not change the
+experiment definition.
 
 ## Install
 
@@ -125,6 +148,33 @@ Start from [`examples/rlvr-target-plugin.example.json`](examples/rlvr-target-plu
 for RLVR or [`examples/target-plugin.example.json`](examples/target-plugin.example.json) for another
 training paradigm. These are contracts only; they do not include a model or task implementation.
 
+For an RLVR target, the important edit boundary looks like this:
+
+```json
+{
+  "editable_paths": [
+    "policy/train.py",
+    "policy/model.py",
+    "policy/algorithm.py"
+  ],
+  "evaluator_path": "control/evaluate.py",
+  "rl": {
+    "algorithm_paths": ["policy/algorithm.py"],
+    "budget_unit": "tokens",
+    "paradigm": "rlvr",
+    "reward_minimum": 0.0,
+    "reward_maximum": 1.0,
+    "reward_source": "verifier",
+    "schema_version": 1
+  }
+}
+```
+
+`algorithm_paths` must be a subset of `editable_paths`. Autodidact does not enumerate or force an
+algorithm, so the researcher can implement GRPO, PPO, REINFORCE, or a custom method. The trainer
+reports an arbitrary `algorithm_id` for evidence attribution; the protected evaluator independently
+computes the reward used by PatchRCT.
+
 Create the local target configuration:
 
 ```bash
@@ -145,6 +195,31 @@ uv run autodidact-target doctor --repository-root .
 They must be different directories. `device` is an opaque value passed to your adapters, so a
 target may support `cpu`, `mps`, `cuda`, a local consumer GPU, or a custom remote runtime.
 Autodidact does not provision or SSH into that runtime.
+
+### Target integration requirements
+
+Before a real campaign, the target owner must provide:
+
+1. A trainer that consumes the exact assigned `{training_budget}`, seed, public input root, and
+   output paths.
+2. A protected inspector/evaluator that implements Autodidact's JSON event protocol.
+3. Distinct public and protected data, task, or environment roots.
+4. Deterministic or seed-controlled target behavior appropriate for paired comparisons.
+
+Run `autodidact-target doctor`, followed by a one-proposal smoke campaign, before spending on a
+larger run. The included tests exercise synthetic target plugins; they are not evidence that an
+unseen real trainer or verifier is integrated correctly.
+
+### Current limits
+
+- The autonomous CLI currently uses PatchRCT's default cheap, intermediate, and full stage budgets
+  of 2,000,000, 6,000,000, and 20,000,000 target units. The campaign-wide ceiling is configurable,
+  but per-stage values are not yet target-JSON fields.
+- External target plugins currently start each escalated stage through a fresh trainer invocation;
+  generic checkpoint continuation between stages is not yet supported. Exact compatible parent
+  results can still be reused with ledger provenance.
+- Third-party agent CLI flags can change. `autodidact-agent doctor --fix` detects supported versions
+  and common installation problems before inference, but cannot guarantee future CLI compatibility.
 
 ## 3. Run a campaign
 
